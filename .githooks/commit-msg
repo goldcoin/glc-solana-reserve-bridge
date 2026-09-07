@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Reject commit messages carrying AI/Claude authorship attribution.
+#
+# Why this exists: GitHub credits `Co-Authored-By:` trailers as
+# first-class commit authors, and it resolves the address
+# noreply@anthropic.com to the real GitHub account `claude`. A trailer
+# added by an assistant therefore does not just sit inertly in the log —
+# it makes an AI account appear in this repository's Contributors panel
+# and in the per-commit author line. Getting one back out again means
+# rewriting published history and force-pushing, which is expensive and
+# breaks every open PR. Blocking it at commit time is the cheap moment.
+#
+# This hook is deliberately REJECT-ONLY. It never edits the message
+# file. Silently stripping a trailer would be worse than failing: the
+# committer would not learn that their tooling is still adding it, and a
+# stripping bug could quietly drop a legitimate human co-author's
+# credit. So the only thing this hook ever does is refuse and explain.
+#
+# Normal human co-authorship is unaffected —
+#   Co-authored-by: Jane Doe <jane@example.com>
+# passes, because every pattern below requires Claude/Anthropic
+# specifically. Only the AI attribution forms are rejected.
+#
+# Install:  scripts/install-git-hooks.sh   (see DEVELOPMENT.md)
+# Bypass:   git commit --no-verify         (see DEVELOPMENT.md for when
+#                                           that is legitimate)
+
+set -euo pipefail
+
+msg_file="${1:?commit-msg hook called without a message file}"
+
+# What the final commit message will actually contain. Two things in the
+# file are NOT part of it and must not be scanned, or the hook produces
+# false rejections on input the committer never wrote:
+#
+#   1. Comment lines. Git strips them. The commit template and git's own
+#      "# Changes to be committed" block live here.
+#   2. Everything below a `git commit -v` / --cleanup=scissors cut line.
+#      That region is the staged DIFF. Committing a file that merely
+#      MENTIONS one of these patterns (this hook itself, its tests, the
+#      docs describing it) would otherwise be unable to be committed.
+comment_char="$(git config --get core.commentChar || true)"
+[ -z "$comment_char" ] && comment_char='#'
+[ "$comment_char" = "auto" ] && comment_char='#'
+
+scan_text="$(
+    awk -v cc="$comment_char" '
+        # Scissors line: everything from here down is the -v diff.
+        index($0, "------------------------ >8 ------------------------") { exit }
+        # Comment lines are stripped by git and are not part of the message.
+        substr($0, 1, 1) == cc { next }
+        { print }
+    ' "$msg_file"
+)"
+
+# Each entry is "<extended-regex>|<what it is>". All matching is
+# case-insensitive: the trailer has been seen in the wild as both
+# "Co-authored-by" and "Co-Authored-By".
+patterns=(
+    'Co-authored-by:.*Claude|Claude co-author trailer'
+    'Co-authored-by:.*Anthropic|Anthropic co-author trailer'
+    'noreply@anthropic\.com|Anthropic no-reply address (GitHub maps this to the `claude` account)'
+    'Claude-Session:|Claude session-link trailer'
+    'generated-by:.*Claude|Claude generated-by trailer'
+    'AI-generated|AI-generated attribution marker'
+)
+
+# Report each offending LINE once, listing every rule it broke, rather
+# than once per rule — a single Co-Authored-By trailer trips three of
+# the patterns above and repeating it three times just buries the point.
+violations=""
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    reasons=""
+    for entry in "${patterns[@]}"; do
+        regex="${entry%%|*}"
+        label="${entry##*|}"
+        if printf '%s\n' "$line" | grep -qiE "$regex"; then
+            reasons+="      - ${label}"$'\n'
+        fi
+    done
+    if [ -n "$reasons" ]; then
+        violations+="    ${line}"$'\n'"${reasons}"
+    fi
+done < <(printf '%s\n' "$scan_text")
+
+if [ -n "$violations" ]; then
+    cat >&2 <<ERR_EOF
+
+COMMIT REJECTED: AI/Claude attribution in the commit message.
+
+Prohibited content found:
+
+${violations}
+GitHub treats these as real authorship. The address
+noreply@anthropic.com resolves to the GitHub account 'claude', so a
+commit carrying it lists an AI as a contributor to this repository.
+Removing that later requires rewriting published history and
+force-pushing — please just remove the line now.
+
+To fix: re-run your commit and delete the offending line(s) from the
+message. Human co-author trailers are fine and are not affected:
+
+    Co-authored-by: Jane Doe <jane@example.com>
+
+If you are certain this is a false positive (for example, prose that
+legitimately discusses AI-generated content), bypass with:
+
+    git commit --no-verify
+
+ERR_EOF
+    exit 1
+fi
+
+exit 0
