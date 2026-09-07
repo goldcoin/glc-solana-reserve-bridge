@@ -54,6 +54,18 @@ Two notes on scope:
   positives here are cheap and false negatives are expensive. Use
   `git commit --no-verify` for the rare genuine case.
 
+The hook has a self-test covering both halves of its contract — what it must
+reject, and (more importantly) what it must keep allowing:
+
+```
+scripts/test-commit-msg-hook.sh
+```
+
+It runs a pattern matrix directly against the hook, asserts the hook never edits
+the message file, and then proves end-to-end in a throwaway repository that git
+actually refuses the prohibited commit and accepts a normal human co-authored one.
+It creates nothing in this repository.
+
 A hook is a convenience, not an enforcement boundary: it is per-clone and
 bypassable. Treat it as the thing that catches the accident, not as a guarantee.
 
