@@ -7713,3 +7713,222 @@ fn transfers_page_with_no_address_still_lists_every_direction() {
     // Newest first, as before.
     assert!(page.windows(2).all(|w| w[0].id > w[1].id));
 }
+
+// ------------------------------------------------ auto-resume hold (v29) --
+
+/// The hold is per-row, explicit, and absolute for resumes: a held park
+/// refuses every resume entry point until released, a row folded after
+/// the hold is unheld, and release restores exactly the pre-hold
+/// behaviour. Nothing else about the row changes.
+#[test]
+fn a_hold_blocks_resume_until_released_and_never_reaches_other_rows() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let before = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(before.auto_resume_hold_note, None);
+
+    ledger
+        .set_manual_review_hold(request_id, 1_000 + 72 * 3600, "72h freeze", "cli:op", 1_000)
+        .unwrap();
+    let held = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(held.state, RequestState::ManualReview);
+    assert_eq!(
+        held.manual_review_note, before.manual_review_note,
+        "the fold note is untouched"
+    );
+    assert_eq!(held.auto_resume_hold_note.as_deref(), Some("72h freeze"));
+    assert_eq!(held.auto_resume_hold_until, Some(1_000 + 72 * 3600));
+
+    // Every resume entry point refuses — the operator one included — and
+    // an elapsed `hold_until` changes nothing: the hold never expires on
+    // its own.
+    for now in [2_000, 1_000 + 72 * 3600 + 1] {
+        let err = ledger
+            .resume_manual_review_sol_to_glc(request_id, "try", "operator", now)
+            .unwrap_err();
+        assert!(
+            matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
+            "held row must be refused: {err}"
+        );
+        assert!(err.to_string().contains("held by operator"), "{err}");
+    }
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+
+    // A row folded after the hold is unheld and behaves as it always did.
+    let SolFoldOutcome::FoldedManualReview { request_id: later } = ledger
+        .fold_sol_deposit(1, amounts(100_000), [3u8; 32], &[4u8; 32], None, 3_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let later_row = ledger.get_request(later).unwrap().unwrap();
+    assert_eq!(later_row.auto_resume_hold_note, None);
+    assert_eq!(later_row.auto_resume_hold_until, None);
+    assert_eq!(
+        ledger
+            .resume_manual_review_sol_to_glc(later, "unheld resumes", "operator", 4_000)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+
+    // Listing shows exactly the held row.
+    let listed: Vec<i64> = ledger
+        .held_manual_review_requests()
+        .unwrap()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(listed, vec![request_id]);
+
+    // Release restores the pre-hold behaviour; a second release is a no-op.
+    assert!(ledger
+        .clear_manual_review_hold(request_id, "cli:op", 5_000)
+        .unwrap());
+    assert!(!ledger
+        .clear_manual_review_hold(request_id, "cli:op", 5_001)
+        .unwrap());
+    assert!(ledger.held_manual_review_requests().unwrap().is_empty());
+    assert_eq!(
+        ledger
+            .resume_manual_review_sol_to_glc(request_id, "released", "operator", 6_000)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+}
+
+/// A hold applies only to a parked request that nothing has paid: any
+/// other state, a recorded destination txid, or an existing payout row
+/// is refused without a write — so the "already processing" set can never
+/// be marked, however the id list was assembled.
+#[test]
+fn a_hold_is_refused_for_anything_that_is_not_an_unpaid_park() {
+    let mut ledger = setup();
+    // Admitted straight through: SourceFinalized, not ManualReview.
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let err = ledger
+        .set_manual_review_hold(request_id, 9_999, "x", "cli:op", 1_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("not ManualReview"), "{err}");
+    assert_eq!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .auto_resume_hold_note,
+        None
+    );
+
+    // Unknown id.
+    assert!(matches!(
+        ledger.set_manual_review_hold(424_242, 9_999, "x", "cli:op", 1_000),
+        Err(LedgerError::RequestNotFound(424_242))
+    ));
+
+    // Empty note.
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
+        .fold_sol_deposit(1, amounts(100_000), [3u8; 32], &[4u8; 32], None, 2_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(ledger
+        .set_manual_review_hold(parked, 9_999, "   ", "cli:op", 2_000)
+        .is_err());
+    // Re-holding an already-held row is idempotent (note/time replaced).
+    ledger
+        .set_manual_review_hold(parked, 9_999, "first", "cli:op", 2_000)
+        .unwrap();
+    ledger
+        .set_manual_review_hold(parked, 10_000, "second", "cli:op", 2_001)
+        .unwrap();
+    let row = ledger.get_request(parked).unwrap().unwrap();
+    assert_eq!(row.auto_resume_hold_note.as_deref(), Some("second"));
+    assert_eq!(row.auto_resume_hold_until, Some(10_000));
+}
+
+/// The v29 migration is idempotent and leaves every pre-existing row
+/// unheld — reopening a ledger never manufactures a hold.
+#[test]
+fn v29_reopen_keeps_rows_unheld_and_the_hold_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (held, unheld) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..2u64 {
+            let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+                .fold_sol_deposit(
+                    i,
+                    amounts(100_000),
+                    [i as u8 + 1; 32],
+                    &[i as u8 + 10; 32],
+                    None,
+                    1_000,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            ids.push(request_id);
+        }
+        ledger
+            .set_manual_review_hold(ids[0], 9_999, "freeze", "cli:op", 1_000)
+            .unwrap();
+        (ids[0], ids[1])
+    };
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert_eq!(
+        ledger
+            .get_request(held)
+            .unwrap()
+            .unwrap()
+            .auto_resume_hold_note
+            .as_deref(),
+        Some("freeze")
+    );
+    assert_eq!(
+        ledger
+            .get_request(unheld)
+            .unwrap()
+            .unwrap()
+            .auto_resume_hold_note,
+        None
+    );
+}

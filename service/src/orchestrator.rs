@@ -897,10 +897,18 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     .requests_by_state(direction, RequestState::ManualReview)?
                     .into_iter()
                     .filter(|r| {
-                        Ledger::is_auto_resumable_manual_review_reason(
-                            r.manual_review_note.as_deref(),
-                            liquidity_admission_open,
-                        )
+                        // An operator hold (schema v29) is absolute: the
+                        // row is not a candidate at all, so it neither
+                        // resumes nor consumes this tick's
+                        // `max_auto_resumes_per_tick` budget from the
+                        // unheld rows behind it. The resume path refuses
+                        // it too, but relying on that here would turn
+                        // every held row into a logged failure per tick.
+                        r.auto_resume_hold_note.is_none()
+                            && Ledger::is_auto_resumable_manual_review_reason(
+                                r.manual_review_note.as_deref(),
+                                liquidity_admission_open,
+                            )
                     })
                     .map(|r| (r.created_at, r.id, direction)),
             );

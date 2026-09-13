@@ -5606,4 +5606,89 @@ async fn auto_resume_drains_a_mixed_sol_and_rhn_backlog_in_one_global_order() {
     );
 }
 
+/// An operator hold (schema v29) removes a parked request from the
+/// auto-resume sweep entirely: it is not attempted, it does not consume
+/// the per-tick budget, and the unheld requests behind it drain as if it
+/// were not there. A request folded AFTER the hold is placed is unheld
+/// and resumes normally — the hold is per-row and never inherited.
+#[tokio::test]
+async fn a_held_request_is_skipped_by_auto_resume_and_new_folds_are_unaffected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 5, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let ids = park_utxo_liquidity_requests(&mut ledger, 0, 3);
+        // Hold the two OLDEST — exactly the ones the sweep would take
+        // first — so the test can tell "skipped" from "not reached".
+        for id in &ids[..2] {
+            ledger
+                .set_manual_review_hold(*id, 10 + 72 * 3600, "72h freeze", "cli:test", 10)
+                .unwrap();
+        }
+        // A fold placed after the hold: unheld by construction.
+        let later = park_utxo_liquidity_requests(&mut ledger, 10, 1);
+        let later_row = ledger.get_request(later[0]).unwrap().unwrap();
+        assert_eq!(later_row.auto_resume_hold_note, None);
+        assert_eq!(later_row.auto_resume_hold_until, None);
+        let mut all = ids;
+        all.extend(later);
+        all
+    };
+
+    // Liquidity recovers fully; budget of 2 per tick.
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        seed_mature_vault_utxos(&mut ledger, &vault, 20, 100_000_000_000);
+    }
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 2);
+    let report = orchestrator.tick(20).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.attempted, 2,
+        "held rows must not even be attempted — errors: {:?}",
+        report.errors
+    );
+    assert_eq!(auto_resume.resumed, 2, "errors: {:?}", report.errors);
+
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[0]),
+        RequestState::ManualReview
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[1]),
+        RequestState::ManualReview
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[2]),
+        RequestState::SourceFinalized,
+        "the oldest UNHELD request drains first"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[3]),
+        RequestState::SourceFinalized,
+        "a request folded after the hold is unheld and drains normally"
+    );
+
+    // Another tick: still nothing happens to the held rows, however
+    // much room there is.
+    let report = orchestrator.tick(30).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.attempted, 0);
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[0]),
+        RequestState::ManualReview
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[1]),
+        RequestState::ManualReview
+    );
+}
+
 mod cross_route;

@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glc_reserve_bridge_service::admin_api::{
-    audited_resume_manual_review, audited_set_admission, audited_set_local_pause,
-    audited_set_robinhood_local_pause, audited_set_route_admission, audited_set_route_enabled,
+    audited_manual_review_hold, audited_manual_review_hold_release, audited_resume_manual_review,
+    audited_set_admission, audited_set_local_pause, audited_set_robinhood_local_pause,
+    audited_set_route_admission, audited_set_route_enabled,
 };
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
@@ -301,6 +302,27 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       proof — identical to running manual-review-settle on each candidate.
       --db: no RPC, so the ledger half of the verdict only; the chain half
       is not evaluated and each row says so.
+  glc-admin manual-review-hold --db PATH --request-ids N[,N...] --hold-hours H --note TEXT
+      Places an operator AUTO-RESUME HOLD (schema v29) on each listed
+      request, one audited mutation per id. While held, the daemon's
+      automatic ManualReview recovery pass skips the request entirely and
+      `resume-manual-review` / `manual-review-settle` refuse it; refund
+      commands are unaffected (a hold keeps a request FOR refunding).
+      Per id, refuses unless the request is currently ManualReview with no
+      destination txid and no destination payout row — a request already
+      processing can never be held. Ids are explicit and nothing else is
+      touched: a request folded after this command is exactly as it always
+      was (folds never read or write the hold). `--hold-hours` records the
+      moment the operator intends to act (`auto_resume_hold_until = now +
+      H*3600`); it has no effect on the daemon and the hold does NOT
+      expire on its own — release or refund is always an explicit act.
+      Prints one verdict line per id; exits 1 if any id was refused
+      (the others stay held).
+  glc-admin manual-review-hold-release --db PATH --request-id N --note TEXT
+      Clears one hold. No-op on an unheld request. Never changes state.
+  glc-admin manual-review-hold-list --db PATH
+      Read-only: every request carrying a hold, with state, route, gross,
+      hold_until (and whether it has passed), note.
 
 ROBINHOOD NETWORK (the four routes the custody contract models: GlcToRhn,
 RhnToGlc and, since Phase H, SolToRhn and RhnToSol. All four ship DISABLED
@@ -848,6 +870,9 @@ fn main() {
         "refund-list" => cmd_refund_list(&args),
         "manual-review-settle" => cmd_manual_review_settle(&args),
         "manual-review-settle-list" => cmd_manual_review_settle_list(&args),
+        "manual-review-hold" => cmd_manual_review_hold(&args),
+        "manual-review-hold-release" => cmd_manual_review_hold_release(&args),
+        "manual-review-hold-list" => cmd_manual_review_hold_list(&args),
         "refund-glc-manual-review" => cmd_refund_glc_manual_review(&args),
         "glc-refund-list" => cmd_glc_refund_list(&args),
         "reconcile-unmatched-deposit" => cmd_reconcile_unmatched_deposit(&args),
@@ -1369,6 +1394,118 @@ fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
                 "request {request_id}: already resumed (state={state:?}) — nothing to do, no mutation performed"
             );
         }
+    }
+    Ok(())
+}
+
+/// `manual-review-hold` — see the USAGE banner. Explicit ids only; one
+/// audited mutation each; every refusal lives in
+/// `Ledger::set_manual_review_hold` and is reported per id.
+fn cmd_manual_review_hold(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let ids_raw = require(args, "--request-ids");
+    let hold_hours: i64 = require(args, "--hold-hours")
+        .parse()
+        .map_err(|e| format!("--hold-hours must be an integer: {e}"))?;
+    if !(1..=24 * 365).contains(&hold_hours) {
+        return Err("--hold-hours must be within 1..=8760".to_string());
+    }
+    let note = require_note(args)?;
+    let mut ids = Vec::new();
+    for part in ids_raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let id: i64 = part
+            .parse()
+            .map_err(|e| format!("--request-ids: `{part}` is not an integer: {e}"))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err("--request-ids must name at least one request".to_string());
+    }
+    let now = now_unix();
+    let hold_until = now + hold_hours * 3600;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let actor = cli_actor();
+    let mut held = 0usize;
+    let mut refused = Vec::new();
+    for id in &ids {
+        match audited_manual_review_hold(&mut ledger, *id, hold_until, note, &actor) {
+            Ok(_) => {
+                held += 1;
+                println!("request {id}: HELD (auto_resume_hold_until={hold_until})");
+            }
+            Err(e) => {
+                refused.push(*id);
+                println!("request {id}: REFUSED — {e}");
+            }
+        }
+    }
+    println!(
+        "\n{held} held, {} refused; hold_until={hold_until} ({hold_hours}h from now); note: {note}",
+        refused.len()
+    );
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} request(s) refused and NOT held: {}",
+            refused.len(),
+            refused
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
+}
+
+fn cmd_manual_review_hold_release(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let (released, _receipt) =
+        audited_manual_review_hold_release(&mut ledger, request_id, note, &cli_actor())
+            .map_err(|e| e.to_string())?;
+    if released {
+        println!("request {request_id}: hold released (note: {note})");
+    } else {
+        println!("request {request_id}: not held — nothing to do, no mutation performed");
+    }
+    Ok(())
+}
+
+fn cmd_manual_review_hold_list(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let rows = ledger
+        .held_manual_review_requests()
+        .map_err(|e| e.to_string())?;
+    let now = now_unix();
+    println!(
+        "HELD REQUESTS (schema v29 auto_resume_hold) — {} row(s), now={now}",
+        rows.len()
+    );
+    for r in &rows {
+        let until = r.auto_resume_hold_until.unwrap_or(0);
+        println!(
+            "  id={} route={} state={} gross={} hold_until={} ({}) note={}",
+            r.id,
+            r.direction.as_str(),
+            r.state.as_str(),
+            r.gross_amount_atomic,
+            until,
+            if until <= now { "ELAPSED" } else { "active" },
+            r.auto_resume_hold_note.as_deref().unwrap_or("")
+        );
     }
     Ok(())
 }

@@ -798,6 +798,15 @@ pub struct BridgeRequest {
     pub source_finalized_at: Option<i64>,
     pub failure_reason: Option<String>,
     pub manual_review_note: Option<String>,
+    /// Operator-placed auto-resume hold (schema v29). `Some` means the
+    /// daemon's automatic ManualReview recovery skips this row and every
+    /// resume entry point refuses it until `clear_manual_review_hold`;
+    /// refund tooling ignores it. Never set by a fold — a new row is
+    /// always unheld.
+    pub auto_resume_hold_note: Option<String>,
+    /// Informational companion to the hold: when the operator intends to
+    /// act on the row (unix seconds). Has no effect on the daemon.
+    pub auto_resume_hold_until: Option<i64>,
 }
 
 /// The full gross/fee/net breakdown for one new bridge request, as the

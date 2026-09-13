@@ -4597,6 +4597,7 @@ impl Ledger {
             "resume_manual_review_cross_route is only meaningful for a Solana<->Robinhood route"
         );
         let tx = write_tx(&mut self.conn)?;
+        Self::refuse_if_auto_resume_held(&tx, request_id)?;
 
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -5019,6 +5020,185 @@ impl Ledger {
         self.resume_manual_review_inbound(Direction::RhnToGlc, request_id, note, actor, now)
     }
 
+    /// Reason string every hold/release writes to `bridge_request_state_log`
+    /// (a `ManualReview -> ManualReview` row, so the Explorer shows the
+    /// operator act without inventing a state).
+    pub const AUTO_RESUME_HOLD_TRANSITION_REASON: &str = "auto_resume_hold";
+    pub const AUTO_RESUME_HOLD_RELEASED_TRANSITION_REASON: &str = "auto_resume_hold_released";
+
+    /// Places an operator auto-resume hold on ONE `ManualReview` request
+    /// (schema v29 — see `apply_v29`).
+    ///
+    /// Refuses, without writing, unless the row is currently
+    /// `ManualReview`, has no destination txid and no destination payout
+    /// row — the same "nothing has been paid" predicates the resume and
+    /// refund paths apply, so a request already processing can never be
+    /// marked. Idempotent on an already-held row (the note and time are
+    /// replaced, one audit row is written). Touches nothing else: no
+    /// state, note, reserve figure or other row changes, and a row
+    /// folded after this call is unaffected because folds never read or
+    /// write the hold columns.
+    pub fn set_manual_review_hold(
+        &mut self,
+        request_id: i64,
+        hold_until: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let note = note.trim();
+        if note.is_empty() {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a hold needs a non-empty note".to_string(),
+            });
+        }
+        let tx = write_tx(&mut self.conn)?;
+        let row: Option<(RequestState, Option<Vec<u8>>)> = tx
+            .query_row(
+                "SELECT state, destination_txid FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, destination_txid)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if state != RequestState::ManualReview {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "state is {state:?}, not ManualReview — a hold applies only to parked requests"
+                ),
+            });
+        }
+        if destination_txid.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a destination txid is recorded — this request has been paid out"
+                    .to_string(),
+            });
+        }
+        let payout_rows: i64 = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM goldcoin_payouts WHERE request_id = ?1)
+                  + (SELECT COUNT(*) FROM robinhood_transactions
+                      WHERE request_id = ?1 AND kind <> 'Refund')",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        if payout_rows > 0 {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a destination payout row already exists — this request is processing"
+                    .to_string(),
+            });
+        }
+        tx.execute(
+            "UPDATE bridge_requests
+                SET auto_resume_hold_note = ?1, auto_resume_hold_until = ?2
+              WHERE id = ?3",
+            rusqlite::params![note, hold_until, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::ManualReview,
+            now,
+            Some(Self::AUTO_RESUME_HOLD_TRANSITION_REASON),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clears the hold placed by [`Self::set_manual_review_hold`]. A no-op
+    /// (`Ok(false)`) on a row that is not held; `Ok(true)` when a hold was
+    /// removed. Never changes state.
+    pub fn clear_manual_review_hold(
+        &mut self,
+        request_id: i64,
+        actor: &str,
+        now: i64,
+    ) -> Result<bool, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let held: Option<Option<String>> = tx
+            .query_row(
+                "SELECT auto_resume_hold_note FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(held) = held else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if held.is_none() {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE bridge_requests
+                SET auto_resume_hold_note = NULL, auto_resume_hold_until = NULL
+              WHERE id = ?1",
+            [request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::ManualReview,
+            now,
+            Some(Self::AUTO_RESUME_HOLD_RELEASED_TRANSITION_REASON),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Every request currently carrying a hold, oldest first — whatever
+    /// its state (a held row that was refunded keeps its marker, which is
+    /// the audit trail; the listing shows the state beside it).
+    pub fn held_manual_review_requests(&self) -> Result<Vec<BridgeRequest>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_REQUEST_PREFIX} WHERE auto_resume_hold_note IS NOT NULL ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map([], row_to_request)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The one predicate both resume entry points apply first: a held
+    /// row is refused, by whoever asks (operator or the automatic pass),
+    /// until the hold is cleared. Refund paths deliberately do NOT call
+    /// this — a hold keeps a row FOR refunding.
+    fn refuse_if_auto_resume_held(tx: &Connection, request_id: i64) -> Result<(), LedgerError> {
+        let hold: Option<(Option<String>, Option<i64>)> = tx
+            .query_row(
+                "SELECT auto_resume_hold_note, auto_resume_hold_until
+                   FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(note), until)) = hold {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "held by operator (auto_resume_hold{}): {note} — release with \
+                     `glc-admin manual-review-hold-release` before resuming",
+                    until.map(|u| format!(" until {u}")).unwrap_or_default()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The one body behind both resume wrappers.
     ///
     /// Written as a single function on purpose. A parallel Robinhood
@@ -5042,6 +5222,7 @@ impl Ledger {
             "resume_manual_review_inbound is only meaningful for an inbound-to-Goldcoin route"
         );
         let tx = write_tx(&mut self.conn)?;
+        Self::refuse_if_auto_resume_held(&tx, request_id)?;
 
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -11143,7 +11324,7 @@ const SELECT_REQUEST_PREFIX: &str =
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
     source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract, \
-    source_wallet \
+    source_wallet, auto_resume_hold_note, auto_resume_hold_until \
     FROM bridge_requests";
 const SELECT_REQUEST: &str =
     "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
@@ -11151,7 +11332,7 @@ const SELECT_REQUEST: &str =
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
     source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract, \
-    source_wallet \
+    source_wallet, auto_resume_hold_note, auto_resume_hold_until \
     FROM bridge_requests WHERE id = ?1";
 
 fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
@@ -11185,6 +11366,8 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
         source_chain: r.get(22)?,
         source_contract: r.get(23)?,
         source_wallet: r.get(24)?,
+        auto_resume_hold_note: r.get(25)?,
+        auto_resume_hold_until: r.get(26)?,
     })
 }
 

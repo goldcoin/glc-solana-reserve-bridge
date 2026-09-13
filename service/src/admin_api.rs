@@ -1826,6 +1826,89 @@ pub fn audited_set_route_admission(
     .map(|((), receipt)| receipt)
 }
 
+/// Places an operator auto-resume hold on one `ManualReview` request
+/// (schema v29), through the shared audit path — see
+/// [`Ledger::set_manual_review_hold`] for every refusal, none of which is
+/// re-implemented here.
+pub fn audited_manual_review_hold(
+    ledger: &mut Ledger,
+    request_id: i64,
+    hold_until: i64,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "manual_review_hold",
+            target: request_id.to_string(),
+            note,
+            new_value: Some(format!("auto_resume_hold_until={hold_until}")),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "state={} hold={}",
+                    r.state.as_str(),
+                    r.auto_resume_hold_until
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            }))
+        },
+        |l| {
+            l.set_manual_review_hold(request_id, hold_until, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
+/// Clears a hold placed by [`audited_manual_review_hold`]. Returns whether
+/// a hold was actually removed (`false` = already unheld, no-op).
+pub fn audited_manual_review_hold_release(
+    ledger: &mut Ledger,
+    request_id: i64,
+    note: &str,
+    actor: &str,
+) -> Result<(bool, MutationReceipt), AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "manual_review_hold_release",
+            target: request_id.to_string(),
+            note,
+            new_value: None,
+        },
+        |l| {
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "hold={}",
+                    r.auto_resume_hold_until
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            }))
+        },
+        |l| {
+            l.clear_manual_review_hold(request_id, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |released, params| {
+            params.new_value = Some(if *released {
+                "hold=none".to_string()
+            } else {
+                "no-op: not held".to_string()
+            });
+        },
+    )
+}
+
 /// ManualReview resume, audited — the one implementation behind both
 /// `POST /manual-review/{id}/resume` and `glc-admin
 /// resume-manual-review`. The authenticated `actor` is recorded on BOTH

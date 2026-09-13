@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 28;
+const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -84,6 +84,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v26(conn)?;
         apply_v27(conn)?;
         apply_v28(conn)?;
+        apply_v29(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -169,6 +170,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(28) {
             apply_v28(conn)?;
+        }
+        if current < Some(29) {
+            apply_v29(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2868,6 +2872,47 @@ fn apply_v28(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v29 — a per-request **auto-resume hold** on `bridge_requests`
+/// (2026-09-12 incident follow-up).
+///
+/// `auto_resume_hold_note` (TEXT, NULL = no hold) and
+/// `auto_resume_hold_until` (INTEGER unix seconds, informational: the
+/// moment the operator intends to act on the row, e.g. refund it).
+/// While `auto_resume_hold_note` is set, the daemon's automatic
+/// ManualReview recovery pass skips the row and every resume entry
+/// point refuses it; refund tooling is unaffected. Set and cleared ONLY
+/// by explicit operator command on explicit request ids
+/// (`glc-admin manual-review-hold` / `manual-review-hold-release`),
+/// never by a fold, a tick or a migration — so a row created after a
+/// hold was placed is exactly as it always was (both columns NULL).
+///
+/// # Why a column and not a note
+///
+/// `manual_review_note` is the durable key every resume/refund allowlist
+/// matches on; rewriting it to "hold" a row would silently disqualify
+/// the row from `refund-manual-review`, which is the one thing a held
+/// row is being kept FOR. The hold is therefore its own column and its
+/// own predicate, and the note keeps meaning what it meant at fold time.
+///
+/// # Idempotence
+///
+/// `column_exists`-guarded `ALTER`s; no backfill (every existing row is
+/// unheld, which is the correct starting state). A re-run does nothing.
+fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "bridge_requests", "auto_resume_hold_note")? {
+        conn.execute_batch(
+            "ALTER TABLE bridge_requests ADD COLUMN auto_resume_hold_note TEXT
+                CHECK (auto_resume_hold_note IS NULL OR length(auto_resume_hold_note) > 0);",
+        )?;
+    }
+    if !column_exists(conn, "bridge_requests", "auto_resume_hold_until")? {
+        conn.execute_batch(
+            "ALTER TABLE bridge_requests ADD COLUMN auto_resume_hold_until INTEGER;",
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether `ddl` already admits everything `to` would have added: every
 /// quoted value in `to` appears in `ddl`. Used only after `from` is known
 /// to be absent, so this is asking "did a later migration go past this
@@ -3318,7 +3363,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4505,7 +4550,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
