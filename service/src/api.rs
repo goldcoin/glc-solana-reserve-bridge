@@ -316,6 +316,23 @@ pub struct BridgeStatus {
     /// admission axis on its own.
     #[serde(default)]
     pub goldcoin_destination_admission_open: bool,
+    /// Machine-readable cause when [`BridgeStatus::sol_to_glc_available`]
+    /// is `false`; `null` when available. The same vocabulary as
+    /// `GET /chains`'s [`RouteView::availability_reason`], plus
+    /// [`AVAILABILITY_REASON_QUOTA_EXHAUSTED`] for the one gate this
+    /// endpoint applies that `/chains` does not (the program's
+    /// rolling-24h-volume window). `liquidity_buffer_low` here is the
+    /// 2026-09-12 shape: every reserve gate open, headroom positive, and
+    /// still no normal-sized deposit admissible.
+    #[serde(default)]
+    pub sol_to_glc_availability_reason: Option<String>,
+    /// `SolToGlc`'s capacity figures — the same [`RouteCapacityView`]
+    /// `GET /chains` carries for the route, so a status page can render
+    /// headroom, buffer and "up to N" without a second request. `null`
+    /// only when the probe could not be built (see
+    /// [`AVAILABILITY_REASON_PROBE_UNAVAILABLE`]).
+    #[serde(default)]
+    pub sol_to_glc_capacity: Option<RouteCapacityView>,
 }
 
 /// One executable route's configured fee, for the surfaces that report
@@ -512,6 +529,9 @@ pub struct BridgeStats {
     pub solana_paused: bool,
     pub glc_to_sol_available: bool,
     pub sol_to_glc_available: bool,
+    /// See [`BridgeStatus::sol_to_glc_availability_reason`].
+    #[serde(default)]
+    pub sol_to_glc_availability_reason: Option<String>,
     /// See [`BridgeStatus::glc_to_sol_quota_exhausted`].
     pub glc_to_sol_quota_exhausted: bool,
     /// See [`BridgeStatus::sol_to_glc_quota_exhausted`].
@@ -649,7 +669,7 @@ pub struct ChainView {
 /// Use `enabled`/`implemented` only to choose the WORDING — "Coming
 /// soon" for a route this build cannot serve, versus "temporarily
 /// unavailable" for one that is switched on but currently closed.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteView {
     /// `GlcToSol` | `SolToGlc` | `GlcToRhn` | `RhnToGlc` | `SolToRhn` |
     /// `RhnToSol`.
@@ -678,11 +698,17 @@ pub struct RouteView {
     /// disabled route, a destination reserve with no `reserve_ledger`
     /// row, or a ledger read that did not complete all report `false`.
     ///
-    /// Amount-independent, and necessarily so — it is asked before an
-    /// amount exists. It answers "would a minimum-sized deposit be
-    /// admitted", so a large enough transfer can still be held back by
-    /// the safety buffer or by capacity even while this is `true`. Two
-    /// further things it does not cover, each with its own endpoint: the
+    /// Asked before an amount exists, so it is evaluated at a STATED
+    /// size. For `SolToGlc` that is the Solana program's
+    /// `per_transfer_limit` — the largest deposit the program accepts —
+    /// so `true` means "the largest permitted deposit would be admitted
+    /// under every gate, the confirmed-liquidity safety buffer
+    /// included", and any smaller one would too (see
+    /// [`AdmissionProbe`] and `capacity`). Every other route is still
+    /// evaluated at one atomic unit ("would a minimum-sized deposit be
+    /// admitted"), so on those a large enough transfer can be held back
+    /// by the buffer or by capacity while this is `true`. Two further
+    /// things it does not cover, each with its own endpoint: the
     /// per-wallet rolling-24h windows on both legs of every route
     /// (`GET /routes/{route}/eligibility`, and the older
     /// `GET /recipients/{sol,rhn}-to-glc/eligibility`), and — for
@@ -726,6 +752,152 @@ pub struct RouteView {
     /// other amount on this API uses.
     #[serde(default)]
     pub min_transfer_atomic: AtomicU64,
+    /// **Machine-readable cause** when `available` is `false`; `null`
+    /// when available. Where `unavailable_reason` carries end-user copy
+    /// and deliberately names no gate, this names exactly one: the
+    /// highest-ranked gate that refused, in
+    /// [`crate::ledger::admission::InboundAdmissionBlocker::as_str`]'s
+    /// vocabulary (`liquidity_buffer_low`, `route_admission_closed`,
+    /// `reserve_admission_closed`, `reserve_paused`,
+    /// `utxo_liquidity_low`, `insufficient_capacity`) plus the cases the
+    /// evaluator never sees: [`AVAILABILITY_REASON_NOT_IMPLEMENTED`],
+    /// [`AVAILABILITY_REASON_ROUTE_DISABLED`],
+    /// [`AVAILABILITY_REASON_ONCHAIN_PAUSED`],
+    /// [`AVAILABILITY_REASON_RESERVE_UNAVAILABLE`] and
+    /// [`AVAILABILITY_REASON_PROBE_UNAVAILABLE`].
+    ///
+    /// Added after the 2026-09-12 incident, in which `SolToGlc` was
+    /// advertised `available: true` while every normal-sized deposit
+    /// parked `liquidity_buffer_low_at_fold`, and nothing on this
+    /// endpoint could say so. Operators and integrators need the gate;
+    /// end users keep getting `unavailable_reason`.
+    #[serde(default)]
+    pub availability_reason: Option<String>,
+    /// The destination reserve's admission capacity as it bears on THIS
+    /// route, for routes with a known normal transfer size — today
+    /// `SolToGlc`, probed at the Solana program's `per_transfer_limit`.
+    /// `null` for every other route. See [`RouteCapacityView`].
+    #[serde(default)]
+    pub capacity: Option<RouteCapacityView>,
+}
+
+/// Machine-readable `availability_reason` for a route this build cannot
+/// serve at all (`Route::as_direction()` is `None`).
+pub const AVAILABILITY_REASON_NOT_IMPLEMENTED: &str = "not_implemented";
+/// `availability_reason` when the route gate (`crate::routes::RouteGate`)
+/// has the route switched off.
+pub const AVAILABILITY_REASON_ROUTE_DISABLED: &str = "route_disabled";
+/// `availability_reason` when the Solana program's own pause flags refuse
+/// this route's Solana leg, or `bridge_config` could not be read
+/// (fail-closed).
+pub const AVAILABILITY_REASON_ONCHAIN_PAUSED: &str = "onchain_paused";
+/// `availability_reason` when the destination reserve's gates could not
+/// be read (no `reserve_ledger` row, or a failed read) — fail-closed.
+pub const AVAILABILITY_REASON_RESERVE_UNAVAILABLE: &str = "reserve_unavailable";
+/// `availability_reason` when a route whose availability must be probed
+/// at its normal transfer size had no probe to evaluate against
+/// (`per_transfer_limit` or the reserve mint's decimals unreadable) —
+/// fail-closed, never "available at an unknown size".
+pub const AVAILABILITY_REASON_PROBE_UNAVAILABLE: &str = "probe_unavailable";
+/// `GET /status`-only `availability_reason`: every admission gate is
+/// open but the Solana program's rolling-24h-volume window for this
+/// direction is exhausted (`sol_to_glc_quota_exhausted`).
+pub const AVAILABILITY_REASON_QUOTA_EXHAUSTED: &str = "quota_exhausted";
+
+/// One route's view of its destination reserve's admission capacity,
+/// canonical 8-decimal units throughout.
+///
+/// The figures the confirmed-liquidity safety buffer rule is stated in
+/// (docs/09-runbook.md's "Confirmed-liquidity admission safety buffer":
+/// a deposit is admitted only while `headroom - net >= buffer`), so a
+/// client can see WHY a route is closed for capacity and how large a
+/// transfer would currently go through — instead of learning it by
+/// having a deposit parked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteCapacityView {
+    /// Confirmed, unreserved destination headroom right now:
+    /// `total_reserve_balance - protected_minimum - reserved_liquidity`
+    /// (`InboundAdmissionGates::confirmed_headroom_atomic`). May be
+    /// negative when the reserve is over-committed.
+    pub confirmed_headroom_atomic: AtomicI64,
+    /// The configured admission safety buffer headroom must stay above
+    /// AFTER admitting a transfer (`0` = disabled).
+    pub liquidity_buffer_atomic: AtomicI64,
+    /// The largest GROSS transfer the DESTINATION RESERVE would admit
+    /// right now: the buffer rule's `headroom - buffer` (or plain
+    /// headroom with no buffer) grossed up through the route fee
+    /// ([`crate::amount_conversion::max_gross_for_net_at_bps`]). `0`
+    /// when any amount-independent gate is closed or headroom is
+    /// already inside the buffer.
+    ///
+    /// Deliberately NOT capped at the program's own per-transfer limit,
+    /// so the two figures can be compared: `available` is `true` exactly
+    /// when this is at least `probe_gross_atomic` (and no other gate
+    /// refuses). In the 2026-09-12 shape this read ~32,183 GLC against a
+    /// 50,000 GLC probe — the sentence an operator needed and no field
+    /// could say. A UI offering an amount should still respect the
+    /// program's own limits (`GET /limits`) on top.
+    pub max_admissible_gross_atomic: AtomicU64,
+    /// The automatic confirmed-liquidity gate's persisted hysteresis
+    /// state: `true` while it is holding ALL new obligations back, until
+    /// headroom recovers to the reopen threshold. Distinct from a
+    /// per-amount buffer refusal, which can occur while this is `false`.
+    pub liquidity_admission_closed: bool,
+    /// The GROSS this route's availability was evaluated at — the
+    /// "normal transfer" the `available` verdict answers for.
+    pub probe_gross_atomic: AtomicU64,
+}
+
+/// The transfer size a route's public availability is evaluated at.
+///
+/// For `SolToGlc` this is the Solana program's `per_transfer_limit` — the
+/// largest deposit the program will accept — widened to canonical units
+/// and netted through the route's own fee, so `available: true` means
+/// "the largest permitted deposit would be admitted", and a smaller one
+/// therefore would too. Built once per request by
+/// [`BridgeApi::sol_to_glc_probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionProbe {
+    /// The gross the probe stands for, canonical.
+    pub gross_canonical: u64,
+    /// The route fee it was netted at.
+    pub fee_bps: u64,
+    /// The net destination amount the evaluator is asked about.
+    pub net_destination_atomic: i64,
+}
+
+/// Every probe [`RouteView::build`] may need, resolved by the endpoint
+/// once so a listing of six routes performs the chain reads once.
+/// `None` for a route means that route is evaluated at the weakest form
+/// ([`InboundAdmissionGates::route_blocker`]) exactly as before — for
+/// the routes that carry no probe, and for `SolToGlc` when the probe
+/// could not be built (which then fails closed inside
+/// [`route_availability`], never silently falling back to the weak form).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouteProbes {
+    pub sol_to_glc: Option<AdmissionProbe>,
+}
+
+/// The full availability verdict [`route_availability`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAvailability {
+    pub available: bool,
+    /// End-user copy, cause-agnostic — see `RouteView::unavailable_reason`.
+    pub unavailable_reason: Option<String>,
+    /// Machine-readable gate — see `RouteView::availability_reason`.
+    pub availability_reason: Option<String>,
+    pub capacity: Option<RouteCapacityView>,
+}
+
+impl RouteAvailability {
+    fn unavailable(copy: &str, reason: &str) -> RouteAvailability {
+        RouteAvailability {
+            available: false,
+            unavailable_reason: Some(copy.to_string()),
+            availability_reason: Some(reason.to_string()),
+            capacity: None,
+        }
+    }
 }
 
 impl RouteView {
@@ -745,13 +917,19 @@ impl RouteView {
         route_gate: &crate::routes::RouteGate,
         ledger: &Ledger,
         onchain: SolanaProgramPause,
+        probes: RouteProbes,
         route: crate::routes::Route,
     ) -> RouteView {
         // One gate evaluation per route, same call the write paths make
         // — this listing can never claim a route is open that
         // `POST /transfers` would then refuse.
         let enabled = route_gate.is_enabled(ledger, route);
-        let (available, unavailable_reason) = route_availability(ledger, onchain, route, enabled);
+        let RouteAvailability {
+            available,
+            unavailable_reason,
+            availability_reason,
+            capacity,
+        } = route_availability(ledger, onchain, probes, route, enabled);
         RouteView {
             id: route.as_str().to_string(),
             source_chain: route.source_chain().as_str().to_string(),
@@ -766,22 +944,44 @@ impl RouteView {
             // happens to be open this minute, and a UI showing a closed
             // route's limits should show the real ones.
             min_transfer_atomic: AtomicU64(crate::min_transfer::source_minimum(route).0),
+            availability_reason,
+            capacity,
         }
     }
 }
 
-/// Whether `route` would currently admit a new transfer, and the
-/// cause-agnostic copy to show when it would not.
+/// Whether `route` would currently admit a new transfer, the
+/// cause-agnostic copy to show when it would not, the machine-readable
+/// gate that refused, and — for a probed route — its capacity figures.
 ///
 /// # Where the answer comes from
 ///
 /// Every runtime gate is read through
-/// [`Ledger::route_admission_blocker`], i.e. through the SAME
+/// [`Ledger::inbound_admission_gates`], i.e. through the SAME
 /// [`crate::ledger::InboundAdmissionGates`] evaluator
 /// `Ledger::fold_sol_deposit` and `Ledger::fold_robinhood_deposit` gate
 /// on. Nothing is re-derived here, and nothing is guessed: this function
 /// owns only the mapping from "which reserve does this route draw on"
-/// to that shared decision, plus the fail-closed cases.
+/// to that shared decision, the size the decision is asked at, and the
+/// fail-closed cases.
+///
+/// # The size the decision is asked at
+///
+/// A route with a probe in `probes` is evaluated at that probe's net —
+/// [`InboundAdmissionGates::route_blocker_at`] — so `available: true`
+/// means "a normal, permitted transfer would be admitted". For
+/// `SolToGlc` the probe is the Solana program's `per_transfer_limit`
+/// (see [`AdmissionProbe`]). Before this existed every route was
+/// evaluated at one atomic unit, which with a safety buffer configured
+/// is `headroom > buffer` — true for a long stretch of headroom in
+/// which every real deposit fails `headroom - net >= buffer` and parks.
+/// That is the 2026-09-12 incident, and a probed route can no longer
+/// report it as open. A route without a probe keeps the weakest form
+/// ([`InboundAdmissionGates::route_blocker`]), exactly as before.
+///
+/// A route that REQUIRES a probe (`SolToGlc`) and has none fails closed
+/// with [`AVAILABILITY_REASON_PROBE_UNAVAILABLE`]: "we could not work
+/// out what a normal transfer is" must never render as available.
 ///
 /// The reserve is the route's DESTINATION reserve
 /// (`Direction::destination_reserve`) because that is the pool the
@@ -801,30 +1001,38 @@ impl RouteView {
 /// # Fail-closed, in every branch that can fail
 ///
 /// A non-implemented route, a disabled route, an unconfigured
-/// destination reserve and a failed ledger read all answer `false`. For
-/// `RhnToGlc` in particular there is no `POST /transfers` preflight
-/// between this answer and an irreversible on-chain deposit, so
-/// "unknown" must never render as "available".
+/// destination reserve, a failed ledger read and a missing required
+/// probe all answer `false`. For `RhnToGlc` in particular there is no
+/// `POST /transfers` preflight between this answer and an irreversible
+/// on-chain deposit, so "unknown" must never render as "available".
+///
+/// # Read-only
+///
+/// Evaluates the confirmed-liquidity gate's PERSISTED hysteresis state
+/// and never the rule, so asking never moves a gate; and the automatic
+/// gate, the buffer thresholds and every resume policy are untouched —
+/// this changes what is REPORTED, never what is admitted.
 fn route_availability(
     ledger: &Ledger,
     onchain: SolanaProgramPause,
+    probes: RouteProbes,
     route: crate::routes::Route,
     enabled: bool,
-) -> (bool, Option<String>) {
+) -> RouteAvailability {
     // A route with no settlement machinery, or one the route gate
     // refuses, is unavailable for the reason the gate already reports —
     // the same copy `disabled_reason` carries, so a UI showing one
     // message never has to reconcile two.
     let Some(direction) = route.as_direction() else {
-        return (
-            false,
-            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()),
+        return RouteAvailability::unavailable(
+            crate::routes::RouteGateError::UNAVAILABLE_MESSAGE,
+            AVAILABILITY_REASON_NOT_IMPLEMENTED,
         );
     };
     if !enabled {
-        return (
-            false,
-            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()),
+        return RouteAvailability::unavailable(
+            crate::routes::RouteGateError::UNAVAILABLE_MESSAGE,
+            AVAILABILITY_REASON_ROUTE_DISABLED,
         );
     }
     // The Solana program's own circuit breaker for this route's Solana
@@ -836,23 +1044,76 @@ fn route_availability(
     // and which layer paused is an operator detail (`glc-admin
     // show-config`, the admin API's `/onchain`).
     if onchain.blocks(direction) {
-        return (false, Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string()));
+        return RouteAvailability::unavailable(
+            DIRECTION_UNAVAILABLE_MESSAGE,
+            AVAILABILITY_REASON_ONCHAIN_PAUSED,
+        );
     }
-    match ledger.route_admission_blocker(direction) {
-        Ok(None) => (true, None),
+    // Which size to ask at. `SolToGlc` MUST be probed; every other route
+    // keeps the weakest form until it too has a stated normal size.
+    let probe = match route {
+        crate::routes::Route::SolToGlc => match probes.sol_to_glc {
+            Some(p) => Some(p),
+            None => {
+                return RouteAvailability::unavailable(
+                    DIRECTION_UNAVAILABLE_MESSAGE,
+                    AVAILABILITY_REASON_PROBE_UNAVAILABLE,
+                )
+            }
+        },
+        _ => None,
+    };
+    // Includes `ReserveNotInitialized` — a destination reserve this
+    // deployment has no row for can admit nothing, and reporting
+    // "available" for it would be the exact inversion of the
+    // fail-closed rule everywhere else in this module.
+    let gates = match ledger.inbound_admission_gates(direction) {
+        Ok(g) => g,
+        Err(_) => {
+            return RouteAvailability::unavailable(
+                DIRECTION_UNAVAILABLE_MESSAGE,
+                AVAILABILITY_REASON_RESERVE_UNAVAILABLE,
+            )
+        }
+    };
+    let blocker = match probe {
+        Some(p) => gates.route_blocker_at(p.net_destination_atomic),
+        None => gates.route_blocker(),
+    };
+    let available = blocker.is_none();
+    // The capacity figures travel with every probed verdict, open or
+    // closed, so a client can show "closed: headroom X against buffer Y,
+    // reserve admits up to N" as readily as "open". `max_admissible_
+    // gross_atomic` is the evaluator's own bound grossed up through the
+    // route fee — see the field's docs for why it is not capped at the
+    // probe. A gross-up that cannot be computed (an unpriceable rate)
+    // reports `0`, the fail-closed figure.
+    let capacity = probe.map(|p| {
+        let max_net = gates.max_admissible_net_destination_atomic().max(0) as u64;
+        let max_gross = crate::amount_conversion::max_gross_for_net_at_bps(
+            crate::amount_conversion::CanonicalAtomic(max_net),
+            p.fee_bps,
+        )
+        .map(|g| g.0)
+        .unwrap_or(0);
+        RouteCapacityView {
+            confirmed_headroom_atomic: AtomicI64(gates.confirmed_headroom_atomic),
+            liquidity_buffer_atomic: AtomicI64(gates.admission_buffer_atomic),
+            max_admissible_gross_atomic: AtomicU64(max_gross),
+            liquidity_admission_closed: gates.liquidity_admission_closed,
+            probe_gross_atomic: AtomicU64(p.gross_canonical),
+        }
+    });
+    RouteAvailability {
+        available,
         // A closed runtime gate is a capacity/pause condition, not a
         // "this route does not exist yet" condition, so it gets the
         // capacity copy rather than the route-gate copy. Which gate
-        // closed is deliberately not disclosed here — that is an
-        // operator detail (`glc-admin status`, the admin API,
-        // `/metrics`), exactly as `DIRECTION_UNAVAILABLE_MESSAGE`'s own
-        // docs require.
-        Ok(Some(_)) => (false, Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string())),
-        // Includes `ReserveNotInitialized` — a destination reserve this
-        // deployment has no row for can admit nothing, and reporting
-        // "available" for it would be the exact inversion of the
-        // fail-closed rule everywhere else in this module.
-        Err(_) => (false, Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string())),
+        // closed is deliberately not disclosed in THIS field — that is
+        // what `availability_reason` is for.
+        unavailable_reason: (!available).then(|| DIRECTION_UNAVAILABLE_MESSAGE.to_string()),
+        availability_reason: blocker.map(|b| b.as_str().to_string()),
+        capacity,
     }
 }
 
@@ -2408,23 +2669,119 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         accounts::decode_bridge_config(&account.data).map_err(|e| ApiError::Upstream(e.to_string()))
     }
 
-    /// The Solana program's pause flags for route listings. Fail-closed:
-    /// a `bridge_config` that cannot be read or decoded answers
-    /// [`SolanaProgramPause::UNKNOWN`] (every Solana leg paused) rather
-    /// than failing the whole listing, so `GET /chains` keeps serving the
-    /// Goldcoin<->Robinhood routes — which the program cannot affect —
-    /// while never advertising a Solana route it cannot vouch for.
-    async fn solana_program_pause(&self) -> SolanaProgramPause {
+    /// The size `SolToGlc`'s public availability is evaluated at — see
+    /// [`AdmissionProbe`] and [`route_availability`]'s "The size the
+    /// decision is asked at".
+    ///
+    /// Takes the already-fetched `bridge_config` so a listing pays for
+    /// one extra chain read (the reserve mint's live `decimals`, which
+    /// the widening to canonical needs) and not two. `None` — logged —
+    /// when the mint cannot be read, the widening is inexact, or the
+    /// route is unpriced; the caller then fails closed with
+    /// [`AVAILABILITY_REASON_PROBE_UNAVAILABLE`] rather than falling
+    /// back to the one-unit form, because "we do not know what a normal
+    /// transfer is" is not a reason to advertise the route.
+    ///
+    /// A `per_transfer_limit` so small it nets to nothing is probed at
+    /// one atomic unit: the program would refuse every deposit anyway,
+    /// and the weakest form is the only one left to ask.
+    async fn sol_to_glc_probe(
+        &self,
+        config: &accounts::BridgeConfigSnapshot,
+    ) -> Option<AdmissionProbe> {
+        let route = crate::routes::Route::SolToGlc;
+        let decimals = match accounts::fetch_reserve_mint_decimals(
+            &self.solana_rpc,
+            &config.reserve_token_mint,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "reserve mint decimals unreadable; SolToGlc availability fails closed (no probe)"
+                );
+                return None;
+            }
+        };
+        let gross = match crate::amount_conversion::SolanaAtomic(config.per_transfer_limit)
+            .to_canonical(decimals)
+        {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    per_transfer_limit = config.per_transfer_limit,
+                    "per_transfer_limit does not widen to canonical; SolToGlc availability fails closed"
+                );
+                return None;
+            }
+        };
+        let fee_bps = match self.route_fees.fee_bps(route) {
+            Ok(bps) => bps,
+            Err(e) => {
+                tracing::warn!(error = %e, "SolToGlc is unpriced; availability fails closed");
+                return None;
+            }
+        };
+        let net = match crate::amount_conversion::compute_fee_at_bps(gross, fee_bps) {
+            Ok(fb) => fb.net.0,
+            Err(e) => {
+                tracing::warn!(error = %e, "SolToGlc probe fee computation failed; fails closed");
+                return None;
+            }
+        };
+        Some(AdmissionProbe {
+            gross_canonical: gross.0,
+            fee_bps,
+            net_destination_atomic: i64::try_from(net).ok()?.max(1),
+        })
+    }
+
+    /// [`SolanaProgramPause`] and [`RouteProbes`] together, from ONE
+    /// `bridge_config` read — what every route listing needs. Fail-closed
+    /// on both axes when the config is unreadable: every Solana leg is
+    /// treated as paused ([`SolanaProgramPause::UNKNOWN`]) so `GET
+    /// /chains` keeps serving the Goldcoin<->Robinhood routes — which the
+    /// program cannot affect — while never advertising a Solana route it
+    /// cannot vouch for, and `SolToGlc` additionally has no probe.
+    async fn route_listing_inputs(&self) -> (SolanaProgramPause, RouteProbes) {
         match self.fetch_bridge_config().await {
-            Ok(config) => SolanaProgramPause::from_config(&config),
+            Ok(config) => (
+                SolanaProgramPause::from_config(&config),
+                RouteProbes {
+                    sol_to_glc: self.sol_to_glc_probe(&config).await,
+                },
+            ),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "bridge_config unreadable; reporting every Solana route as unavailable (fail-closed)"
                 );
-                SolanaProgramPause::UNKNOWN
+                (SolanaProgramPause::UNKNOWN, RouteProbes::default())
             }
         }
+    }
+
+    /// `SolToGlc`'s [`route_availability`] verdict for the status
+    /// surfaces. Synchronous on purpose: the probe (the one chain read
+    /// involved) is resolved by the caller first, so no `&Ledger` is
+    /// ever held across an await.
+    fn sol_to_glc_verdict(
+        &self,
+        ledger: &Ledger,
+        onchain: SolanaProgramPause,
+        probes: RouteProbes,
+    ) -> RouteAvailability {
+        let route = crate::routes::Route::SolToGlc;
+        route_availability(
+            ledger,
+            onchain,
+            probes,
+            route,
+            self.route_gate.is_enabled(ledger, route),
+        )
     }
 
     /// Live rolling-24h-volume headroom remaining for one direction's
@@ -2525,11 +2882,25 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 && !onchain.blocks(Direction::GlcToSol)
                 && !glc_to_sol_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
-            let sol_to_glc_available = !goldcoin_paused
-                && !onchain.blocks(Direction::SolToGlc)
-                && sol_to_glc_admission_open
-                && !sol_to_glc_quota_exhausted
-                && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
+            // `SolToGlc` through the SAME verdict `GET /chains` reports —
+            // the shared evaluator, probed at the program's
+            // `per_transfer_limit` — and then the program's rolling
+            // window on top, which is this endpoint's own gate. Every
+            // clause the old boolean chain spelled out (pause, both
+            // admission axes, capacity > 0) is a gate inside that
+            // evaluator; what it adds is the buffer rule at a REAL size,
+            // so this field can no longer read `true` while every
+            // normal deposit parks `liquidity_buffer_low_at_fold`.
+            let probes = RouteProbes {
+                sol_to_glc: self.sol_to_glc_probe(&config).await,
+            };
+            let sol_to_glc_verdict = self.sol_to_glc_verdict(&ledger, onchain, probes);
+            let sol_to_glc_available = sol_to_glc_verdict.available && !sol_to_glc_quota_exhausted;
+            let sol_to_glc_availability_reason =
+                sol_to_glc_verdict.availability_reason.clone().or_else(|| {
+                    sol_to_glc_quota_exhausted
+                        .then(|| AVAILABILITY_REASON_QUOTA_EXHAUSTED.to_string())
+                });
             Ok(BridgeStatus {
                 goldcoin_paused,
                 solana_paused,
@@ -2543,6 +2914,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 sol_to_glc_rolling_volume_remaining: AtomicU64(sol_to_glc_rolling_volume_remaining),
                 sol_to_glc_admission_open,
                 goldcoin_destination_admission_open,
+                sol_to_glc_availability_reason,
+                sol_to_glc_capacity: sol_to_glc_verdict.capacity,
             })
         })
     }
@@ -2558,10 +2931,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     display_name: c.display_name().to_string(),
                 })
                 .collect();
-            let onchain = self.solana_program_pause().await;
+            let (onchain, probes) = self.route_listing_inputs().await;
             let routes = crate::routes::Route::ALL
                 .iter()
-                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, *r))
+                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, probes, *r))
                 .collect();
             Ok(ChainsView {
                 chains,
@@ -2632,10 +3005,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 && !onchain.blocks(Direction::GlcToSol)
                 && !glc_to_sol_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
-            let sol_to_glc_available = !goldcoin_paused
-                && !onchain.blocks(Direction::SolToGlc)
-                && !sol_to_glc_quota_exhausted
-                && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
+            // Same verdict as `GET /status` and `GET /chains` — see
+            // `status()` for why the boolean chain this replaced could
+            // advertise a route every normal deposit would park on.
+            let probes = RouteProbes {
+                sol_to_glc: self.sol_to_glc_probe(&config).await,
+            };
+            let sol_to_glc_verdict = self.sol_to_glc_verdict(&ledger, onchain, probes);
+            let sol_to_glc_available = sol_to_glc_verdict.available && !sol_to_glc_quota_exhausted;
+            let sol_to_glc_availability_reason =
+                sol_to_glc_verdict.availability_reason.clone().or_else(|| {
+                    sol_to_glc_quota_exhausted
+                        .then(|| AVAILABILITY_REASON_QUOTA_EXHAUSTED.to_string())
+                });
 
             let glc_to_sol = direction_stats(ledger.request_state_counts(Direction::GlcToSol)?);
             let sol_to_glc = direction_stats(ledger.request_state_counts(Direction::SolToGlc)?);
@@ -2714,6 +3096,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 solana_paused,
                 glc_to_sol_available,
                 sol_to_glc_available,
+                sol_to_glc_availability_reason,
                 glc_to_sol_quota_exhausted,
                 sol_to_glc_quota_exhausted,
                 glc_to_sol_rolling_volume_remaining: AtomicU64(glc_to_sol_rolling_volume_remaining),
@@ -3299,11 +3682,11 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let report = crate::robinhood::admin::reserve_report(&ledger, now)?;
             // Every route with a Robinhood leg — the four the custody
             // contract models.
-            let onchain = self.solana_program_pause().await;
+            let (onchain, probes) = self.route_listing_inputs().await;
             let routes = crate::routes::Route::ALL
                 .iter()
                 .filter(|r| r.contract_route_id().is_some())
-                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, *r))
+                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, probes, *r))
                 .collect();
             let onchain = self.robinhood_onchain_view(now).await;
             Ok(RobinhoodReserveView {

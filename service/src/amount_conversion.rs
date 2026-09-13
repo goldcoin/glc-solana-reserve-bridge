@@ -392,6 +392,51 @@ pub fn verify_fee_breakdown(
     Ok(fb)
 }
 
+/// The largest GROSS whose net at `fee_bps` does not exceed `max_net` —
+/// the inverse of [`compute_fee_at_bps`], for rendering "up to N GLC"
+/// from a net-denominated capacity figure.
+///
+/// Exact by construction rather than by formula: the closed-form
+/// estimate `max_net * 10000 / (10000 - fee_bps)` is only a starting
+/// point, because [`compute_fee_at_bps`] floors the fee and so its net is
+/// a step function of the gross. The estimate is then walked to the
+/// exact boundary against the real function — `net(gross) <= max_net`
+/// and `net(gross + 1) > max_net` — so the two can never disagree by a
+/// rounding unit. `0` for a zero `max_net`; a `fee_bps` of 100% (no net
+/// is ever delivered) also answers `0` rather than dividing by zero.
+pub fn max_gross_for_net_at_bps(
+    max_net: CanonicalAtomic,
+    fee_bps: u64,
+) -> Result<CanonicalAtomic, ConversionError> {
+    if fee_bps > BPS_DENOMINATOR {
+        return Err(ConversionError::FeeBpsOutOfRange {
+            fee_bps,
+            max: BPS_DENOMINATOR,
+        });
+    }
+    if max_net.0 == 0 || fee_bps == BPS_DENOMINATOR {
+        return Ok(CanonicalAtomic(0));
+    }
+    let net_of =
+        |gross: u64| compute_fee_at_bps(CanonicalAtomic(gross), fee_bps).map(|fb| fb.net.0);
+    let estimate =
+        (max_net.0 as u128) * (BPS_DENOMINATOR as u128) / ((BPS_DENOMINATOR - fee_bps) as u128);
+    let mut gross = u64::try_from(estimate).map_err(|_| ConversionError::Overflow(max_net.0))?;
+    // Walk down while the estimate delivers too much, then up while the
+    // next unit would still fit — each loop moves at most a handful of
+    // atomic units, since the estimate is exact up to fee flooring.
+    while gross > 0 && net_of(gross)? > max_net.0 {
+        gross -= 1;
+    }
+    while let Some(next) = gross.checked_add(1) {
+        match net_of(next) {
+            Ok(net) if net <= max_net.0 => gross = next,
+            _ => break,
+        }
+    }
+    Ok(CanonicalAtomic(gross))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,5 +958,56 @@ mod tests {
     fn solana_checked_sub_underflows_closed_rather_than_wrapping() {
         let result = SolanaAtomic(0).checked_sub(SolanaAtomic(1));
         assert!(matches!(result, Err(ConversionError::Overflow(_))));
+    }
+
+    /// `max_gross_for_net_at_bps` is the exact inverse of
+    /// `compute_fee_at_bps`: the answer's net fits, one more unit's does
+    /// not — across rates and around the flooring boundaries.
+    #[test]
+    fn max_gross_for_net_is_the_exact_inverse_of_the_fee() {
+        for fee_bps in [0u64, 1, 300, 600, 2_500, 9_999] {
+            for max_net in [1u64, 2, 99, 100, 101, 9_400, 47_000, 4_700_000_000] {
+                let gross = max_gross_for_net_at_bps(CanonicalAtomic(max_net), fee_bps)
+                    .unwrap()
+                    .0;
+                let net = compute_fee_at_bps(CanonicalAtomic(gross), fee_bps)
+                    .unwrap()
+                    .net
+                    .0;
+                assert!(
+                    net <= max_net,
+                    "fee {fee_bps} net {max_net}: gross {gross} nets {net}"
+                );
+                let next = compute_fee_at_bps(CanonicalAtomic(gross + 1), fee_bps)
+                    .unwrap()
+                    .net
+                    .0;
+                assert!(
+                    next > max_net,
+                    "fee {fee_bps} net {max_net}: gross {gross} is not maximal"
+                );
+            }
+        }
+        // The production shape: 47,000 GLC net at 6% is exactly 50,000 GLC gross.
+        assert_eq!(
+            max_gross_for_net_at_bps(CanonicalAtomic(4_700_000_000_000), 600).unwrap(),
+            CanonicalAtomic(5_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn max_gross_for_net_edge_cases() {
+        assert_eq!(
+            max_gross_for_net_at_bps(CanonicalAtomic(0), 600).unwrap(),
+            CanonicalAtomic(0)
+        );
+        assert_eq!(
+            max_gross_for_net_at_bps(CanonicalAtomic(1_000), BPS_DENOMINATOR).unwrap(),
+            CanonicalAtomic(0)
+        );
+        assert!(matches!(
+            max_gross_for_net_at_bps(CanonicalAtomic(1_000), BPS_DENOMINATOR + 1),
+            Err(ConversionError::FeeBpsOutOfRange { .. })
+        ));
     }
 }

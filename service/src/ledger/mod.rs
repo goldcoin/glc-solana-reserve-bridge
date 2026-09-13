@@ -2379,12 +2379,15 @@ impl Ledger {
     /// `GET /status` has always done).
     ///
     /// This is what the public API's per-route `available` is computed
-    /// from. It is the same [`crate::ledger::admission::
-    /// InboundAdmissionGates`] both folds read from inside their own
-    /// write transaction, so an availability answer and the fold that
-    /// follows it cannot disagree about the rules — only, at worst,
-    /// about the instant, which no read-then-act API can avoid and which
-    /// the fold's own re-check inside its transaction is what makes safe.
+    /// from (at a stated normal transfer size for `SolToGlc` —
+    /// `InboundAdmissionGates::route_blocker_at` — and at one atomic
+    /// unit for the other routes). It is the same
+    /// [`crate::ledger::admission::InboundAdmissionGates`] both folds
+    /// read from inside their own write transaction, so an availability
+    /// answer and the fold that follows it cannot disagree about the
+    /// rules — only, at worst, about the instant, which no read-then-act
+    /// API can avoid and which the fold's own re-check inside its
+    /// transaction is what makes safe.
     pub fn inbound_admission_gates(
         &self,
         direction: Direction,

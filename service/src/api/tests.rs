@@ -131,6 +131,25 @@ impl SolanaRpc for FakeSolanaRpc {
 /// [`fake_bridge_config_bytes_with_rolling_limit`].
 const TEST_DEFAULT_ROLLING_VOLUME_LIMIT: u64 = 1_000_000_000_000;
 
+/// The `per_transfer_limit` (reserve-mint units, 6 decimals) every
+/// non-limit-specific fixture in this module serves — 0.05 GLC, i.e.
+/// 5_000_000 canonical.
+///
+/// `SolToGlc`'s public availability is evaluated at THIS size (see
+/// `api::AdmissionProbe`): the route reads `available` only if a deposit
+/// of the program's full `per_transfer_limit` would be admitted. The
+/// fixture reserves seed 10_000_000 canonical of headroom, so the probe
+/// nets to 4_850_000 at the 300 bps test rate and fits comfortably —
+/// every existing "healthy deployment is available" expectation holds
+/// unchanged — while a test that wants the probe to be the binding
+/// constraint sets the buffer or headroom explicitly and says so.
+///
+/// It used to be 1_000_000 (100_000_000 canonical), which no fixture
+/// reserve could ever have admitted; that only went unnoticed because
+/// availability was probed at one atomic unit, which is the bug this
+/// module's `liquidity_buffer_probe` tests pin closed.
+const TEST_PER_TRANSFER_LIMIT: u64 = 50_000;
+
 fn fake_bridge_config_bytes(
     obligation_count: u64,
     min_transfer: u64,
@@ -245,7 +264,7 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
     opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(obligation_count, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(obligation_count, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -286,7 +305,7 @@ fn build_with_rolling_volume(
             bridge_config: fake_bridge_config_bytes_with_rolling_limit(
                 0,
                 100,
-                1_000_000,
+                TEST_PER_TRANSFER_LIMIT,
                 rolling_volume_limit,
             ),
             rolling_volume_windows: (
@@ -356,7 +375,7 @@ async fn limits_reflects_the_live_bridge_config() {
     let api = build(&db_path, 0);
     let limits = api.limits().await.unwrap();
     assert_eq!(limits.min_transfer_amount.0, 100);
-    assert_eq!(limits.per_transfer_limit.0, 1_000_000);
+    assert_eq!(limits.per_transfer_limit.0, TEST_PER_TRANSFER_LIMIT);
     assert_eq!(
         limits.bridge_fee_bps,
         amount_conversion::BRIDGE_FEE_BPS,
@@ -536,7 +555,7 @@ async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
     let api = BridgeApi::new(
         db_path,
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -2388,6 +2407,9 @@ impl ApiSource for StubSource {
                         unavailable_reason: (!r.default_enabled()).then(|| {
                             crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
                         }),
+                        availability_reason: (!r.default_enabled())
+                            .then(|| AVAILABILITY_REASON_ROUTE_DISABLED.to_string()),
+                        capacity: None,
                     })
                     .collect(),
                 as_of: 0,
@@ -2409,6 +2431,8 @@ impl ApiSource for StubSource {
                 sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000),
                 sol_to_glc_admission_open: true,
                 goldcoin_destination_admission_open: true,
+                sol_to_glc_availability_reason: None,
+                sol_to_glc_capacity: None,
             })
         })
     }
@@ -2499,6 +2523,7 @@ impl ApiSource for StubSource {
                 solana_paused: false,
                 glc_to_sol_available: true,
                 sol_to_glc_available: true,
+                sol_to_glc_availability_reason: None,
                 glc_to_sol_quota_exhausted: false,
                 sol_to_glc_quota_exhausted: false,
                 glc_to_sol_rolling_volume_remaining: AtomicU64(100_000_000),
@@ -3196,6 +3221,7 @@ fn production_stats() -> BridgeStats {
         solana_paused: false,
         glc_to_sol_available: true,
         sol_to_glc_available: true,
+        sol_to_glc_availability_reason: None,
         glc_to_sol_quota_exhausted: false,
         sol_to_glc_quota_exhausted: false,
         glc_to_sol_rolling_volume_remaining: AtomicU64(17_500_000_000),
@@ -3428,6 +3454,8 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 sol_to_glc_rolling_volume_remaining: AtomicU64(0),
                 sol_to_glc_admission_open: true,
                 goldcoin_destination_admission_open: true,
+                sol_to_glc_availability_reason: None,
+                sol_to_glc_capacity: None,
             })
             .unwrap(),
         ),
@@ -4600,7 +4628,7 @@ fn build_with_open_glc_to_rhn(db_path: &std::path::Path) -> BridgeApi<FakeSolana
     opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -5485,12 +5513,18 @@ async fn robinhood_limits_come_from_the_contract_not_from_the_solana_config() {
 
     // The Solana limits are a different program's, in a different unit,
     // and none of them appears here. `fake_bridge_config_bytes` sets
-    // min 100 / per-transfer 1_000_000.
+    // min 100 / per-transfer `TEST_PER_TRANSFER_LIMIT`.
     let solana = api.limits().await.unwrap();
     assert_eq!(solana.min_transfer_amount, AtomicU64(100));
-    assert_eq!(solana.per_transfer_limit, AtomicU64(1_000_000));
+    assert_eq!(
+        solana.per_transfer_limit,
+        AtomicU64(TEST_PER_TRANSFER_LIMIT)
+    );
     assert_ne!(view.inbound_min_atomic.as_deref(), Some("100"));
-    assert_ne!(view.inbound_max_atomic.as_deref(), Some("1000000"));
+    assert_ne!(
+        view.inbound_max_atomic.as_deref(),
+        Some(TEST_PER_TRANSFER_LIMIT.to_string().as_str())
+    );
 }
 
 /// Each Robinhood route's rolling window is published on `GET
@@ -5966,7 +6000,7 @@ impl CountingSolanaRpc {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rpc = CountingSolanaRpc {
             inner: FakeSolanaRpc {
-                bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+                bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
                 rolling_volume_windows: (
                     fake_rolling_volume_window_bytes(0, 0, 0),
                     fake_rolling_volume_window_bytes(1, 0, 0),
@@ -6154,7 +6188,7 @@ async fn quote_amounts_and_display_strings_are_pinned() {
     let api = build_with(
         &db_path,
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -6602,7 +6636,7 @@ async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
     let api = BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -6682,7 +6716,7 @@ fn build_with_open_rhn_to_glc(db_path: &std::path::Path) -> BridgeApi<FakeSolana
     opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -7296,7 +7330,7 @@ fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSola
     opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -7460,7 +7494,7 @@ fn build_at_production_minimum(db_path: &std::path::Path) -> BridgeApi<FakeSolan
     BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
             rolling_volume_windows: (
                 fake_rolling_volume_window_bytes(0, 0, 0),
                 fake_rolling_volume_window_bytes(1, 0, 0),
@@ -8235,7 +8269,7 @@ async fn post_transfers_without_a_declared_source_is_source_checked_only_when_th
 /// Layout: 8 discriminator + 1 protocol_version + 32 admin + 1 pending
 /// tag => `paused` at 42, `release_paused` at 43, `deposit_paused` at 44.
 fn fake_bridge_config_bytes_with_pause(paused: bool, release: bool, deposit: bool) -> Vec<u8> {
-    let mut v = fake_bridge_config_bytes(0, 100, 1_000_000);
+    let mut v = fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT);
     v[42] = paused as u8;
     v[43] = release as u8;
     v[44] = deposit as u8;
@@ -8473,4 +8507,510 @@ fn solana_program_pause_maps_flags_to_directions_by_program_semantics() {
     assert!(SolanaProgramPause::UNKNOWN.blocks(Direction::GlcToSol));
     assert!(SolanaProgramPause::UNKNOWN.blocks(Direction::SolToRhn));
     assert!(!SolanaProgramPause::UNKNOWN.blocks(Direction::GlcToRhn));
+}
+
+// ------------------------------------ availability probed at a real size --
+//
+// The 2026-09-12 incident: `SolToGlc` reported `available: true` on
+// `/status` and `/chains` while every normal 50,000 GLC deposit folded
+// straight into `ManualReview` with `liquidity_buffer_low_at_fold`. The
+// public verdict was computed at ONE atomic unit (`headroom > buffer`),
+// which held, while a real deposit failed `headroom - net >= buffer`.
+// These tests pin the fix: `SolToGlc` is evaluated at the program's
+// `per_transfer_limit`, names the gate that refused, and publishes the
+// capacity figures the rule is stated in — without moving any gate.
+//
+// Fixture arithmetic, in canonical units: the reserve has 10_000_000 of
+// headroom (`configure`), the probe is `TEST_PER_TRANSFER_LIMIT` =
+// 50_000 mint units = 5_000_000 canonical, netting to 4_850_000 at the
+// 300 bps test rate.
+
+/// The probe every test below evaluates against, derived the same way
+/// the API derives it, so a change to either constant is caught here.
+const PROBE_GROSS: u64 = TEST_PER_TRANSFER_LIMIT * 100; // 6 -> 8 decimals
+const PROBE_NET: i64 = 4_850_000; // 5_000_000 less 3%
+
+#[test]
+fn the_probe_fixture_is_what_the_api_will_derive() {
+    let gross = amount_conversion::SolanaAtomic(TEST_PER_TRANSFER_LIMIT)
+        .to_canonical(TEST_SOLANA_DECIMALS)
+        .unwrap();
+    assert_eq!(gross.0, PROBE_GROSS);
+    let fb =
+        amount_conversion::compute_fee_at_bps(gross, amount_conversion::BRIDGE_FEE_BPS).unwrap();
+    assert_eq!(fb.net.0 as i64, PROBE_NET);
+}
+
+/// Sets the Goldcoin reserve's admission buffer so that a ONE-UNIT
+/// probe passes (`headroom > buffer`) while the normal-size probe fails
+/// (`headroom - PROBE_NET < buffer`) — the incident's exact shape.
+fn make_buffer_bind_on_a_normal_transfer(db_path: &std::path::Path) {
+    let mut ledger = Ledger::open(db_path).unwrap();
+    // headroom 10_000_000; 10_000_000 - 4_850_000 = 5_150_000 < 6_000_000
+    ledger
+        .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, 6_000_000, 7_000_000)
+        .unwrap();
+}
+
+/// Headroom cannot admit the max transfer under the buffer rule =>
+/// `available: false`, on `/chains`, `/status` and `/stats` alike, with
+/// the exact reason and the figures that explain it — while the
+/// automatic gate itself stays OPEN (nothing here moves a gate).
+#[tokio::test]
+async fn sol_to_glc_is_unavailable_when_headroom_cannot_admit_the_max_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    make_buffer_bind_on_a_normal_transfer(&db_path);
+    let api = build(&db_path, 0);
+
+    let chains = api.chains().await.unwrap();
+    let r = route(&chains, "SolToGlc");
+    assert!(
+        r.enabled,
+        "the route is switched on; it is closed for capacity"
+    );
+    assert!(!r.available);
+    assert_eq!(
+        r.availability_reason.as_deref(),
+        Some("liquidity_buffer_low")
+    );
+    assert_eq!(
+        r.unavailable_reason.as_deref(),
+        Some(DIRECTION_UNAVAILABLE_MESSAGE),
+        "end-user copy is unchanged and still cause-agnostic"
+    );
+    // Bound = 10_000_000 - 6_000_000 = 4_000_000 net => 4_123_711 gross
+    // at 3% (4_123_711 * 0.97 = 4_000_000, floor-exact), which is below
+    // the 5_000_000 probe — the sentence "the reserve admits up to
+    // 4.12 GLC, a normal transfer is 5 GLC" stated as two numbers.
+    assert_eq!(
+        r.capacity,
+        Some(RouteCapacityView {
+            confirmed_headroom_atomic: AtomicI64(10_000_000),
+            liquidity_buffer_atomic: AtomicI64(6_000_000),
+            max_admissible_gross_atomic: AtomicU64(4_123_711),
+            liquidity_admission_closed: false,
+            probe_gross_atomic: AtomicU64(PROBE_GROSS),
+        })
+    );
+    assert!(
+        r.capacity.as_ref().unwrap().max_admissible_gross_atomic.0 < PROBE_GROSS,
+        "closed exactly because the reserve's bound is below the probe"
+    );
+
+    let status = api.status().await.unwrap();
+    assert!(!status.sol_to_glc_available);
+    assert_eq!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some("liquidity_buffer_low")
+    );
+    assert_eq!(status.sol_to_glc_capacity, r.capacity);
+    // The AUTOMATIC gate is untouched: the hysteresis has not closed
+    // (headroom is above the buffer), the operator switch is open, and
+    // `sol_to_glc_admission_open` — which reports those two — still
+    // says so. Unavailability here is a per-amount verdict, not a gate.
+    assert!(status.sol_to_glc_admission_open);
+    assert!(status.goldcoin_destination_admission_open);
+    assert!(!status.goldcoin_paused);
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert!(!ledger
+            .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap());
+    }
+
+    let stats = api.stats().await.unwrap();
+    assert!(!stats.sol_to_glc_available);
+    assert_eq!(
+        stats.sol_to_glc_availability_reason.as_deref(),
+        Some("liquidity_buffer_low")
+    );
+}
+
+/// The regression itself, stated as the contradiction it was: the
+/// one-unit evaluator still says "open" for exactly this ledger, and the
+/// public verdict must no longer be derived from it.
+#[tokio::test]
+async fn a_tiny_transfer_probe_does_not_make_sol_to_glc_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    make_buffer_bind_on_a_normal_transfer(&db_path);
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert_eq!(
+            ledger.route_admission_blocker(Direction::SolToGlc).unwrap(),
+            None,
+            "the one-atomic-unit form is satisfied — this is the shape that used to be advertised"
+        );
+        assert_eq!(
+            ledger
+                .inbound_admission_gates(Direction::SolToGlc)
+                .unwrap()
+                .route_blocker_at(PROBE_NET),
+            Some(crate::ledger::InboundAdmissionBlocker::LiquidityBufferLow)
+        );
+    }
+    let api = build(&db_path, 0);
+    assert!(!route(&api.chains().await.unwrap(), "SolToGlc").available);
+    assert!(!api.status().await.unwrap().sol_to_glc_available);
+}
+
+/// Sufficient headroom => `available: true`, no reason, and the capacity
+/// view says how much: the buffer bound grossed up through the fee and
+/// capped at the probe (the program refuses anything larger regardless).
+#[tokio::test]
+async fn sol_to_glc_is_available_with_sufficient_headroom_and_reports_its_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // 10_000_000 - 4_850_000 = 5_150_000 >= 5_000_000: the max
+        // transfer fits, with 150_000 to spare.
+        ledger
+            .set_admission_liquidity_thresholds(
+                ReserveDirection::GoldcoinReserve,
+                5_000_000,
+                6_000_000,
+            )
+            .unwrap();
+    }
+    let api = build(&db_path, 0);
+
+    let chains = api.chains().await.unwrap();
+    let r = route(&chains, "SolToGlc");
+    assert!(r.available);
+    assert_eq!(r.availability_reason, None);
+    assert_eq!(r.unavailable_reason, None);
+    let cap = r
+        .capacity
+        .clone()
+        .expect("SolToGlc always carries its capacity view");
+    assert_eq!(cap.confirmed_headroom_atomic, AtomicI64(10_000_000));
+    assert_eq!(cap.liquidity_buffer_atomic, AtomicI64(5_000_000));
+    assert!(!cap.liquidity_admission_closed);
+    assert_eq!(cap.probe_gross_atomic, AtomicU64(PROBE_GROSS));
+    // max net under the buffer = 5_000_000; grossed up at 3% that is
+    // 5_154_639 — at or above the probe, which is exactly what `available`
+    // says. Not capped at the program's limit: the two are comparable.
+    assert_eq!(cap.max_admissible_gross_atomic, AtomicU64(5_154_639));
+    assert!(cap.max_admissible_gross_atomic.0 >= PROBE_GROSS);
+
+    let status = api.status().await.unwrap();
+    assert!(status.sol_to_glc_available);
+    assert_eq!(status.sol_to_glc_availability_reason, None);
+    assert_eq!(status.sol_to_glc_capacity, Some(cap));
+    assert!(api.stats().await.unwrap().sol_to_glc_available);
+}
+
+/// `available` and `max_admissible_gross_atomic` are one statement made
+/// twice: the route is open exactly when the reserve's grossed-up bound
+/// reaches the probe. Swept across buffers on both sides of the boundary
+/// so the identity is proved against the real endpoint, not assumed.
+#[tokio::test]
+async fn available_is_exactly_max_admissible_gross_reaching_the_probe() {
+    // headroom 10_000_000; probe net 4_850_000 fits iff buffer <= 5_150_000.
+    for buffer in [
+        0u64, 1_000_000, 5_149_999, 5_150_000, 5_150_001, 6_000_000, 9_999_999,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        {
+            let mut ledger = Ledger::open(&db_path).unwrap();
+            ledger
+                .set_admission_liquidity_thresholds(
+                    ReserveDirection::GoldcoinReserve,
+                    buffer,
+                    buffer,
+                )
+                .unwrap();
+        }
+        let api = build(&db_path, 0);
+        let r = route(&api.chains().await.unwrap(), "SolToGlc").clone();
+        let cap = r.capacity.expect("always present for SolToGlc");
+        assert_eq!(
+            r.available,
+            buffer <= 5_150_000,
+            "buffer {buffer}: the buffer rule decides availability"
+        );
+        assert_eq!(
+            r.available,
+            cap.max_admissible_gross_atomic.0 >= PROBE_GROSS,
+            "buffer {buffer}: available iff the reserve's bound reaches the probe \
+             (bound {}, probe {PROBE_GROSS})",
+            cap.max_admissible_gross_atomic.0
+        );
+        assert_eq!(cap.liquidity_buffer_atomic, AtomicI64(buffer as i64));
+        assert_eq!(cap.confirmed_headroom_atomic, AtomicI64(10_000_000));
+        // The bound nets to no more than the rule allows, and one more
+        // gross unit would exceed it — the gross-up is exact.
+        let bound_net = 10_000_000u64.saturating_sub(buffer);
+        let net = |g: u64| {
+            amount_conversion::compute_fee_at_bps(
+                amount_conversion::CanonicalAtomic(g),
+                amount_conversion::BRIDGE_FEE_BPS,
+            )
+            .unwrap()
+            .net
+            .0
+        };
+        assert!(net(cap.max_admissible_gross_atomic.0) <= bound_net);
+        assert!(net(cap.max_admissible_gross_atomic.0 + 1) > bound_net);
+    }
+}
+
+/// Closing `SolToGlc` for capacity at its normal size touches NOTHING
+/// else: the other five routes keep the verdict they had, including
+/// `RhnToGlc`, which draws on the same Goldcoin reserve but carries no
+/// probe and so is still evaluated at the weakest form.
+#[tokio::test]
+async fn the_probe_closes_sol_to_glc_alone_and_leaves_the_other_five_routes_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_all_routes_with_bridge_config(
+        &db_path,
+        fake_bridge_config_bytes_with_pause(false, false, false),
+    );
+    let before = api.chains().await.unwrap();
+    for id in ALL_ROUTES {
+        assert!(
+            route(&before, id).available,
+            "{id} is open on a healthy deployment"
+        );
+    }
+
+    make_buffer_bind_on_a_normal_transfer(&db_path);
+    let after = api.chains().await.unwrap();
+    for id in ALL_ROUTES {
+        let r = route(&after, id);
+        if id == "SolToGlc" {
+            assert!(!r.available);
+            assert_eq!(
+                r.availability_reason.as_deref(),
+                Some("liquidity_buffer_low")
+            );
+            assert!(r.capacity.is_some());
+        } else {
+            assert!(r.available, "{id} must be unaffected by SolToGlc's probe");
+            assert_eq!(r.availability_reason, None, "{id}");
+            assert_eq!(r.unavailable_reason, None, "{id}");
+            assert_eq!(
+                r.capacity, None,
+                "{id} carries no probe and so no capacity view"
+            );
+        }
+    }
+    // `/status`'s other legacy direction and `/robinhood/reserve`'s four
+    // routes agree with `/chains`.
+    let status = api.status().await.unwrap();
+    assert!(status.glc_to_sol_available);
+    assert!(!status.sol_to_glc_available);
+    let rh = api.robinhood_reserve().await.unwrap();
+    for r in &rh.routes {
+        assert!(r.available, "{} on /robinhood/reserve", r.id);
+        assert_eq!(r.capacity, None, "{}", r.id);
+    }
+}
+
+/// Every gate names itself: the exact `availability_reason` for each
+/// way `SolToGlc` can be closed, on `/chains` and `/status` alike.
+#[tokio::test]
+async fn sol_to_glc_availability_reason_names_the_exact_gate() {
+    async fn reason_for(
+        setup: impl FnOnce(&mut Ledger),
+    ) -> (Option<String>, Option<String>, bool, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        {
+            let mut ledger = Ledger::open(&db_path).unwrap();
+            setup(&mut ledger);
+        }
+        let api = build(&db_path, 0);
+        let chains = api.chains().await.unwrap();
+        let status = api.status().await.unwrap();
+        let r = route(&chains, "SolToGlc");
+        (
+            r.availability_reason.clone(),
+            status.sol_to_glc_availability_reason.clone(),
+            r.available,
+            status.sol_to_glc_available,
+        )
+    }
+
+    // Open: no reason anywhere.
+    assert_eq!(reason_for(|_| {}).await, (None, None, true, true));
+
+    type Setup = Box<dyn FnOnce(&mut Ledger)>;
+    let cases: [(&str, Setup); 5] = [
+        (
+            "liquidity_buffer_low",
+            Box::new(|l| {
+                l.set_admission_liquidity_thresholds(
+                    ReserveDirection::GoldcoinReserve,
+                    6_000_000,
+                    7_000_000,
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            "route_admission_closed",
+            Box::new(|l| {
+                l.set_route_admission(crate::routes::Route::SolToGlc, true, Some("t"))
+                    .unwrap()
+            }),
+        ),
+        (
+            "reserve_admission_closed",
+            Box::new(|l| {
+                l.set_admission(ReserveDirection::GoldcoinReserve, true, Some("t"))
+                    .unwrap()
+            }),
+        ),
+        (
+            "reserve_paused",
+            Box::new(|l| {
+                l.set_paused(ReserveDirection::GoldcoinReserve, true, Some("t"))
+                    .unwrap()
+            }),
+        ),
+        (
+            "insufficient_capacity",
+            Box::new(|l| {
+                // No buffer, and headroom below the probe's net: raise
+                // the protected minimum (`configure_reserve` upserts the
+                // thresholds) so 10_000_000 - 6_000_000 < 4_850_000.
+                l.set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, 0, 0)
+                    .unwrap();
+                l.configure_reserve(
+                    ReserveDirection::GoldcoinReserve,
+                    10_000_000,
+                    6_000_000,
+                    8_000_000,
+                    7_000_000,
+                    6_000_001,
+                    0,
+                )
+                .unwrap();
+            }),
+        ),
+    ];
+    for (expected, setup) in cases {
+        let (chains_reason, status_reason, chains_open, status_open) = reason_for(setup).await;
+        assert_eq!(
+            chains_reason.as_deref(),
+            Some(expected),
+            "/chains for {expected}"
+        );
+        assert_eq!(
+            status_reason.as_deref(),
+            Some(expected),
+            "/status for {expected}"
+        );
+        assert!(!chains_open && !status_open, "{expected} closes the route");
+    }
+}
+
+/// `/status` applies one gate `/chains` does not — the program's
+/// rolling-24h-volume window — and names it when it is the only one.
+#[tokio::test]
+async fn status_names_quota_exhaustion_when_it_is_the_only_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    // deposit/SolToGlc window fully used against a 2_000_000 limit.
+    let api = build_with_rolling_volume(&db_path, 2_000_000, 0, 2_000_000);
+    let status = api.status().await.unwrap();
+    assert!(status.sol_to_glc_quota_exhausted);
+    assert!(!status.sol_to_glc_available);
+    assert_eq!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_QUOTA_EXHAUSTED)
+    );
+    // Not a reserve condition: `/chains` (which has no quota gate) is open.
+    assert!(route(&api.chains().await.unwrap(), "SolToGlc").available);
+}
+
+/// A probe that cannot be built fails CLOSED with its own reason — never
+/// a silent fall-back to the one-unit form that caused the incident —
+/// and closes only `SolToGlc`.
+#[tokio::test]
+async fn an_unbuildable_probe_fails_sol_to_glc_closed_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    // Point `reserve_token_mint` at an account the fake RPC does not
+    // serve, so the mint's decimals — and therefore the probe — are
+    // unreadable. Offset: 8 (discriminator) + 1 + 32 + 1 + 1 + 1 + 1 + 1.
+    let mut bridge_config = fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT);
+    bridge_config[47..79].copy_from_slice(&[8u8; 32]);
+    let api = opt_down(BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config,
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::legacy_only()),
+        test_route_fees(),
+    ));
+    let chains = api.chains().await.unwrap();
+    let r = route(&chains, "SolToGlc");
+    assert!(!r.available);
+    assert_eq!(
+        r.availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_PROBE_UNAVAILABLE)
+    );
+    assert_eq!(r.capacity, None);
+    assert!(
+        route(&chains, "GlcToSol").available,
+        "GlcToSol needs no probe"
+    );
+    let status = api.status().await.unwrap();
+    assert!(!status.sol_to_glc_available);
+    assert_eq!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_PROBE_UNAVAILABLE)
+    );
+    assert_eq!(status.sol_to_glc_capacity, None);
+}
+
+/// Wire compatibility: the new fields are additive. A payload from a
+/// daemon without them still deserializes, and the new fields serialize
+/// under the exact names the fix names.
+#[test]
+fn capacity_and_reason_fields_are_additive_on_the_wire() {
+    let old = serde_json::json!({
+        "id": "SolToGlc", "source_chain": "solana", "destination_chain": "goldcoin",
+        "enabled": true, "disabled_reason": null, "implemented": true,
+        "available": true, "unavailable_reason": null, "min_transfer_atomic": "10000000000"
+    });
+    let v: RouteView = serde_json::from_value(old).unwrap();
+    assert_eq!(v.availability_reason, None);
+    assert_eq!(v.capacity, None);
+
+    let cap = RouteCapacityView {
+        confirmed_headroom_atomic: AtomicI64(28_025_210_893_041),
+        liquidity_buffer_atomic: AtomicI64(25_000_000_000_000),
+        max_admissible_gross_atomic: AtomicU64(0),
+        liquidity_admission_closed: false,
+        probe_gross_atomic: AtomicU64(5_000_000_000_000),
+    };
+    let json = serde_json::to_value(&cap).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "confirmed_headroom_atomic": "28025210893041",
+            "liquidity_buffer_atomic": "25000000000000",
+            "max_admissible_gross_atomic": "0",
+            "liquidity_admission_closed": false,
+            "probe_gross_atomic": "5000000000000"
+        })
+    );
 }

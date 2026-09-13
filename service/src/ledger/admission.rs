@@ -452,9 +452,72 @@ impl InboundAdmissionGates {
     /// So `None` here means "a minimum-sized deposit would be admitted",
     /// never "this specific deposit would be" — a large enough one can
     /// still be held back by the buffer or by capacity, and is then
-    /// parked and refundable exactly as before.
+    /// parked and refundable exactly as before. A public verdict for a
+    /// route with a known normal transfer size must therefore use
+    /// [`Self::route_blocker_at`] instead; see its docs for the incident
+    /// that made the difference matter.
     pub fn route_blocker(&self) -> Option<InboundAdmissionBlocker> {
-        self.blocker(1, InboundRateLimits::default())
+        self.route_blocker_at(1)
+    }
+
+    /// The ROUTE-level question for a deposit of a KNOWN size: would a
+    /// transfer whose net destination amount is `probe_net_destination_
+    /// atomic` be admitted right now, with no wallet to evaluate the
+    /// rate limits against?
+    ///
+    /// This is what a public "is this route open" answer must be
+    /// computed from when the route has a normal transfer size. The
+    /// one-atomic-unit form ([`Self::route_blocker`]) is exact for the
+    /// question it asks, but that question — "would ANY amount be
+    /// admitted" — is not the one a depositor is asking. With a safety
+    /// buffer configured, `headroom > buffer` holds while `headroom -
+    /// net < buffer` for every real transfer, and a route advertised on
+    /// the former parks every deposit it attracts on the latter
+    /// (`liquidity_buffer_low_at_fold`). The 2026-09-12 production
+    /// incident was exactly that: `SolToGlc` reported `available: true`
+    /// with 280,252 GLC of headroom against a 250,000 GLC buffer while
+    /// every 47,000 GLC deposit folded straight into `ManualReview`.
+    ///
+    /// Still the real decision — [`Self::blocker`] with the probe amount
+    /// and no rate limits — never a restatement of its inequalities, so
+    /// this cannot drift from what a fold of that size will do. The
+    /// probe is the caller's statement of "a normal transfer" (for
+    /// `SolToGlc`, the Solana program's own `per_transfer_limit` net of
+    /// the route fee); a probe of `1` is the weakest form and equals
+    /// [`Self::route_blocker`].
+    pub fn route_blocker_at(
+        &self,
+        probe_net_destination_atomic: i64,
+    ) -> Option<InboundAdmissionBlocker> {
+        self.blocker(probe_net_destination_atomic, InboundRateLimits::default())
+    }
+
+    /// The largest NET destination amount this route would admit right
+    /// now with no wallet limits in play — `0` when no amount at all
+    /// would be (any amount-independent gate closed, or headroom already
+    /// inside the buffer).
+    ///
+    /// Derived from the same inequalities [`Self::blocker`] applies, and
+    /// pinned to it by test (`blocker(max) == None` and `blocker(max + 1)
+    /// != None` whenever `max > 0`) rather than trusted: the buffer rule
+    /// `headroom - net >= buffer` gives `net <= headroom - buffer`, and
+    /// the capacity rule `net <= headroom` is weaker whenever a buffer is
+    /// configured, so the buffer bounds it when present and headroom
+    /// does otherwise. Reported to callers so a UI can render "up to N"
+    /// instead of discovering N by parking a deposit.
+    pub fn max_admissible_net_destination_atomic(&self) -> i64 {
+        // Any gate that does not depend on the amount closes the route
+        // for every amount — asked of the real decision at the weakest
+        // probe, so the list of such gates is never restated here.
+        if self.route_blocker().is_some() {
+            return 0;
+        }
+        let bound = if self.admission_buffer_atomic > 0 {
+            self.confirmed_headroom_atomic - self.admission_buffer_atomic
+        } else {
+            self.confirmed_headroom_atomic
+        };
+        bound.max(0)
     }
 }
 

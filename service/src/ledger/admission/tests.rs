@@ -433,3 +433,143 @@ fn blocker_display_names_are_distinct_and_not_manual_review_notes() {
         InboundAdmissionBlocker::AdmissionClosed.manual_review_note()
     );
 }
+
+// ------------------------------------------------ probing at a real size --
+
+/// `route_blocker_at(n)` IS `blocker(n, no limits)` — the same identity
+/// `route_blocker_is_the_real_decision_at_one_atomic_unit` pins for the
+/// one-unit form, at every probe size.
+#[test]
+fn route_blocker_at_is_the_real_decision_at_that_size() {
+    for headroom in [-5i64, 0, 1, 46_999, 47_000, 47_001, 297_000, 1_000_000] {
+        for buffer in [0i64, 1, 250_000] {
+            for probe in [1i64, 47_000, 1_000_000] {
+                let gates = InboundAdmissionGates {
+                    confirmed_headroom_atomic: headroom,
+                    admission_buffer_atomic: buffer,
+                    ..healthy()
+                };
+                assert_eq!(
+                    gates.route_blocker_at(probe),
+                    gates.blocker(probe, InboundRateLimits::default()),
+                    "headroom {headroom}, buffer {buffer}, probe {probe}"
+                );
+            }
+        }
+    }
+    let g = healthy();
+    assert_eq!(g.route_blocker_at(1), g.route_blocker());
+}
+
+/// The 2026-09-12 production shape, in the evaluator's own units: every
+/// gate open, 280,252 GLC of headroom against a 250,000 GLC buffer,
+/// 47,000 GLC net per normal deposit. The one-unit probe says "open"
+/// (`headroom > buffer`); a normal deposit is refused
+/// (`headroom - net < buffer`). A public verdict computed from the
+/// former advertised a route every deposit parked on.
+#[test]
+fn a_tiny_probe_can_say_open_while_a_normal_transfer_is_refused() {
+    let gates = InboundAdmissionGates {
+        confirmed_headroom_atomic: 280_252,
+        admission_buffer_atomic: 250_000,
+        ..healthy()
+    };
+    assert_eq!(gates.route_blocker(), None, "the weakest form is satisfied");
+    assert_eq!(
+        gates.route_blocker_at(47_000),
+        Some(InboundAdmissionBlocker::LiquidityBufferLow),
+        "a normal deposit is not"
+    );
+    assert_eq!(
+        InboundAdmissionBlocker::LiquidityBufferLow.as_str(),
+        "liquidity_buffer_low"
+    );
+    // One settlement's worth of headroom later (+47,000) the same probe
+    // clears — the exact one-in-one-out rhythm the incident showed.
+    let recovered = InboundAdmissionGates {
+        confirmed_headroom_atomic: 297_000,
+        ..gates
+    };
+    assert_eq!(recovered.route_blocker_at(47_000), None);
+    assert_eq!(
+        recovered.route_blocker_at(47_001),
+        Some(InboundAdmissionBlocker::LiquidityBufferLow)
+    );
+}
+
+/// `max_admissible_net_destination_atomic` is the exact boundary of the
+/// decision it summarizes — `blocker(max)` admits and `blocker(max + 1)`
+/// refuses — and collapses to `0` whenever any amount-independent gate
+/// is closed or headroom is already inside the buffer.
+#[test]
+fn max_admissible_net_is_the_exact_boundary_of_the_decision() {
+    for headroom in [
+        -1i64, 0, 1, 2, 249_999, 250_000, 250_001, 280_252, 1_000_000,
+    ] {
+        for buffer in [0i64, 1, 250_000] {
+            let gates = InboundAdmissionGates {
+                confirmed_headroom_atomic: headroom,
+                admission_buffer_atomic: buffer,
+                ..healthy()
+            };
+            let max = gates.max_admissible_net_destination_atomic();
+            assert!(max >= 0);
+            if max > 0 {
+                assert_eq!(
+                    gates.route_blocker_at(max),
+                    None,
+                    "headroom {headroom}, buffer {buffer}: max {max} must be admitted"
+                );
+                assert_ne!(
+                    gates.route_blocker_at(max + 1),
+                    None,
+                    "headroom {headroom}, buffer {buffer}: max {max} must be maximal"
+                );
+            } else {
+                assert_ne!(
+                    gates.route_blocker_at(1),
+                    None,
+                    "headroom {headroom}, buffer {buffer}: a zero max means nothing is admitted"
+                );
+            }
+        }
+    }
+    // The incident figures: 30,252 is what fits, not 47,000.
+    let incident = InboundAdmissionGates {
+        confirmed_headroom_atomic: 280_252,
+        admission_buffer_atomic: 250_000,
+        ..healthy()
+    };
+    assert_eq!(incident.max_admissible_net_destination_atomic(), 30_252);
+
+    // Every amount-independent gate zeroes it, however large the headroom.
+    for closed in [
+        InboundAdmissionGates {
+            route_admission_closed: true,
+            ..healthy()
+        },
+        InboundAdmissionGates {
+            admission_closed: true,
+            ..healthy()
+        },
+        InboundAdmissionGates {
+            paused: true,
+            ..healthy()
+        },
+        InboundAdmissionGates {
+            liquidity_admission_closed: true,
+            ..healthy()
+        },
+        InboundAdmissionGates {
+            min_available_utxo_count: 5,
+            available_utxo_count: 5,
+            ..healthy()
+        },
+    ] {
+        assert_eq!(
+            closed.max_admissible_net_destination_atomic(),
+            0,
+            "{closed:?}"
+        );
+    }
+}
