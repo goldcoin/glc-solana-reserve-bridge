@@ -185,12 +185,13 @@ fn value_display(atomic: u64, decimals: u8) -> ValueDisplay {
 /// The `glc-admin` subcommand names this module can emit — kept in one
 /// place so the drift-guard test below can assert every one of them
 /// exists in `glc-admin`'s real dispatch table.
-pub const GENERATED_SUBCOMMANDS: [&str; 5] = [
+pub const GENERATED_SUBCOMMANDS: [&str; 6] = [
     "onchain-pause",
     "onchain-unpause",
     "set-limit",
     "reset-rolling-window",
     "refund-manual-review",
+    "manual-review-refund",
 ];
 
 pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCommandView, String> {
@@ -385,8 +386,57 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
                 label: CLI_APPROVAL_REQUIRED,
             })
         }
+        "manual-review-refund" => {
+            let request_id = input
+                .request_id
+                .ok_or_else(|| "request_id is required for manual-review-refund".to_string())?;
+            if request_id <= 0 {
+                return Err("request_id must be a positive request id".to_string());
+            }
+            // The REFUND decision on a HELD request (schema v30) and the
+            // refund itself, in one command: it records the audited
+            // decision, then runs the request's own route's existing
+            // refund command with these same arguments. Same posture as
+            // `refund-manual-review` above — no destination, no amount,
+            // no override flag is generated here. `--emergency` (the
+            // before-review_after exit for a rapid-burst hold) is
+            // deliberately NOT emitted: an operator types that word
+            // themselves, or not at all.
+            let command = format!(
+                "glc-admin manual-review-refund --config {REFUND_CONFIG_PATH} \
+                 --request-id {request_id} --note '{NOTE_PLACEHOLDER}' \
+                 --keypair {REFUND_ADMIN_KEYPAIR_PATH} --execute"
+            );
+            let precondition = if onchain.paused {
+                None
+            } else {
+                Some(
+                    "for a Solana-sourced request the bridge must be globally paused on-chain \
+                     first (`glc-admin onchain-pause --scope global`); Robinhood- and \
+                     Goldcoin-sourced refunds have their own preconditions, re-checked by the \
+                     CLI"
+                        .to_string(),
+                )
+            };
+            Ok(CliCommandView {
+                command,
+                old_value: None,
+                new_value: None,
+                summary: format!(
+                    "Record the operator REFUND decision on held request #{request_id} and \
+                     refund it to its original depositor through the route's existing refund \
+                     tooling. Nothing is decided by this console: the CLI records the decision \
+                     only on --execute, refuses a rapid-burst hold before its review_after \
+                     unless the operator adds --emergency by hand, and re-runs every refund \
+                     safety check against fresh state."
+                ),
+                precondition,
+                unit: "no value is supplied by this console".to_string(),
+                label: CLI_APPROVAL_REQUIRED,
+            })
+        }
         other => Err(format!(
-            "unknown action {other:?} (expected onchain-pause|onchain-unpause|set-limit|reset-rolling-window|refund-manual-review)"
+            "unknown action {other:?} (expected onchain-pause|onchain-unpause|set-limit|reset-rolling-window|refund-manual-review|manual-review-refund)"
         )),
     }
 }
@@ -721,6 +771,41 @@ mod tests {
         )
         .unwrap();
         assert!(view.precondition.is_none());
+    }
+
+    /// `manual-review-refund` (schema v30): the same no-destination,
+    /// no-amount posture as `refund-manual-review`, `--execute` always
+    /// present (the CLI records the decision only then), and NEVER an
+    /// `--emergency` flag — that word is the operator's to type.
+    #[test]
+    fn manual_review_refund_is_generated_without_any_override_flag() {
+        let input = CliCommandInput {
+            action: "manual-review-refund".to_string(),
+            scope: None,
+            field: None,
+            value_glc: None,
+            direction: None,
+            request_id: Some(4205),
+        };
+        let view = generate(&input, &onchain()).unwrap();
+        assert_eq!(
+            view.command,
+            format!(
+                "glc-admin manual-review-refund --config {REFUND_CONFIG_PATH} --request-id 4205 \
+                 --note '{NOTE_PLACEHOLDER}' --keypair {REFUND_ADMIN_KEYPAIR_PATH} --execute"
+            )
+        );
+        assert!(!view.command.contains("--emergency"));
+        assert!(!view.command.contains("--destination"));
+        assert!(!view.command.contains("--amount"));
+        assert_eq!(view.label, CLI_APPROVAL_REQUIRED);
+        assert!(
+            view.precondition.is_some(),
+            "the fixture is not globally paused"
+        );
+        let mut no_id = input;
+        no_id.request_id = None;
+        assert!(generate(&no_id, &onchain()).is_err());
     }
 
     /// Drift guard, mirroring `service/tests/runbook_commands.rs`'s

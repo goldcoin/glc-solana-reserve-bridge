@@ -2160,3 +2160,83 @@ fn changing_one_routes_fee_in_the_config_moves_only_that_route() {
         );
     }
 }
+
+// ------------------------------------------------------------ [rapid_burst] --
+
+/// Appends a `[rapid_burst]` section to [`valid_config`]'s TOML.
+fn valid_config_with_rapid_burst(dir: &std::path::Path, section: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("\n[rapid_burst]\n");
+    content.push_str(section);
+    content.push('\n');
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+/// A config with no `[rapid_burst]` section — every production file that
+/// exists today — resolves to the rule DISABLED, with the documented
+/// defaults visible for the operator listing.
+#[test]
+fn absent_rapid_burst_section_disables_the_rule_with_documented_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config(dir.path())).unwrap();
+    assert!(!config.rapid_burst.enabled);
+    assert_eq!(config.rapid_burst.window_secs, 900);
+    assert_eq!(config.rapid_burst.max_per_source_wallet, 3);
+    assert_eq!(config.rapid_burst.max_per_destination_wallet, 3);
+    assert_eq!(config.rapid_burst.max_per_pair, 2);
+    assert_eq!(config.rapid_burst.minimum_review_hold_secs, 72 * 3600);
+}
+
+#[test]
+fn rapid_burst_section_is_config_driven_and_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config_with_rapid_burst(
+        dir.path(),
+        "enabled = true\nwindow_secs = 300\nmax_per_source_wallet = 4\n\
+         max_per_destination_wallet = 5\nmax_per_pair = 1\nminimum_review_hold_secs = 3600",
+    ))
+    .unwrap();
+    assert!(config.rapid_burst.enabled);
+    assert_eq!(config.rapid_burst.window_secs, 300);
+    assert_eq!(config.rapid_burst.max_per_source_wallet, 4);
+    assert_eq!(config.rapid_burst.max_per_destination_wallet, 5);
+    assert_eq!(config.rapid_burst.max_per_pair, 1);
+    assert_eq!(config.rapid_burst.minimum_review_hold_secs, 3600);
+
+    // `enabled = true` alone is a complete, sane policy.
+    let config =
+        Config::load(&valid_config_with_rapid_burst(dir.path(), "enabled = true")).unwrap();
+    assert!(config.rapid_burst.enabled);
+    assert_eq!(config.rapid_burst.window_secs, 900);
+
+    for (section, field) in [
+        ("window_secs = 0", "rapid_burst.window_secs"),
+        ("max_per_pair = 0", "rapid_burst.max_per_pair"),
+        (
+            "max_per_source_wallet = 0",
+            "rapid_burst.max_per_source_wallet",
+        ),
+        (
+            "max_per_destination_wallet = 0",
+            "rapid_burst.max_per_destination_wallet",
+        ),
+        (
+            "minimum_review_hold_secs = -1",
+            "rapid_burst.minimum_review_hold_secs",
+        ),
+    ] {
+        let err = Config::load(&valid_config_with_rapid_burst(dir.path(), section)).unwrap_err();
+        match err {
+            ConfigError::Invalid { field: f, .. } => assert_eq!(f, field, "{section}"),
+            other => panic!("{section}: expected Invalid, got {other:?}"),
+        }
+    }
+    // Unknown keys are refused, not ignored.
+    assert!(Config::load(&valid_config_with_rapid_burst(
+        dir.path(),
+        "enabled = true\nmax_per_second = 3"
+    ))
+    .is_err());
+}

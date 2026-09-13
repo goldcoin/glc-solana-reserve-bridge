@@ -5626,7 +5626,7 @@ async fn a_held_request_is_skipped_by_auto_resume_and_new_folds_are_unaffected()
         // first — so the test can tell "skipped" from "not reached".
         for id in &ids[..2] {
             ledger
-                .set_manual_review_hold(*id, 10 + 72 * 3600, "72h freeze", "cli:test", 10)
+                .set_manual_review_hold(*id, Some(10 + 72 * 3600), "72h freeze", "cli:test", 10)
                 .unwrap();
         }
         // A fold placed after the hold: unheld by construction.
@@ -5687,6 +5687,149 @@ async fn a_held_request_is_skipped_by_auto_resume_and_new_folds_are_unaffected()
     );
     assert_eq!(
         ledger_state(&orchestrator, request_ids[1]),
+        RequestState::ManualReview
+    );
+}
+
+/// A rapid-burst hold (schema v30) is never a candidate for the
+/// auto-resume sweep — not when liquidity recovers, not when the route
+/// reopens, not across a daemon restart (a fresh orchestrator over the
+/// same ledger), and not once `review_after` has passed. The ordinary
+/// parks around it, including one folded LATER by an unrelated wallet,
+/// drain exactly as before; the held row never leaves `ManualReview`,
+/// never enters a refund lifecycle, and never has anything reserved.
+#[tokio::test]
+async fn a_rapid_burst_hold_is_never_auto_resumed_whatever_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let (held_id, normal_ids) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 5, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        ledger
+            .set_rapid_burst_policy(
+                &crate::ledger::RapidBurstPolicy {
+                    enabled: true,
+                    window_secs: 600,
+                    max_per_source_wallet: 2,
+                    max_per_destination_wallet: 2,
+                    max_per_pair: 1,
+                    minimum_review_hold_secs: 72 * 3600,
+                },
+                0,
+            )
+            .unwrap();
+        // Two ordinary liquidity parks from unrelated wallets.
+        let normal = park_utxo_liquidity_requests(&mut ledger, 0, 2);
+        // A burst: the same pair twice, 10 s apart. The first is an
+        // ordinary liquidity park; the second is HELD.
+        let burst_wallet = distinct_test_wallet(900);
+        let burst_recipient = distinct_test_recipient(900);
+        let mut burst = Vec::new();
+        for (i, at) in [(100u64, 100i64), (101, 110)] {
+            let outcome = ledger
+                .fold_sol_deposit(
+                    i,
+                    sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                    burst_wallet,
+                    &burst_recipient,
+                    None,
+                    at,
+                )
+                .unwrap();
+            let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+                panic!("{outcome:?}")
+            };
+            burst.push(request_id);
+        }
+        let held = ledger.get_request(burst[1]).unwrap().unwrap();
+        assert_eq!(
+            held.manual_review_disposition,
+            crate::ledger::ManualReviewDisposition::RapidBurstHold
+        );
+        assert!(held.is_held());
+        let first = ledger.get_request(burst[0]).unwrap().unwrap();
+        assert_eq!(
+            first.manual_review_disposition,
+            crate::ledger::ManualReviewDisposition::Normal
+        );
+        // A fold placed after the hold, unrelated wallet: unheld.
+        let later = park_utxo_liquidity_requests(&mut ledger, 10, 1);
+        let mut normal_all = normal;
+        normal_all.push(burst[0]);
+        normal_all.extend(later);
+        (burst[1], normal_all)
+    };
+    let review_after = Ledger::open(&db_path)
+        .unwrap()
+        .get_request(held_id)
+        .unwrap()
+        .unwrap()
+        .review_after
+        .unwrap();
+
+    // Liquidity recovers fully; generous budget.
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        seed_mature_vault_utxos(&mut ledger, &vault, 30, 100_000_000_000);
+    }
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator_with_max_auto_resumes(
+        &db_path,
+        goldcoin_rpc.clone(),
+        vault.clone(),
+        vault_signers,
+        20,
+    );
+    let report = orchestrator.tick(200).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.attempted,
+        normal_ids.len() as u32,
+        "the held row must not be attempted — errors: {:?}",
+        report.errors
+    );
+    for id in &normal_ids {
+        assert_eq!(
+            ledger_state(&orchestrator, *id),
+            RequestState::SourceFinalized,
+            "ordinary park {id} drains"
+        );
+    }
+    assert_eq!(
+        ledger_state(&orchestrator, held_id),
+        RequestState::ManualReview
+    );
+
+    // "Restart": a fresh orchestrator over the same ledger, ticking well
+    // past `review_after` — still nothing.
+    drop(orchestrator);
+    let (_, vault_signers) = vault_and_signers();
+    let mut restarted =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    for at in [review_after - 1, review_after, review_after + 30 * 86_400] {
+        let report = restarted.tick(at).await;
+        let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+        assert_eq!(auto_resume.attempted, 0, "at {at}: {:?}", report.errors);
+        assert_eq!(
+            ledger_state(&restarted, held_id),
+            RequestState::ManualReview
+        );
+    }
+    let ledger = Ledger::open(&db_path).unwrap();
+    let row = ledger.get_request(held_id).unwrap().unwrap();
+    assert!(row.is_held());
+    assert_eq!(row.operator_decision, None);
+    assert!(row.review_available(review_after + 30 * 86_400));
+    assert!(
+        ledger.get_solana_refund(held_id).unwrap().is_none(),
+        "never auto-refunded"
+    );
+    assert_eq!(
+        ledger.state_log(held_id).unwrap().last().unwrap().1,
         RequestState::ManualReview
     );
 }

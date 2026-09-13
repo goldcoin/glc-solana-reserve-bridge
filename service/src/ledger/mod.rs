@@ -20,6 +20,7 @@
 //! the same chain event after a restart is always safe (constraint 5).
 
 mod admission;
+pub mod rapid_burst;
 mod robinhood;
 pub mod robinhood_tx;
 mod schema;
@@ -27,6 +28,7 @@ mod types;
 pub mod wallet_window;
 
 pub use admission::{InboundAdmissionBlocker, InboundAdmissionGates, InboundRateLimits};
+pub use rapid_burst::{RapidBurstMatch, RapidBurstPolicy, RapidBurstRule};
 pub use robinhood::{
     RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
     RobinhoodObservationConflict, RobinhoodObservationOutcome, RobinhoodObservationRow,
@@ -38,9 +40,10 @@ pub use robinhood_tx::{
 };
 pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
-    CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
-    RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection, SolanaRefund,
-    SolanaRefundState, SourceChain, TransferAddressFilter, LEGACY_SOLANA_SOURCE_CONTRACT,
+    CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction,
+    ManualReviewDisposition, OperatorDecision, RebalanceKind, RebalanceRequest, RebalanceState,
+    RequestAmounts, RequestState, ReserveDirection, SolanaRefund, SolanaRefundState, SourceChain,
+    TransferAddressFilter, LEGACY_SOLANA_SOURCE_CONTRACT,
 };
 pub use wallet_window::{RouteWalletEligibility, WalletRole, WalletWindowScope};
 
@@ -472,6 +475,12 @@ pub enum LedgerError {
         buffer_atomic: u64,
         reopen_atomic: u64,
     },
+    /// [`Ledger::set_rapid_burst_policy`] refuses a policy that cannot
+    /// be evaluated (non-positive window, a zero maximum, or a negative
+    /// minimum review hold) — the config layer validates the same
+    /// bounds, so this is a second line, not the first.
+    #[error("invalid rapid-burst policy: {0}")]
+    InvalidRapidBurstPolicy(String),
     #[error(
         "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
         crate::goldcoin::hex::encode(txid)
@@ -967,6 +976,17 @@ pub enum GlcObservationOutcome {
         reason: &'static str,
         retry_after: i64,
     },
+    /// The deposit is real and matched its request, but it tripped the
+    /// configured rapid-burst rule (`ledger::rapid_burst`, schema v30).
+    /// Recorded, with its outpoint and amount witness, and parked in
+    /// `ManualReview` as a RAPID-BURST HOLD: never advanced to
+    /// `Confirming`, never auto-resumed, never auto-refunded; only an
+    /// explicit operator `process`/`refund` decision — normally not
+    /// before `review_after` — ends it.
+    RapidBurstHeld {
+        rule: RapidBurstRule,
+        review_after: i64,
+    },
 }
 
 /// Outcome of [`Ledger::approve_rebalance`].
@@ -1245,6 +1265,10 @@ pub struct SolanaRefundDbChecks {
     /// transition), so a refund has nothing to release and must not
     /// subtract blindly.
     pub never_advanced_past_manual_review: bool,
+    /// `Some(detail)` when the row is HELD (schema v30) and no `refund`
+    /// operator decision has been recorded — [`Ledger::refund_hold_blocker_in`].
+    /// `None` for an unheld row, or a held row whose decision is `refund`.
+    pub hold_blocker: Option<String>,
     /// `Some` if a `solana_refunds` row already exists (its state) — the
     /// caller then resumes THAT lifecycle rather than beginning a new
     /// one.
@@ -1313,6 +1337,9 @@ impl SolanaRefundDbChecks {
                  it may hold (or have held) reserved liquidity and is not a pure fold-time park"
                     .to_string(),
             );
+        }
+        if let Some(detail) = &self.hold_blocker {
+            return Some(detail.clone());
         }
         None
     }
@@ -3366,6 +3393,70 @@ impl Ledger {
             destination_retry_after,
         };
         let primary_source_wallet: Option<&[u8]> = traced.first().copied();
+        // The rapid-burst rule (`ledger::rapid_burst`, schema v30),
+        // ranked above the wallet windows: a deposit matching both is
+        // held (non-self-clearing) rather than parked for 24 hours.
+        // Every traced funding wallet is asked; the recipient once.
+        let mut burst: Option<RapidBurstMatch> = None;
+        let burst_sources: Vec<Option<&[u8]>> = if traced.is_empty() {
+            vec![None]
+        } else {
+            traced.iter().map(|w| Some(*w)).collect()
+        };
+        for wallet in burst_sources {
+            burst = Self::rapid_burst_verdict_in(
+                &tx,
+                direction,
+                wallet,
+                Some(&recipient),
+                now,
+                WalletWindowScope::ExcludingRequest(request_id),
+            )?;
+            if burst.is_some() {
+                break;
+            }
+        }
+        if let Some(matched) = burst {
+            let reason = Self::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD;
+            tx.execute(
+                "UPDATE bridge_requests SET state = ?1, source_txid = ?2, source_vout = ?3,
+                    source_block_height = ?4, source_block_hash = ?5, manual_review_note = ?6,
+                    observed_amount_atomic = ?7,
+                    source_wallet = COALESCE(?8, source_wallet)
+                 WHERE id = ?9",
+                rusqlite::params![
+                    RequestState::ManualReview,
+                    txid.as_slice(),
+                    vout,
+                    block_height,
+                    block_hash.as_slice(),
+                    reason,
+                    observed_amount,
+                    primary_source_wallet,
+                    request_id,
+                ],
+            )?;
+            log_transition(
+                &tx,
+                request_id,
+                Some(RequestState::AwaitingDeposit),
+                RequestState::ManualReview,
+                now,
+                Some(reason),
+                "system",
+            )?;
+            Self::mark_rapid_burst_hold_in(&tx, request_id, &matched, now)?;
+            let review_after: i64 = tx.query_row(
+                "SELECT review_after FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(GlcObservationOutcome::RapidBurstHeld {
+                rule: matched.rule,
+                review_after,
+            });
+        }
         if let Some((role, retry_after)) = eligibility.blocker() {
             let reason = role.limit_reason();
             // Same durable evidence an amount-mismatch park records, in
@@ -3918,6 +4009,14 @@ impl Ledger {
     /// written any more; recognized everywhere, for the same reason.
     pub(crate) const LEGACY_MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED: &str =
         "source_wallet_rate_limited";
+    /// The deposit matched the configured rapid-burst rule at fold time
+    /// (`ledger::rapid_burst`, schema v30). Written together with
+    /// `manual_review_disposition = rapid_burst_hold` and the hold
+    /// columns, on a deposit that is custodied and finalized. NEVER
+    /// auto-resumed and NEVER auto-refunded: the row leaves
+    /// `ManualReview` only through an explicit operator `process` or
+    /// `refund` decision, normally not before `review_after`.
+    pub const MANUAL_REVIEW_REASON_RAPID_BURST_HOLD: &'static str = "rapid_burst_hold";
     /// Whether `note` is one of the wallet-window park reasons, in either
     /// spelling — the one predicate every list and every filter below
     /// asks, so the legacy spellings cannot be dropped from one of them
@@ -3954,7 +4053,7 @@ impl Ledger {
     /// exist so that specific failure cannot recur: the old guard only
     /// checked that every LISTED reason is accepted, never that every
     /// ACCEPTED reason is listed, which is the direction that broke.
-    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 10] = [
+    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 11] = [
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
         // The route-scoped twin of the reserve-wide reason above, and
         // recoverable for exactly the same reason: gating was the only
@@ -3981,6 +4080,14 @@ impl Ledger {
         Self::MANUAL_REVIEW_REASON_WALLET_DESTINATION_24H_LIMIT,
         Self::LEGACY_MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED,
         Self::LEGACY_MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
+        // A rapid-burst hold (schema v30) is recoverable ONLY through the
+        // explicit `process` decision, which clears the hold marker in
+        // the same transaction as the resume. Listing it here is what
+        // lets that resume succeed; the hold marker — refused first by
+        // every resume entry point and skipped outright by the automatic
+        // pass (`is_auto_resumable_manual_review_reason` never returns
+        // true for it) — is what keeps everything else out.
+        Self::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD,
     ];
 
     /// The single canonical answer to "is this `manual_review_note` a
@@ -4256,17 +4363,36 @@ impl Ledger {
                 recipient_rate_limited,
             },
         );
+        // The rapid-burst rule (`ledger::rapid_burst`, schema v30),
+        // evaluated on the same identities the wallet windows use — the
+        // on-chain `requester` and the recipient — against this
+        // transaction's view of recent history. It outranks every other
+        // reason: a burst-held deposit is custodied and classified for an
+        // explicit operator decision, whatever else the reserve would
+        // have said about it.
+        let burst = Self::rapid_burst_verdict_in(
+            &tx,
+            Direction::SolToGlc,
+            Some(requester.as_slice()),
+            Some(recipient_glc_address),
+            now,
+            WalletWindowScope::NewRequest,
+        )?;
         // An explicit refusal outranks a capacity blocker, matching
         // `fold_sol_deposit_to_robinhood`'s ranking: a deposit that may
         // not be paid out AT ALL is not usefully described as one the
         // reserve is currently too small for, and the two have different
         // remedies.
-        let capacity_ok = blocker.is_none() && refusal.is_none();
-        let manual_review_reason = refusal.unwrap_or_else(|| {
-            blocker
-                .map(|b| b.manual_review_note())
-                .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
-        });
+        let capacity_ok = blocker.is_none() && refusal.is_none() && burst.is_none();
+        let manual_review_reason = if burst.is_some() {
+            Self::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD
+        } else {
+            refusal.unwrap_or_else(|| {
+                blocker
+                    .map(|b| b.manual_review_note())
+                    .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
+            })
+        };
 
         tx.execute(
             // The obligation index is only half an identity: it is local
@@ -4320,6 +4446,9 @@ impl Ledger {
             Some("retroactive_fold_sol_deposit"),
             "system",
         )?;
+        if let Some(matched) = &burst {
+            Self::mark_rapid_burst_hold_in(&tx, request_id, matched, now)?;
+        }
 
         if capacity_ok {
             tx.execute(
@@ -4463,14 +4592,29 @@ impl Ledger {
                 recipient_rate_limited: eligibility.destination_retry_after.is_some(),
             },
         );
-        let payable =
-            route_open && refusal.is_none() && recipient_evm.is_some() && reserve_blocker.is_none();
+        // The rapid-burst rule (`ledger::rapid_burst`), ranked above
+        // everything else — see `fold_sol_deposit`.
+        let burst = Self::rapid_burst_verdict_in(
+            &tx,
+            direction,
+            Some(requester.as_slice()),
+            recipient_evm.as_ref().map(|a| &a[..]),
+            now,
+            WalletWindowScope::NewRequest,
+        )?;
+        let payable = route_open
+            && refusal.is_none()
+            && recipient_evm.is_some()
+            && reserve_blocker.is_none()
+            && burst.is_none();
         // Ranked exactly as `fold_robinhood_deposit` ranks them: the
-        // explicit refusal, then deliverability, then the route's
-        // ENABLEMENT gate (a different axis from admission), then the
-        // shared reserve-side ranking verbatim.
+        // burst hold, the explicit refusal, then deliverability, then
+        // the route's ENABLEMENT gate (a different axis from admission),
+        // then the shared reserve-side ranking verbatim.
         let note: Option<&str> = if payable {
             None
+        } else if burst.is_some() {
+            Some(Self::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD)
         } else if let Some(explicit) = refusal {
             Some(explicit)
         } else if recipient_evm.is_none() {
@@ -4532,6 +4676,9 @@ impl Ledger {
             Some("retroactive_fold_sol_deposit_to_robinhood"),
             "system",
         )?;
+        if let Some(matched) = &burst {
+            Self::mark_rapid_burst_hold_in(&tx, request_id, matched, now)?;
+        }
 
         if payable {
             tx.execute(
@@ -5025,23 +5172,43 @@ impl Ledger {
     /// operator act without inventing a state).
     pub const AUTO_RESUME_HOLD_TRANSITION_REASON: &str = "auto_resume_hold";
     pub const AUTO_RESUME_HOLD_RELEASED_TRANSITION_REASON: &str = "auto_resume_hold_released";
+    /// State-log reason a fold writes when the rapid-burst rule holds a
+    /// deposit (`ledger::rapid_burst`), and the reasons an operator's
+    /// `process`/`refund` decision on a held row writes.
+    pub const RAPID_BURST_HOLD_TRANSITION_REASON: &str = "rapid_burst_hold";
+    pub const OPERATOR_DECISION_PROCESS_TRANSITION_REASON: &str = "operator_decision_process";
+    pub const OPERATOR_DECISION_REFUND_TRANSITION_REASON: &str = "operator_decision_refund";
+    /// `hold_reason` of an operator hold (a rapid-burst hold's is
+    /// `rapid_burst:<rule>` — [`RapidBurstRule::hold_reason`]).
+    pub const OPERATOR_HOLD_REASON: &str = "operator_hold";
 
-    /// Places an operator auto-resume hold on ONE `ManualReview` request
-    /// (schema v29 — see `apply_v29`).
+    /// Places an explicit operator hold on ONE `ManualReview` request
+    /// (schema v29 hold marker + v30 disposition — see `apply_v29`/
+    /// `apply_v30`).
     ///
     /// Refuses, without writing, unless the row is currently
     /// `ManualReview`, has no destination txid and no destination payout
     /// row — the same "nothing has been paid" predicates the resume and
     /// refund paths apply, so a request already processing can never be
-    /// marked. Idempotent on an already-held row (the note and time are
-    /// replaced, one audit row is written). Touches nothing else: no
-    /// state, note, reserve figure or other row changes, and a row
-    /// folded after this call is unaffected because folds never read or
-    /// write the hold columns.
+    /// marked — and is not a rapid-burst hold (that classification is
+    /// the fold's evidence and is never overwritten; decide it with
+    /// `process`/`refund` instead). Idempotent on an already-held row
+    /// (note, marker time and `review_after` are replaced; one audit
+    /// row is written; `hold_started_at` keeps the ORIGINAL time).
+    ///
+    /// `review_after` is informational — the moment the operator
+    /// intends to revisit the row (`None` = at their discretion). The
+    /// hold is INDEFINITE: nothing expires it, and only
+    /// [`Self::clear_manual_review_hold`] or an explicit decision
+    /// ([`Self::process_held_manual_review`] /
+    /// [`Self::record_operator_decision`]) ends it. Touches nothing
+    /// else: no state, note, reserve figure or other row changes, and a
+    /// row folded after this call is unaffected because folds never
+    /// read or write the hold columns.
     pub fn set_manual_review_hold(
         &mut self,
         request_id: i64,
-        hold_until: i64,
+        review_after: Option<i64>,
         note: &str,
         actor: &str,
         now: i64,
@@ -5054,54 +5221,33 @@ impl Ledger {
             });
         }
         let tx = write_tx(&mut self.conn)?;
-        let row: Option<(RequestState, Option<Vec<u8>>)> = tx
-            .query_row(
-                "SELECT state, destination_txid FROM bridge_requests WHERE id = ?1",
-                [request_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((state, destination_txid)) = row else {
-            tx.rollback()?;
-            return Err(LedgerError::RequestNotFound(request_id));
-        };
-        if state != RequestState::ManualReview {
+        let disposition = Self::refuse_unless_holdable(&tx, request_id)?;
+        if disposition == ManualReviewDisposition::RapidBurstHold {
             tx.rollback()?;
             return Err(LedgerError::ManualReviewNotRecoverable {
                 id: request_id,
-                detail: format!(
-                    "state is {state:?}, not ManualReview — a hold applies only to parked requests"
-                ),
-            });
-        }
-        if destination_txid.is_some() {
-            tx.rollback()?;
-            return Err(LedgerError::ManualReviewNotRecoverable {
-                id: request_id,
-                detail: "a destination txid is recorded — this request has been paid out"
-                    .to_string(),
-            });
-        }
-        let payout_rows: i64 = tx.query_row(
-            "SELECT (SELECT COUNT(*) FROM goldcoin_payouts WHERE request_id = ?1)
-                  + (SELECT COUNT(*) FROM robinhood_transactions
-                      WHERE request_id = ?1 AND kind <> 'Refund')",
-            [request_id],
-            |r| r.get(0),
-        )?;
-        if payout_rows > 0 {
-            tx.rollback()?;
-            return Err(LedgerError::ManualReviewNotRecoverable {
-                id: request_id,
-                detail: "a destination payout row already exists — this request is processing"
+                detail: "this is a rapid-burst hold — its classification is not replaced by an \
+                         operator hold; decide it with `manual-review-process` or \
+                         `manual-review-refund`"
                     .to_string(),
             });
         }
         tx.execute(
             "UPDATE bridge_requests
-                SET auto_resume_hold_note = ?1, auto_resume_hold_until = ?2
-              WHERE id = ?3",
-            rusqlite::params![note, hold_until, request_id],
+                SET auto_resume_hold_note = ?1, auto_resume_hold_until = ?2,
+                    manual_review_disposition = ?3, hold_reason = ?4, held_by = ?5,
+                    hold_started_at = COALESCE(hold_started_at, ?6), review_after = ?2,
+                    operator_decision = NULL, operator_decision_at = NULL, operator_note = NULL
+              WHERE id = ?7",
+            rusqlite::params![
+                note,
+                review_after,
+                ManualReviewDisposition::OperatorHold,
+                Self::OPERATOR_HOLD_REASON,
+                actor,
+                now,
+                request_id
+            ],
         )?;
         log_transition(
             &tx,
@@ -5116,36 +5262,65 @@ impl Ledger {
         Ok(())
     }
 
-    /// Clears the hold placed by [`Self::set_manual_review_hold`]. A no-op
-    /// (`Ok(false)`) on a row that is not held; `Ok(true)` when a hold was
-    /// removed. Never changes state.
+    /// Releases an OPERATOR hold placed by [`Self::set_manual_review_hold`]
+    /// — the row becomes an ordinary park again (disposition `normal`,
+    /// eligible for auto-resume exactly as an unheld park with its
+    /// original `manual_review_note`). The decision (`release`), its time
+    /// and note stay on the row as audit. A no-op (`Ok(false)`) on a row
+    /// that is not held; `Ok(true)` when a hold was removed. Never
+    /// changes state.
+    ///
+    /// Refuses a rapid-burst hold outright: the only ways out of one are
+    /// `process` and `refund`, because "let it drain on its own" is
+    /// precisely what the classification exists to prevent.
     pub fn clear_manual_review_hold(
         &mut self,
         request_id: i64,
+        note: &str,
         actor: &str,
         now: i64,
     ) -> Result<bool, LedgerError> {
+        let note = note.trim();
         let tx = write_tx(&mut self.conn)?;
-        let held: Option<Option<String>> = tx
+        let held: Option<(Option<String>, ManualReviewDisposition)> = tx
             .query_row(
-                "SELECT auto_resume_hold_note FROM bridge_requests WHERE id = ?1",
+                "SELECT auto_resume_hold_note, manual_review_disposition
+                   FROM bridge_requests WHERE id = ?1",
                 [request_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(held) = held else {
+        let Some((held_note, disposition)) = held else {
             tx.rollback()?;
             return Err(LedgerError::RequestNotFound(request_id));
         };
-        if held.is_none() {
+        if disposition == ManualReviewDisposition::RapidBurstHold {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a rapid-burst hold cannot be released — it ends only with an explicit \
+                         `manual-review-process` or `manual-review-refund` decision"
+                    .to_string(),
+            });
+        }
+        if held_note.is_none() && disposition == ManualReviewDisposition::Normal {
             tx.rollback()?;
             return Ok(false);
         }
         tx.execute(
             "UPDATE bridge_requests
-                SET auto_resume_hold_note = NULL, auto_resume_hold_until = NULL
-              WHERE id = ?1",
-            [request_id],
+                SET auto_resume_hold_note = NULL, auto_resume_hold_until = NULL,
+                    manual_review_disposition = ?1,
+                    operator_decision = ?2, operator_decision_at = ?3,
+                    operator_note = ?4
+              WHERE id = ?5",
+            rusqlite::params![
+                ManualReviewDisposition::Normal,
+                OperatorDecision::Release,
+                now,
+                if note.is_empty() { None } else { Some(note) },
+                request_id
+            ],
         )?;
         log_transition(
             &tx,
@@ -5160,12 +5335,16 @@ impl Ledger {
         Ok(true)
     }
 
-    /// Every request currently carrying a hold, oldest first — whatever
-    /// its state (a held row that was refunded keeps its marker, which is
-    /// the audit trail; the listing shows the state beside it).
+    /// Every request currently HELD ([`BridgeRequest::is_held`]) or that
+    /// ever carried a hold marker, oldest first — whatever its state (a
+    /// held row that was refunded keeps its markers, which is the audit
+    /// trail; the listing shows the state beside it).
     pub fn held_manual_review_requests(&self) -> Result<Vec<BridgeRequest>, LedgerError> {
         let mut stmt = self.conn.prepare(&format!(
-            "{SELECT_REQUEST_PREFIX} WHERE auto_resume_hold_note IS NOT NULL ORDER BY id"
+            "{SELECT_REQUEST_PREFIX}
+              WHERE auto_resume_hold_note IS NOT NULL
+                 OR manual_review_disposition <> 'normal'
+              ORDER BY id"
         ))?;
         let rows = stmt
             .query_map([], row_to_request)?
@@ -5173,30 +5352,433 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// The one predicate both resume entry points apply first: a held
-    /// row is refused, by whoever asks (operator or the automatic pass),
-    /// until the hold is cleared. Refund paths deliberately do NOT call
-    /// this — a hold keeps a row FOR refunding.
-    fn refuse_if_auto_resume_held(tx: &Connection, request_id: i64) -> Result<(), LedgerError> {
-        let hold: Option<(Option<String>, Option<i64>)> = tx
+    /// Records the explicit operator decision that ends a hold, on ONE
+    /// held `ManualReview` request, and returns the row as it stood
+    /// BEFORE the write (for the caller's audit old-value).
+    ///
+    /// Refuses, without writing, unless ALL of: the row exists and is
+    /// currently `ManualReview`; it is held ([`BridgeRequest::is_held`]);
+    /// no destination txid and no destination payout row (the same
+    /// "nothing has been paid" predicates every resume/refund path
+    /// applies — a double payout is impossible by construction); no
+    /// refund lifecycle has begun; and, for a rapid-burst hold, the
+    /// minimum review hold has elapsed (`now >= review_after`) — unless
+    /// `emergency` is set, which is accepted ONLY for `refund` (the
+    /// emergency exit returns funds; it never pays out early) and is
+    /// recorded in the state log as such.
+    ///
+    /// `process` clears the v29 hold marker in the same write so the
+    /// shared resume can proceed — callers MUST run that resume inside
+    /// the same transaction ([`Self::process_held_manual_review`]) so a
+    /// refused resume rolls the decision back too. `refund` leaves the
+    /// marker in place (the hold keeps the row FOR refunding) and only
+    /// records the decision, which the refund begin-paths then require
+    /// ([`Self::refuse_unless_decided`]). `release` is not a decision
+    /// this records — use [`Self::clear_manual_review_hold`].
+    pub fn record_operator_decision(
+        &mut self,
+        request_id: i64,
+        decision: OperatorDecision,
+        note: &str,
+        actor: &str,
+        emergency: bool,
+        now: i64,
+    ) -> Result<BridgeRequest, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let before = Self::record_operator_decision_in(
+            &tx, request_id, decision, note, actor, emergency, now,
+        )?;
+        tx.commit()?;
+        Ok(before)
+    }
+
+    fn record_operator_decision_in(
+        tx: &Connection,
+        request_id: i64,
+        decision: OperatorDecision,
+        note: &str,
+        actor: &str,
+        emergency: bool,
+        now: i64,
+    ) -> Result<BridgeRequest, LedgerError> {
+        let refuse = |detail: String| LedgerError::ManualReviewNotRecoverable {
+            id: request_id,
+            detail,
+        };
+        let note = note.trim();
+        if note.is_empty() {
+            return Err(refuse(
+                "an operator decision needs a non-empty note".to_string(),
+            ));
+        }
+        if decision == OperatorDecision::Release {
+            return Err(refuse(
+                "`release` is recorded by clear_manual_review_hold, not as a decision".to_string(),
+            ));
+        }
+        if emergency && decision != OperatorDecision::Refund {
+            return Err(refuse(
+                "the emergency override applies to `refund` only — a payout is never brought \
+                 forward"
+                    .to_string(),
+            ));
+        }
+        Self::refuse_unless_holdable(tx, request_id)?;
+        let before = tx
+            .query_row(SELECT_REQUEST, [request_id], row_to_request)
+            .optional()?
+            .ok_or(LedgerError::RequestNotFound(request_id))?;
+        if !before.is_held() {
+            return Err(refuse(format!(
+                "not held (disposition {}) — an operator decision applies to a held request \
+                 only; use resume-manual-review / refund-manual-review for an ordinary park",
+                before.manual_review_disposition.as_str()
+            )));
+        }
+        if Self::refund_lifecycle_exists_in(tx, request_id)? {
+            return Err(refuse(
+                "a refund lifecycle already exists for this request".to_string(),
+            ));
+        }
+        if before.manual_review_disposition == ManualReviewDisposition::RapidBurstHold
+            && !before.review_available(now)
+            && !emergency
+        {
+            return Err(refuse(format!(
+                "rapid-burst hold: the minimum review hold has not elapsed (review_after={}, \
+                 now={}) — decide after that moment, or `--emergency` for a refund",
+                before.review_after.unwrap_or_default(),
+                now
+            )));
+        }
+        let reason = match decision {
+            OperatorDecision::Process => Self::OPERATOR_DECISION_PROCESS_TRANSITION_REASON,
+            OperatorDecision::Refund => Self::OPERATOR_DECISION_REFUND_TRANSITION_REASON,
+            OperatorDecision::Release => unreachable!("refused above"),
+        };
+        let stored_note = if emergency {
+            format!("EMERGENCY (before review_after): {note}")
+        } else {
+            note.to_string()
+        };
+        match decision {
+            OperatorDecision::Process => tx.execute(
+                "UPDATE bridge_requests
+                    SET operator_decision = ?1, operator_decision_at = ?2, operator_note = ?3,
+                        auto_resume_hold_note = NULL, auto_resume_hold_until = NULL
+                  WHERE id = ?4",
+                rusqlite::params![decision, now, stored_note, request_id],
+            )?,
+            _ => tx.execute(
+                "UPDATE bridge_requests
+                    SET operator_decision = ?1, operator_decision_at = ?2, operator_note = ?3
+                  WHERE id = ?4",
+                rusqlite::params![decision, now, stored_note, request_id],
+            )?,
+        };
+        log_transition(
+            tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::ManualReview,
+            now,
+            Some(reason),
+            actor,
+        )?;
+        Ok(before)
+    }
+
+    /// The `process` decision, end to end, as ONE atomic unit: records
+    /// the decision ([`Self::record_operator_decision`]), then runs the
+    /// SAME shared resume every other recovery path uses — inbound
+    /// ([`Self::resume_manual_review_sol_to_glc`] /
+    /// [`Self::resume_manual_review_rhn_to_glc`]) or cross-route
+    /// ([`Self::resume_manual_review_cross_route`]) by the row's own
+    /// direction — which independently re-checks state, the fold-time
+    /// reason, the refund lifecycle, both rolling-24h windows, the
+    /// mature-UTXO floor, the safety buffer and the reserve invariant
+    /// under the write lock. A refused resume rolls the decision back
+    /// with it: the row stays held, unchanged, and the refusal is
+    /// returned. There is no second payout implementation here.
+    pub fn process_held_manual_review(
+        &mut self,
+        request_id: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<ResumeManualReviewOutcome, LedgerError> {
+        self.atomically("manual_review_process", |ledger| {
+            let before = ledger.record_operator_decision(
+                request_id,
+                OperatorDecision::Process,
+                note,
+                actor,
+                false,
+                now,
+            )?;
+            let outcome = match before.direction {
+                Direction::SolToGlc => {
+                    ledger.resume_manual_review_sol_to_glc(request_id, note, actor, now)?
+                }
+                Direction::RhnToGlc => {
+                    ledger.resume_manual_review_rhn_to_glc(request_id, note, actor, now)?
+                }
+                Direction::SolToRhn | Direction::RhnToSol => ledger
+                    .resume_manual_review_cross_route(
+                        before.direction,
+                        request_id,
+                        note,
+                        actor,
+                        now,
+                    )?,
+                Direction::GlcToSol | Direction::GlcToRhn => {
+                    return Err(LedgerError::ManualReviewNotRecoverable {
+                        id: request_id,
+                        detail: format!(
+                            "direction {:?} has no ManualReview resume path — a Goldcoin-sourced \
+                             park is refunded, never re-admitted",
+                            before.direction
+                        ),
+                    })
+                }
+            };
+            Ok(outcome)
+        })
+    }
+
+    /// Runs `f` as one unit: a `BEGIN IMMEDIATE` when standalone, a
+    /// SAVEPOINT when an admin-action scope is already open
+    /// ([`Self::begin_admin_action`]). Every `write_tx` inside `f` nests
+    /// as its own savepoint, so a failure in the LAST of several
+    /// mutations rolls back the earlier ones too — which is the whole
+    /// point (a recorded decision must never outlive a refused resume).
+    fn atomically<T>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut Self) -> Result<T, LedgerError>,
+    ) -> Result<T, LedgerError> {
+        let standalone = self.conn.is_autocommit();
+        if standalone {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        } else {
+            self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        }
+        match f(self) {
+            Ok(v) => {
+                if standalone {
+                    self.conn.execute_batch("COMMIT")?;
+                } else {
+                    self.conn.execute_batch(&format!("RELEASE {name}"))?;
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = if standalone {
+                    self.conn.execute_batch("ROLLBACK")
+                } else {
+                    self.conn
+                        .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))
+                };
+                Err(e)
+            }
+        }
+    }
+
+    /// The "nothing has been paid, nothing is processing" predicate a
+    /// hold or a decision requires: the row exists, is `ManualReview`,
+    /// has no destination txid and no destination payout row. Returns
+    /// the row's disposition for the caller's own rule.
+    fn refuse_unless_holdable(
+        tx: &Connection,
+        request_id: i64,
+    ) -> Result<ManualReviewDisposition, LedgerError> {
+        let row: Option<(RequestState, Option<Vec<u8>>, ManualReviewDisposition)> = tx
             .query_row(
-                "SELECT auto_resume_hold_note, auto_resume_hold_until
+                "SELECT state, destination_txid, manual_review_disposition
                    FROM bridge_requests WHERE id = ?1",
                 [request_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((Some(note), until)) = hold {
+        let Some((state, destination_txid, disposition)) = row else {
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if state != RequestState::ManualReview {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "state is {state:?}, not ManualReview — a hold applies only to parked requests"
+                ),
+            });
+        }
+        if destination_txid.is_some() {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a destination txid is recorded — this request has been paid out"
+                    .to_string(),
+            });
+        }
+        let payout_rows: i64 = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM goldcoin_payouts WHERE request_id = ?1)
+                  + (SELECT COUNT(*) FROM robinhood_transactions
+                      WHERE request_id = ?1 AND kind <> 'Refund')",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        if payout_rows > 0 {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a destination payout row already exists — this request is processing"
+                    .to_string(),
+            });
+        }
+        Ok(disposition)
+    }
+
+    /// Whether ANY refund lifecycle marker exists for `request_id`: a
+    /// `solana_refunds` row, a `goldcoin_refunds` row, or a `Refund`
+    /// `robinhood_transactions` row. The same three markers the resume
+    /// paths exclude on, gathered once.
+    fn refund_lifecycle_exists_in(tx: &Connection, request_id: i64) -> Result<bool, LedgerError> {
+        let n: i64 = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM solana_refunds WHERE request_id = ?1)
+                  + (SELECT COUNT(*) FROM goldcoin_refunds WHERE request_id = ?1)
+                  + (SELECT COUNT(*) FROM robinhood_transactions
+                      WHERE request_id = ?1 AND kind = 'Refund')",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The one predicate both resume entry points apply first: a held
+    /// row is refused, by whoever asks (operator or the automatic pass),
+    /// until the hold is ended by an explicit operator act. Refund paths
+    /// deliberately do NOT call this — a hold keeps a row FOR refunding
+    /// — they call [`Self::refuse_unless_decided`] instead.
+    fn refuse_if_auto_resume_held(tx: &Connection, request_id: i64) -> Result<(), LedgerError> {
+        #[allow(clippy::type_complexity)]
+        let hold: Option<(
+            Option<String>,
+            Option<i64>,
+            ManualReviewDisposition,
+            Option<OperatorDecision>,
+            Option<i64>,
+        )> = tx
+            .query_row(
+                "SELECT auto_resume_hold_note, auto_resume_hold_until,
+                        manual_review_disposition, operator_decision, review_after
+                   FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((note, until, disposition, decision, review_after)) = hold else {
+            return Ok(());
+        };
+        if disposition == ManualReviewDisposition::RapidBurstHold && decision.is_none() {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "held: rapid-burst hold (review_after={}) — resumes only through an explicit \
+                     `glc-admin manual-review-process` decision, never automatically",
+                    review_after.unwrap_or_default()
+                ),
+            });
+        }
+        if let Some(note) = note {
             return Err(LedgerError::ManualReviewNotRecoverable {
                 id: request_id,
                 detail: format!(
                     "held by operator (auto_resume_hold{}): {note} — release with \
-                     `glc-admin manual-review-hold-release` before resuming",
+                     `glc-admin manual-review-release`, or decide with \
+                     `manual-review-process`, before resuming",
                     until.map(|u| format!(" until {u}")).unwrap_or_default()
                 ),
             });
         }
+        if disposition != ManualReviewDisposition::Normal && decision.is_none() {
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "held ({}) with no operator decision recorded",
+                    disposition.as_str()
+                ),
+            });
+        }
         Ok(())
+    }
+
+    /// The refund-side twin of [`Self::refuse_if_auto_resume_held`]: a
+    /// HELD row may enter a refund lifecycle only once the operator has
+    /// recorded the `refund` decision ([`Self::record_operator_decision`])
+    /// — so a held row is never refunded automatically, by a script, or
+    /// by a command that did not state the decision. An unheld row is
+    /// unaffected (every pre-v30 refund semantics applies unchanged).
+    /// Returns the detail to refuse with, `None` when the refund may
+    /// proceed.
+    pub(crate) fn refund_hold_blocker_in(
+        tx: &Connection,
+        request_id: i64,
+    ) -> Result<Option<String>, LedgerError> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Option<String>,
+            ManualReviewDisposition,
+            Option<OperatorDecision>,
+            Option<i64>,
+        )> = tx
+            .query_row(
+                "SELECT auto_resume_hold_note, manual_review_disposition, operator_decision,
+                        review_after
+                   FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((note, disposition, decision, review_after)) = row else {
+            return Ok(None);
+        };
+        let held = note.is_some() || disposition != ManualReviewDisposition::Normal;
+        if !held {
+            return Ok(None);
+        }
+        match decision {
+            Some(OperatorDecision::Refund) => Ok(None),
+            Some(other) => Ok(Some(format!(
+                "held ({}) with operator decision `{}` recorded — not `refund`",
+                disposition.as_str(),
+                other.as_str()
+            ))),
+            None => Ok(Some(format!(
+                "held ({}{}) — record the operator decision first: \
+                 `glc-admin manual-review-refund` (it re-runs this refund once recorded)",
+                disposition.as_str(),
+                review_after
+                    .map(|t| format!(", review_after={t}"))
+                    .unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// [`Self::refuse_unless_decided`] on the ledger's own connection,
+    /// for callers outside a transaction (the Robinhood refund flow).
+    pub fn refuse_refund_unless_decided(&self, request_id: i64) -> Result<(), LedgerError> {
+        Self::refuse_unless_decided(&self.conn, request_id)
+    }
+
+    /// [`Self::refund_hold_blocker_in`] as a refusal.
+    pub(crate) fn refuse_unless_decided(
+        tx: &Connection,
+        request_id: i64,
+    ) -> Result<(), LedgerError> {
+        match Self::refund_hold_blocker_in(tx, request_id)? {
+            None => Ok(()),
+            Some(detail) => Err(LedgerError::RefundNotEligible {
+                id: request_id,
+                detail,
+            }),
+        }
     }
 
     /// The one body behind both resume wrappers.
@@ -5628,7 +6210,7 @@ impl Ledger {
     /// unknown string) is refused — an ambiguous reason is excluded, not
     /// broadened; the independent settlement-evidence checks run
     /// regardless.
-    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 10] = [
+    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 11] = [
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
         // Both premises hold identically to the reserve-wide reason
         // above: the park happened INSTEAD OF reserving Goldcoin
@@ -5649,6 +6231,11 @@ impl Ledger {
         Self::MANUAL_REVIEW_REASON_WALLET_DESTINATION_24H_LIMIT,
         Self::LEGACY_MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED,
         Self::LEGACY_MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
+        // A rapid-burst hold is refundable — but only once the operator
+        // has recorded the `refund` decision (`refuse_unless_decided`,
+        // checked by every refund begin-path). The reason being listed
+        // is necessary, never sufficient.
+        Self::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD,
     ];
 
     /// The `SolToRhn`-only fold-time park reasons that are refundable in
@@ -5826,6 +6413,7 @@ impl Ledger {
             not_settled: settled_at.is_none(),
             no_goldcoin_payout,
             never_advanced_past_manual_review,
+            hold_blocker: Self::refund_hold_blocker_in(conn, request_id)?,
             existing_refund,
         })
     }
@@ -8065,6 +8653,11 @@ impl Ledger {
                 ),
             );
         }
+        // Held (schema v30) without a recorded `refund` decision: the
+        // dry run reports it, and `begin_goldcoin_refund` refuses it.
+        if let Some(detail) = Self::refund_hold_blocker_in(&self.conn, request_id)? {
+            refuse(&mut c, format!("request {request_id} is {detail}"));
+        }
 
         {
             // The durable witnesses live on the REQUEST ROW, written by
@@ -8137,6 +8730,15 @@ impl Ledger {
         }
 
         let tx = write_tx(&mut self.conn)?;
+        // A held row (schema v30) refunds only on a recorded `refund`
+        // decision — same gate as the Solana and Robinhood refund paths.
+        if let Some(detail) = Self::refund_hold_blocker_in(&tx, request_id)? {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail,
+            });
+        }
 
         let (direction, state, note_db, source_txid, source_vout, destination_txid, claim_hash): GlcRefundEligibilityRow = tx
             .query_row(
@@ -11324,7 +11926,9 @@ const SELECT_REQUEST_PREFIX: &str =
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
     source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract, \
-    source_wallet, auto_resume_hold_note, auto_resume_hold_until \
+    source_wallet, auto_resume_hold_note, auto_resume_hold_until, \
+    manual_review_disposition, hold_reason, held_by, hold_started_at, review_after, \
+    operator_decision, operator_decision_at, operator_note \
     FROM bridge_requests";
 const SELECT_REQUEST: &str =
     "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
@@ -11332,7 +11936,9 @@ const SELECT_REQUEST: &str =
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
     source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract, \
-    source_wallet, auto_resume_hold_note, auto_resume_hold_until \
+    source_wallet, auto_resume_hold_note, auto_resume_hold_until, \
+    manual_review_disposition, hold_reason, held_by, hold_started_at, review_after, \
+    operator_decision, operator_decision_at, operator_note \
     FROM bridge_requests WHERE id = ?1";
 
 fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
@@ -11368,6 +11974,14 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
         source_wallet: r.get(24)?,
         auto_resume_hold_note: r.get(25)?,
         auto_resume_hold_until: r.get(26)?,
+        manual_review_disposition: r.get(27)?,
+        hold_reason: r.get(28)?,
+        held_by: r.get(29)?,
+        hold_started_at: r.get(30)?,
+        review_after: r.get(31)?,
+        operator_decision: r.get(32)?,
+        operator_decision_at: r.get(33)?,
+        operator_note: r.get(34)?,
     })
 }
 

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 29;
+const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -85,6 +85,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v27(conn)?;
         apply_v28(conn)?;
         apply_v29(conn)?;
+        apply_v30(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -173,6 +174,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(29) {
             apply_v29(conn)?;
+        }
+        if current < Some(30) {
+            apply_v30(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2913,6 +2917,132 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v30 — **ManualReview disposition** and the **rapid-burst hold**
+/// (2026-09-13 anti-abuse policy; builds on v29's hold columns rather
+/// than replacing them).
+///
+/// New `bridge_requests` columns, all additive and all NULL/`normal` on
+/// every existing row except the v29 backfill below:
+///
+/// - `manual_review_disposition` — `normal` (every ordinary park; what
+///   a fold writes unless the rapid-burst rule fires), `operator_hold`
+///   (an explicit operator hold, `glc-admin manual-review-hold`) or
+///   `rapid_burst_hold` (written by a fold when the deposit matched the
+///   configured rapid-burst rule). Anything other than `normal` with no
+///   `operator_decision` recorded is HELD: the automatic recovery pass
+///   never considers it, and every resume/refund entry point refuses it
+///   until an explicit operator decision — regardless of liquidity,
+///   route state, daemon restarts or the passage of `review_after`.
+/// - `hold_reason` — machine-readable: `operator_hold`, or the burst
+///   rule that fired (`rapid_burst:same_source_wallet`, …).
+/// - `held_by`, `hold_started_at` — who placed the hold (`system` for a
+///   fold) and when.
+/// - `review_after` — the EARLIEST moment an operator may normally
+///   decide the row's fate (`hold_started_at + minimum_review_hold_secs`
+///   for a rapid-burst hold; the operator's own `--hold-hours` marker
+///   for an operator hold, NULL = at their discretion). Its passing
+///   never changes the row: this is a minimum review hold, not an
+///   expiry and not a refund timer.
+/// - `operator_decision` (`process` | `refund` | `release`),
+///   `operator_decision_at`, `operator_note` — the explicit decision
+///   that ends a hold, and its audit.
+///
+/// `rapid_burst_policy` is the single-row table the daemon seeds from
+/// `[rapid_burst]` at startup, so the fold — which runs inside the
+/// ledger's own write transaction — reads the SAME thresholds `glc-admin
+/// rapid-burst-policy-show` reports. Absent row = rule disabled.
+///
+/// # Backfill
+///
+/// A row carrying a v29 hold (`auto_resume_hold_note IS NOT NULL`) is an
+/// operator hold by definition and is classified as one:
+/// `disposition = operator_hold`, `hold_reason = operator_hold`,
+/// `review_after = auto_resume_hold_until`, `hold_started_at` from the
+/// hold's own state-log row (the earliest `auto_resume_hold` transition;
+/// NULL if a restore lost it). Nothing else is touched. Idempotent:
+/// guarded `ALTER`s, `CREATE TABLE IF NOT EXISTS`, and the backfill only
+/// rewrites rows still at `normal`.
+fn apply_v30(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "bridge_requests", "manual_review_disposition")? {
+        conn.execute_batch(
+            "ALTER TABLE bridge_requests ADD COLUMN manual_review_disposition TEXT NOT NULL
+                DEFAULT 'normal'
+                CHECK (manual_review_disposition IN ('normal', 'operator_hold', 'rapid_burst_hold'));",
+        )?;
+    }
+    for (column, ddl) in [
+        (
+            "hold_reason",
+            "ALTER TABLE bridge_requests ADD COLUMN hold_reason TEXT
+                CHECK (hold_reason IS NULL OR length(hold_reason) > 0);",
+        ),
+        (
+            "held_by",
+            "ALTER TABLE bridge_requests ADD COLUMN held_by TEXT
+                CHECK (held_by IS NULL OR length(held_by) > 0);",
+        ),
+        (
+            "hold_started_at",
+            "ALTER TABLE bridge_requests ADD COLUMN hold_started_at INTEGER;",
+        ),
+        (
+            "review_after",
+            "ALTER TABLE bridge_requests ADD COLUMN review_after INTEGER;",
+        ),
+        (
+            "operator_decision",
+            "ALTER TABLE bridge_requests ADD COLUMN operator_decision TEXT
+                CHECK (operator_decision IS NULL
+                       OR operator_decision IN ('process', 'refund', 'release'));",
+        ),
+        (
+            "operator_decision_at",
+            "ALTER TABLE bridge_requests ADD COLUMN operator_decision_at INTEGER;",
+        ),
+        (
+            "operator_note",
+            "ALTER TABLE bridge_requests ADD COLUMN operator_note TEXT
+                CHECK (operator_note IS NULL OR length(operator_note) > 0);",
+        ),
+    ] {
+        if !column_exists(conn, "bridge_requests", column)? {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rapid_burst_policy (
+            id                          INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled                     INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            window_secs                 INTEGER NOT NULL CHECK (window_secs > 0),
+            max_per_source_wallet       INTEGER NOT NULL CHECK (max_per_source_wallet >= 1),
+            max_per_destination_wallet  INTEGER NOT NULL CHECK (max_per_destination_wallet >= 1),
+            max_per_pair                INTEGER NOT NULL CHECK (max_per_pair >= 1),
+            minimum_review_hold_secs    INTEGER NOT NULL CHECK (minimum_review_hold_secs >= 0),
+            updated_at                  INTEGER NOT NULL
+        );",
+    )?;
+    // v29 holds are operator holds. Only rows still classified `normal`
+    // are rewritten, so a re-run (or a row already re-held under v30)
+    // is left exactly as it is.
+    conn.execute_batch(
+        "UPDATE bridge_requests
+            SET manual_review_disposition = 'operator_hold',
+                hold_reason = 'operator_hold',
+                held_by = COALESCE(
+                    (SELECT l.actor FROM bridge_request_state_log l
+                      WHERE l.request_id = bridge_requests.id AND l.reason = 'auto_resume_hold'
+                      ORDER BY l.at DESC, l.id DESC LIMIT 1),
+                    'operator'),
+                hold_started_at = (SELECT MIN(l.at) FROM bridge_request_state_log l
+                                    WHERE l.request_id = bridge_requests.id
+                                      AND l.reason = 'auto_resume_hold'),
+                review_after = auto_resume_hold_until
+          WHERE auto_resume_hold_note IS NOT NULL
+            AND manual_review_disposition = 'normal';",
+    )?;
+    Ok(())
+}
+
 /// Whether `ddl` already admits everything `to` would have added: every
 /// quoted value in `to` appears in `ddl`. Used only after `from` is known
 /// to be absent, so this is asking "did a later migration go past this
@@ -3363,7 +3493,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4550,7 +4680,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn

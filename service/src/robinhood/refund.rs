@@ -168,6 +168,10 @@ where
     if ledger.get_destination_txid(request_id)?.is_some() {
         return Err(RefundError::AlreadyPaidOut { request_id });
     }
+    // A HELD row (schema v30) refunds only on a recorded `refund`
+    // operator decision — the same gate the Solana and Goldcoin refund
+    // paths apply. Never a hold-aware bypass in the other direction.
+    ledger.refuse_refund_unless_decided(request_id)?;
 
     let obligation_index = request
         .source_obligation_index

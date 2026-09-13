@@ -329,6 +329,26 @@ async fn main() {
             );
         }
     }
+    // The rapid-burst anti-abuse policy (`[rapid_burst]`,
+    // `ledger::rapid_burst`): seeded once here so every fold — which runs
+    // inside the ledger's own transaction — and `glc-admin
+    // rapid-burst-policy-show` read the same numbers. Disabled unless the
+    // config enables it, in which case the effective values are logged
+    // for cross-signer drift diagnosis like the shaping knobs below.
+    or_exit(
+        open_ledger(&config.service.db_path)
+            .set_rapid_burst_policy(&config.rapid_burst, now_unix()),
+        "configure rapid-burst policy",
+    );
+    tracing::info!(
+        enabled = config.rapid_burst.enabled,
+        window_secs = config.rapid_burst.window_secs,
+        max_per_source_wallet = config.rapid_burst.max_per_source_wallet,
+        max_per_destination_wallet = config.rapid_burst.max_per_destination_wallet,
+        max_per_pair = config.rapid_burst.max_per_pair,
+        minimum_review_hold_secs = config.rapid_burst.minimum_review_hold_secs,
+        "rapid-burst hold policy (effective)"
+    );
 
     // Operator/signer-mismatch diagnostic (PR #35 maintainer-review
     // finding 4): every independent signer's own instance of this

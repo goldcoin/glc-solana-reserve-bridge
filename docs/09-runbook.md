@@ -833,6 +833,48 @@ Regression coverage: `ledger::admission::tests` (`route_blocker_at_is_the_real_d
 5. At `hold_until`: refund each held id through the official tooling — `glc-admin refund-manual-review --config PATH --request-id N --note TEXT` (dry run), then with `--execute --keypair …`; `robinhood-refund` for Robinhood-sourced rows. The refund path re-checks state, payout absence and the refund lifecycle itself (no double refund). The hold marker stays on the refunded row as audit trail.
 6. To un-freeze a row instead: `glc-admin manual-review-hold-release --db PATH --request-id N --note TEXT`, after which it is eligible for auto-resume on the next tick exactly as an unheld park.
 
+## ManualReview holds and the rapid-burst anti-abuse rule (added 2026-09-13, schema v30)
+
+Supersedes the operational half of the v29 section above (the v29 columns stay and keep their meaning; v30 adds the DISPOSITION and the decisions). One model covers two held populations:
+
+| `manual_review_disposition` | placed by | ends by |
+|---|---|---|
+| `normal` | every ordinary fold-time park | exactly as before: auto-resume (where the reason allows), `resume-manual-review`, `manual-review-settle`, the refund commands |
+| `operator_hold` | `glc-admin manual-review-hold` on explicit ids | `manual-review-release`, `manual-review-process`, or `manual-review-refund` — nothing else |
+| `rapid_burst_hold` | a FOLD, when the deposit matched `[rapid_burst]` | `manual-review-process` or `manual-review-refund` — normally not before `review_after`; `release` is refused |
+
+**A held row is held absolutely.** `BridgeRequest::is_held` (a hold marker or a non-`normal` disposition, with no `operator_decision`) is the one predicate consulted by `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` (the row is not a candidate — not attempted, no budget consumed), by every resume entry point (refused with `held …`), and — through `Ledger::refund_hold_blocker_in` — by every refund begin-path (`begin_solana_refund`, `robinhood::refund::begin_refund`, `begin_goldcoin_refund`: refused unless the `refund` decision is recorded). None of that changes with liquidity recovering, a route or reserve reopening, `max_auto_resumes_per_tick`, a daemon restart, or time passing: **`review_after` is a minimum review hold, not an expiry and not a refund timer.** Only an explicit operator decision ends a hold. Regression coverage: `orchestrator::tests::a_rapid_burst_hold_is_never_auto_resumed_whatever_recovers`, `ledger::tests::a_rapid_burst_hold_survives_time_release_attempts_and_reopen`.
+
+**Columns (all on `bridge_requests`, all additive):** `manual_review_disposition`, `hold_reason` (`operator_hold` | `rapid_burst:same_source_destination_pair` | `rapid_burst:same_source_wallet` | `rapid_burst:same_destination_wallet`), `held_by` (`system` for a fold), `hold_started_at`, `review_after`, `operator_decision` (`process` | `refund` | `release`), `operator_decision_at`, `operator_note`; plus the v29 `auto_resume_hold_note`/`_until`, which every hold also sets. The v30 migration reclassifies every existing v29 hold as `operator_hold` (start time from its state-log row, `review_after` from the old marker) and touches nothing else. Every hold and decision writes a `ManualReview -> ManualReview` state-log row (`auto_resume_hold`, `rapid_burst_hold`, `operator_decision_process`, `operator_decision_refund`, `auto_resume_hold_released`) and an admin-audit row, so the Explorer, the audit log and `manual-review-hold-list` all show who held what, when, why, and what was decided.
+
+### The rapid-burst rule
+
+`[rapid_burst]` in the daemon config (defaults shown; `enabled` defaults to `false`, so a config that never mentions the section is unaffected):
+
+```toml
+[rapid_burst]
+enabled = true
+window_secs = 900                 # rolling window
+max_per_source_wallet = 3         # requests the SAME source wallet may have in the window (incl. this one)
+max_per_destination_wallet = 3    # same, keyed on the destination wallet
+max_per_pair = 2                  # same, keyed on the exact source/destination pair
+minimum_review_hold_secs = 259200 # 72 h: review_after = hold_started_at + this
+```
+
+The daemon seeds these into the ledger's `rapid_burst_policy` row at startup (like the liquidity thresholds), so the fold — inside its own write transaction — and `glc-admin rapid-burst-policy-show` read one source; changing them is a config edit and a restart. Evaluated at every fold that custodies a deposit (`fold_sol_deposit`, `fold_sol_deposit_to_robinhood`, `fold_robinhood_deposit`, and the Goldcoin deposit observation), on the identities the bridge itself observed (the on-chain `requester` / the custody contract's `depositor` / the traced funding wallet, and the recorded `recipient`), counting every `bridge_requests` row created inside `(now - window_secs, now]` for that identity whatever its state. Pair first, then source, then destination. **Not a global deposits-per-second rule** — unrelated traffic is never counted against a stranger's burst — and **not a replacement for the rolling-24h wallet uniqueness windows**, which stay in force on every route; a deposit matching both is classified by the burst rule (the non-self-clearing one) rather than parked for 24 hours. A matched deposit is custodied exactly like any other park (finalized source deposit, nothing reserved, nothing paid) with `manual_review_note = rapid_burst_hold` and the hold columns set.
+
+### Operator commands
+
+- `glc-admin manual-review-hold --db PATH --request-ids N[,N...] [--hold-hours H] --note TEXT` — an INDEFINITE operator hold on explicit ids (`--hold-hours` only records `review_after`; omit it for "at my discretion"). Refuses anything not an unpaid `ManualReview` row, and any rapid-burst hold. Future rows are unaffected: folds never read or write the hold columns.
+- `glc-admin manual-review-release --db PATH --request-id N --note TEXT` (alias `glc-admin manual-review-hold-release`) — ends an OPERATOR hold; the row becomes an ordinary park under its original `manual_review_note`. Refused on a rapid-burst hold.
+- `glc-admin manual-review-process --db PATH --request-id N --note TEXT` — the PROCESS decision: recorded and, in the same transaction, re-admitted through the shared resume (`ManualReview -> SourceFinalized`, capacity reserved, the normal payout pipeline takes over). The resume re-checks everything it always has (state, reason, refund lifecycle, existing payout/destination txid, both 24h windows, UTXO floor, safety buffer, reserve invariant); a refusal rolls the decision back. Refused before `review_after` on a rapid-burst hold — there is no override, a payout is never brought forward. A repeat is refused as "not held" and never reserves twice.
+- `glc-admin manual-review-refund --config PATH --request-id N --note TEXT [--emergency] [--keypair K] [--execute]` — the REFUND decision, then the request's own route's existing refund command with the same arguments (`refund-manual-review`, `robinhood-refund`, `refund-glc-manual-review`), every one of whose checks still runs. Without `--execute`: dry run (prints the gate verdict and the underlying dry run). With it: records the decision, then refunds. `--emergency` is the only before-`review_after` exit for a rapid-burst hold; it returns funds, never pays out, and is recorded as `manual_review_refund_decision_emergency` with the note prefixed `EMERGENCY`.
+- `glc-admin manual-review-hold-list --db PATH`, `glc-admin rapid-burst-policy-show --db PATH` — read-only.
+
+The Admin Console's Manual Review page shows the same fields (`GET /manual-review`: `disposition`, `held`, `hold_reason`, `review_after`, `review_available`, `operator_decision`, …), labels a rapid-burst row "Rapid-burst hold — Review available after <time> — Awaiting operator decision" (after `review_after`: "Operator decision required"), and offers exactly two buttons: **Process** (`POST /manual-review/{id}/process`) and **Refund** (renders the `manual-review-refund` command for the operator to run — the console never executes a refund and never chooses either action on its own).
+
+**What does not change.** Rows the burst rule never matched are exactly as before v30 — including the 24h wallet-window parks, `liquidity_buffer_low_at_fold` and the rest of the auto-resume set. Nothing here pauses anything, changes a liquidity threshold, or refunds on its own.
+
 ## Choosing between recovery and refund (added 2026-09-01)
 
 A `SolToGlc` request parked in `ManualReview` has exactly two operator

@@ -5982,9 +5982,10 @@ fn a_buffer_parked_request_stays_refundable() {
     // route an operator closed may stay closed indefinitely, so a
     // deposit parked by it must keep its refund path.
     assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"route_admission_closed_at_fold"));
+    assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"rapid_burst_hold"));
     assert_eq!(
         Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.len(),
-        10,
+        11,
         "every fold-time park reason must be refundable — a new one added without a refund \
          path would strand real, irreversible deposits"
     );
@@ -6218,7 +6219,7 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     // never-written string. A new one added to `fold_sol_deposit` (or
     // anywhere else) must be added here too — at which point this test
     // states, in one place, whether recovery accepts it.
-    const ALL_KNOWN_REASONS: [&str; 13] = [
+    const ALL_KNOWN_REASONS: [&str; 14] = [
         "admission_closed_at_fold",
         "route_admission_closed_at_fold",
         "reserve_paused_at_fold",
@@ -6234,6 +6235,13 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
         "source_wallet_rate_limited",
         "late_deposit_no_capacity",
         "deposit_spent_before_finalized",
+        // The rapid-burst hold (v30): a fold-time park whose ONLY exits
+        // are the explicit `process`/`refund` decisions. On the reason
+        // lists (so those decisions can run the shared resume/refund),
+        // but the row is HELD by its disposition — the trial below
+        // writes the reason alone, without the hold, so it exercises
+        // exactly the post-decision path.
+        "rapid_burst_hold",
         "some_future_reason_nobody_has_written_yet",
     ];
 
@@ -6245,7 +6253,7 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     //    can write for a SolToGlc park, and every one of them is a park
     //    that happened INSTEAD of reserving capacity, on an
     //    already-finalized deposit — so every one of them is recoverable.
-    const FOLD_TIME_PARK_REASONS: [&str; 10] = [
+    const FOLD_TIME_PARK_REASONS: [&str; 11] = [
         "admission_closed_at_fold",
         // The route-scoped twin of the reserve-wide reason above (v25).
         // Same premises: a park that happened INSTEAD of reserving
@@ -6262,6 +6270,8 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
         // must keep both exits.
         "recipient_rate_limited",
         "source_wallet_rate_limited",
+        // v30: recoverable through the `process` decision only.
+        "rapid_burst_hold",
     ];
     for reason in FOLD_TIME_PARK_REASONS {
         assert!(
@@ -7736,7 +7746,13 @@ fn a_hold_blocks_resume_until_released_and_never_reaches_other_rows() {
     assert_eq!(before.auto_resume_hold_note, None);
 
     ledger
-        .set_manual_review_hold(request_id, 1_000 + 72 * 3600, "72h freeze", "cli:op", 1_000)
+        .set_manual_review_hold(
+            request_id,
+            Some(1_000 + 72 * 3600),
+            "72h freeze",
+            "cli:op",
+            1_000,
+        )
         .unwrap();
     let held = ledger.get_request(request_id).unwrap().unwrap();
     assert_eq!(held.state, RequestState::ManualReview);
@@ -7793,10 +7809,10 @@ fn a_hold_blocks_resume_until_released_and_never_reaches_other_rows() {
 
     // Release restores the pre-hold behaviour; a second release is a no-op.
     assert!(ledger
-        .clear_manual_review_hold(request_id, "cli:op", 5_000)
+        .clear_manual_review_hold(request_id, "lifting", "cli:op", 5_000)
         .unwrap());
     assert!(!ledger
-        .clear_manual_review_hold(request_id, "cli:op", 5_001)
+        .clear_manual_review_hold(request_id, "again", "cli:op", 5_001)
         .unwrap());
     assert!(ledger.held_manual_review_requests().unwrap().is_empty());
     assert_eq!(
@@ -7822,7 +7838,7 @@ fn a_hold_is_refused_for_anything_that_is_not_an_unpaid_park() {
         panic!()
     };
     let err = ledger
-        .set_manual_review_hold(request_id, 9_999, "x", "cli:op", 1_000)
+        .set_manual_review_hold(request_id, Some(9_999), "x", "cli:op", 1_000)
         .unwrap_err();
     assert!(
         matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
@@ -7840,7 +7856,7 @@ fn a_hold_is_refused_for_anything_that_is_not_an_unpaid_park() {
 
     // Unknown id.
     assert!(matches!(
-        ledger.set_manual_review_hold(424_242, 9_999, "x", "cli:op", 1_000),
+        ledger.set_manual_review_hold(424_242, Some(9_999), "x", "cli:op", 1_000),
         Err(LedgerError::RequestNotFound(424_242))
     ));
 
@@ -7855,14 +7871,14 @@ fn a_hold_is_refused_for_anything_that_is_not_an_unpaid_park() {
         panic!()
     };
     assert!(ledger
-        .set_manual_review_hold(parked, 9_999, "   ", "cli:op", 2_000)
+        .set_manual_review_hold(parked, Some(9_999), "   ", "cli:op", 2_000)
         .is_err());
     // Re-holding an already-held row is idempotent (note/time replaced).
     ledger
-        .set_manual_review_hold(parked, 9_999, "first", "cli:op", 2_000)
+        .set_manual_review_hold(parked, Some(9_999), "first", "cli:op", 2_000)
         .unwrap();
     ledger
-        .set_manual_review_hold(parked, 10_000, "second", "cli:op", 2_001)
+        .set_manual_review_hold(parked, Some(10_000), "second", "cli:op", 2_001)
         .unwrap();
     let row = ledger.get_request(parked).unwrap().unwrap();
     assert_eq!(row.auto_resume_hold_note.as_deref(), Some("second"));
@@ -7909,7 +7925,7 @@ fn v29_reopen_keeps_rows_unheld_and_the_hold_durable() {
             ids.push(request_id);
         }
         ledger
-            .set_manual_review_hold(ids[0], 9_999, "freeze", "cli:op", 1_000)
+            .set_manual_review_hold(ids[0], Some(9_999), "freeze", "cli:op", 1_000)
             .unwrap();
         (ids[0], ids[1])
     };
@@ -7931,4 +7947,684 @@ fn v29_reopen_keeps_rows_unheld_and_the_hold_durable() {
             .auto_resume_hold_note,
         None
     );
+}
+
+// ------------------------------------- disposition + rapid-burst hold (v30) --
+
+fn burst_policy(enabled: bool) -> RapidBurstPolicy {
+    RapidBurstPolicy {
+        enabled,
+        window_secs: 600,
+        max_per_source_wallet: 2,
+        max_per_destination_wallet: 2,
+        max_per_pair: 1,
+        minimum_review_hold_secs: 72 * 3600,
+    }
+}
+
+/// Folds `n` SolToGlc deposits from `requester` to `recipient`, one per
+/// `step` seconds from `t0`, returning ids in order.
+fn fold_burst(
+    ledger: &mut Ledger,
+    first_index: u64,
+    n: u64,
+    requester: [u8; 32],
+    recipient: &[u8],
+    t0: i64,
+    step: i64,
+) -> Vec<i64> {
+    (0..n)
+        .map(|i| {
+            match ledger
+                .fold_sol_deposit(
+                    first_index + i,
+                    amounts(100_000),
+                    requester,
+                    recipient,
+                    None,
+                    t0 + step * i as i64,
+                )
+                .unwrap()
+            {
+                SolFoldOutcome::FoldedFinalized { request_id }
+                | SolFoldOutcome::FoldedManualReview { request_id } => request_id,
+                other => panic!("unexpected fold outcome {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The pair rule: a second deposit from the same source to the same
+/// destination inside the window is held with every hold column set,
+/// the v29 marker, `review_after = now + 72h`, and a state-log row —
+/// while the first (admitted) request and an unrelated deposit are
+/// untouched.
+#[test]
+fn a_matching_burst_is_held_and_unrelated_traffic_is_unaffected() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&burst_policy(true), 1)
+        .unwrap();
+
+    let ids = fold_burst(&mut ledger, 0, 2, [1u8; 32], &[2u8; 32], 1_000, 30);
+    let first = ledger.get_request(ids[0]).unwrap().unwrap();
+    assert_eq!(first.state, RequestState::SourceFinalized);
+    assert_eq!(
+        first.manual_review_disposition,
+        ManualReviewDisposition::Normal
+    );
+    assert!(!first.is_held());
+
+    let second = ledger.get_request(ids[1]).unwrap().unwrap();
+    assert_eq!(second.state, RequestState::ManualReview);
+    assert_eq!(
+        second.manual_review_note.as_deref(),
+        Some(Ledger::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD)
+    );
+    assert_eq!(
+        second.manual_review_disposition,
+        ManualReviewDisposition::RapidBurstHold
+    );
+    assert!(second.is_held());
+    assert_eq!(
+        second.hold_reason.as_deref(),
+        Some("rapid_burst:same_source_destination_pair")
+    );
+    assert_eq!(second.held_by.as_deref(), Some("system"));
+    assert_eq!(second.hold_started_at, Some(1_030));
+    assert_eq!(second.review_after, Some(1_030 + 72 * 3600));
+    assert!(
+        second.auto_resume_hold_note.is_some(),
+        "the v29 marker is set too"
+    );
+    assert_eq!(second.operator_decision, None);
+    assert!(!second.review_available(1_030 + 72 * 3600 - 1));
+    assert!(second.review_available(1_030 + 72 * 3600));
+    let log = ledger.state_log(ids[1]).unwrap();
+    assert!(
+        log.iter().any(|(_, _, _, reason)| reason.as_deref()
+            == Some(Ledger::RAPID_BURST_HOLD_TRANSITION_REASON)),
+        "{log:?}"
+    );
+    // Nothing was reserved for the held deposit.
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        900_000 - 100_000
+    );
+
+    // Unrelated traffic in the same window: different source AND
+    // different destination — admitted.
+    let other = fold_burst(&mut ledger, 10, 1, [7u8; 32], &[8u8; 32], 1_040, 0);
+    let other = ledger.get_request(other[0]).unwrap().unwrap();
+    assert_eq!(other.state, RequestState::SourceFinalized);
+    assert!(!other.is_held());
+
+    // The listing sees exactly the held row.
+    let held: Vec<i64> = ledger
+        .rapid_burst_held_requests()
+        .unwrap()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(held, vec![ids[1]]);
+}
+
+/// Each scoped rule fires on its own identity — source wallet across
+/// destinations, destination wallet across sources — and only inside the
+/// window; the same traffic outside the window is admitted.
+#[test]
+fn source_and_destination_rules_are_scoped_and_windowed() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&burst_policy(true), 1)
+        .unwrap();
+
+    // Same SOURCE, three different destinations: the third trips
+    // `max_per_source_wallet = 2` (never the pair rule — every pair here
+    // is new). The second lands in ManualReview under the 24h SOURCE
+    // wallet window, and is classified `normal` — that policy is
+    // separate and stays in force.
+    let a = fold_burst(&mut ledger, 0, 1, [1u8; 32], &[0xA1; 32], 1_000, 0);
+    let b = fold_burst(&mut ledger, 1, 1, [1u8; 32], &[0xA2; 32], 1_010, 0);
+    let c = fold_burst(&mut ledger, 2, 1, [1u8; 32], &[0xA3; 32], 1_020, 0);
+    assert_eq!(
+        ledger.get_request(a[0]).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+    let b_row = ledger.get_request(b[0]).unwrap().unwrap();
+    assert_eq!(b_row.state, RequestState::ManualReview);
+    assert_eq!(
+        b_row.manual_review_note.as_deref(),
+        Some(Ledger::MANUAL_REVIEW_REASON_WALLET_SOURCE_24H_LIMIT)
+    );
+    assert_eq!(
+        b_row.manual_review_disposition,
+        ManualReviewDisposition::Normal
+    );
+    assert!(!b_row.is_held());
+    let c_row = ledger.get_request(c[0]).unwrap().unwrap();
+    assert_eq!(
+        c_row.manual_review_disposition,
+        ManualReviewDisposition::RapidBurstHold
+    );
+    assert_eq!(
+        c_row.hold_reason.as_deref(),
+        Some("rapid_burst:same_source_wallet")
+    );
+
+    // Same DESTINATION, three different sources: the third trips
+    // `max_per_destination_wallet = 2`.
+    let _ = fold_burst(&mut ledger, 10, 1, [0xB1; 32], &[9u8; 32], 5_000, 0);
+    let _ = fold_burst(&mut ledger, 11, 1, [0xB2; 32], &[9u8; 32], 5_010, 0);
+    let d = fold_burst(&mut ledger, 12, 1, [0xB3; 32], &[9u8; 32], 5_020, 0);
+    assert_eq!(
+        ledger
+            .get_request(d[0])
+            .unwrap()
+            .unwrap()
+            .hold_reason
+            .as_deref(),
+        Some("rapid_burst:same_destination_wallet")
+    );
+
+    // Outside the window (600 s), the same identities are not a burst:
+    // a repeat pair 601 s later is a wallet-window park, not a hold.
+    let late = fold_burst(&mut ledger, 20, 1, [0xB3; 32], &[9u8; 32], 5_020 + 601, 0);
+    let late = ledger.get_request(late[0]).unwrap().unwrap();
+    assert_eq!(
+        late.manual_review_disposition,
+        ManualReviewDisposition::Normal
+    );
+    assert!(!late.is_held());
+}
+
+/// With the rule disabled (or never seeded) every fold is exactly as
+/// before v30 — the rule is opt-in.
+#[test]
+fn a_disabled_or_unseeded_policy_never_holds() {
+    for seed in [None, Some(burst_policy(false))] {
+        let mut ledger = setup();
+        if let Some(p) = seed {
+            ledger.set_rapid_burst_policy(&p, 1).unwrap();
+        }
+        let ids = fold_burst(&mut ledger, 0, 3, [1u8; 32], &[2u8; 32], 1_000, 10);
+        for id in ids {
+            let r = ledger.get_request(id).unwrap().unwrap();
+            assert_eq!(r.manual_review_disposition, ManualReviewDisposition::Normal);
+            assert!(!r.is_held(), "seed={seed:?}");
+        }
+    }
+    // A policy that cannot be evaluated is refused at seeding.
+    let mut ledger = setup();
+    let mut bad = burst_policy(true);
+    bad.max_per_pair = 0;
+    assert!(matches!(
+        ledger.set_rapid_burst_policy(&bad, 1),
+        Err(LedgerError::InvalidRapidBurstPolicy(_))
+    ));
+}
+
+/// A rapid-burst hold is absolute until an explicit decision: every
+/// resume entry point refuses it before AND after `review_after`,
+/// `release` is refused outright, an operator hold cannot overwrite it,
+/// the automatic reason predicate never selects it, and reopening the
+/// ledger changes nothing.
+#[test]
+fn a_rapid_burst_hold_survives_time_release_attempts_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let held_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for direction in [
+            ReserveDirection::SolanaReserve,
+            ReserveDirection::GoldcoinReserve,
+        ] {
+            ledger
+                .configure_reserve(
+                    direction, 1_000_000, 100_000, 500_000, 200_000, 150_000, 1_000,
+                )
+                .unwrap();
+        }
+        ledger
+            .set_rapid_burst_policy(&burst_policy(true), 1)
+            .unwrap();
+        fold_burst(&mut ledger, 0, 2, [1u8; 32], &[2u8; 32], 1_000, 30)[1]
+    };
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    let row = ledger.get_request(held_id).unwrap().unwrap();
+    assert!(row.is_held(), "the hold is durable across reopen");
+    let review_after = row.review_after.unwrap();
+
+    for now in [2_000, review_after, review_after + 365 * 86_400] {
+        let err = ledger
+            .resume_manual_review_sol_to_glc(held_id, "try", "operator", now)
+            .unwrap_err();
+        assert!(err.to_string().contains("rapid-burst hold"), "{err}");
+        assert!(matches!(
+            ledger.clear_manual_review_hold(held_id, "lift", "cli:op", now),
+            Err(LedgerError::ManualReviewNotRecoverable { .. })
+        ));
+        assert!(matches!(
+            ledger.set_manual_review_hold(held_id, None, "re-hold", "cli:op", now),
+            Err(LedgerError::ManualReviewNotRecoverable { .. })
+        ));
+        let again = ledger.get_request(held_id).unwrap().unwrap();
+        assert_eq!(again.state, RequestState::ManualReview);
+        assert!(again.is_held());
+        assert_eq!(again.operator_decision, None);
+    }
+    assert!(!Ledger::is_auto_resumable_manual_review_reason(
+        Some(Ledger::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD),
+        true
+    ));
+    // Neither the refund whitelist nor the hold gate lets a refund begin
+    // without the decision.
+    let checks = ledger.solana_refund_db_checks(held_id).unwrap();
+    assert!(checks.reason_whitelisted);
+    assert!(checks.hold_blocker.is_some());
+    let verified = verified_for(&ledger, held_id);
+    let err = ledger
+        .begin_solana_refund(held_id, &verified, "n", "a", review_after + 1)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundNotEligible { .. }),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("record the operator decision"),
+        "{err}"
+    );
+}
+
+/// The PROCESS decision: refused before `review_after` (no override),
+/// accepted after it, atomic with the shared resume, and never a second
+/// payout — a repeat is the idempotent no-op.
+#[test]
+fn process_decision_is_refused_early_then_resumes_atomically() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&burst_policy(true), 1)
+        .unwrap();
+    let held_id = fold_burst(&mut ledger, 0, 2, [1u8; 32], &[2u8; 32], 1_000, 30)[1];
+    let review_after = ledger
+        .get_request(held_id)
+        .unwrap()
+        .unwrap()
+        .review_after
+        .unwrap();
+
+    // Too early.
+    let err = ledger
+        .process_held_manual_review(held_id, "go", "cli:op", review_after - 1)
+        .unwrap_err();
+    assert!(err.to_string().contains("minimum review hold"), "{err}");
+    let row = ledger.get_request(held_id).unwrap().unwrap();
+    assert!(row.is_held());
+    assert_eq!(row.operator_decision, None);
+
+    // In time — but the resume itself refuses (the confirmed-liquidity
+    // safety buffer, re-checked by every resume, is set so that this
+    // request's net would breach it), so the decision must roll back
+    // with the refused resume.
+    ledger
+        .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, 850_000, 900_000)
+        .unwrap();
+    let err = ledger
+        .process_held_manual_review(held_id, "go", "cli:op", review_after)
+        .unwrap_err();
+    assert!(
+        !matches!(err, LedgerError::ManualReviewNotRecoverable { .. })
+            || !err.to_string().contains("held"),
+        "{err}"
+    );
+    let row = ledger.get_request(held_id).unwrap().unwrap();
+    assert!(row.is_held(), "a refused resume leaves the hold intact");
+    assert_eq!(row.operator_decision, None);
+    assert!(row.auto_resume_hold_note.is_some());
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        900_000 - 100_000,
+        "nothing was reserved by the refused attempt"
+    );
+
+    // Once the resume can succeed, the decision and the re-admission
+    // land together.
+    ledger
+        .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, 0, 0)
+        .unwrap();
+    let later = review_after + 86_400 * 2;
+    assert_eq!(
+        ledger
+            .process_held_manual_review(held_id, "go", "cli:op", later)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+    let row = ledger.get_request(held_id).unwrap().unwrap();
+    assert_eq!(row.state, RequestState::SourceFinalized);
+    assert_eq!(row.operator_decision, Some(OperatorDecision::Process));
+    assert_eq!(row.operator_decision_at, Some(later));
+    assert_eq!(row.operator_note.as_deref(), Some("go"));
+    assert_eq!(row.auto_resume_hold_note, None);
+    assert!(!row.is_held());
+    assert_eq!(
+        row.manual_review_disposition,
+        ManualReviewDisposition::RapidBurstHold,
+        "the classification stays as audit"
+    );
+    let log = ledger.state_log(held_id).unwrap();
+    assert!(log
+        .iter()
+        .any(|(_, _, _, r)| r.as_deref()
+            == Some(Ledger::OPERATOR_DECISION_PROCESS_TRANSITION_REASON)));
+    // Capacity was reserved exactly once (request 0 and this).
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        900_000 - 200_000
+    );
+    // A repeat is refused as "not held" — never a second reservation.
+    assert!(ledger
+        .process_held_manual_review(held_id, "again", "cli:op", later + 1)
+        .is_err());
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        900_000 - 200_000
+    );
+}
+
+/// The REFUND decision: refused before `review_after` unless emergency,
+/// recorded (with the emergency spelled out) and required by the refund
+/// begin-path; once a refund lifecycle exists, no other decision can be
+/// recorded and the resume path refuses — no double-refund, no refund
+/// then payout.
+#[test]
+fn refund_decision_gates_the_refund_and_excludes_a_later_process() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&burst_policy(true), 1)
+        .unwrap();
+    let held_id = fold_burst(&mut ledger, 0, 2, [1u8; 32], &[2u8; 32], 1_000, 30)[1];
+    let review_after = ledger
+        .get_request(held_id)
+        .unwrap()
+        .unwrap()
+        .review_after
+        .unwrap();
+
+    // Early, not emergency: refused. Early, emergency for PROCESS: refused.
+    assert!(ledger
+        .record_operator_decision(
+            held_id,
+            OperatorDecision::Refund,
+            "r",
+            "cli:op",
+            false,
+            2_000
+        )
+        .is_err());
+    assert!(ledger
+        .record_operator_decision(
+            held_id,
+            OperatorDecision::Process,
+            "p",
+            "cli:op",
+            true,
+            2_000
+        )
+        .is_err());
+    // `release` is never a recorded decision.
+    assert!(ledger
+        .record_operator_decision(
+            held_id,
+            OperatorDecision::Release,
+            "x",
+            "cli:op",
+            false,
+            2_000
+        )
+        .is_err());
+
+    // Early, emergency refund: recorded and marked.
+    ledger
+        .record_operator_decision(
+            held_id,
+            OperatorDecision::Refund,
+            "drain",
+            "cli:op",
+            true,
+            2_000,
+        )
+        .unwrap();
+    let row = ledger.get_request(held_id).unwrap().unwrap();
+    assert_eq!(row.operator_decision, Some(OperatorDecision::Refund));
+    assert!(row
+        .operator_note
+        .as_deref()
+        .unwrap()
+        .starts_with("EMERGENCY"));
+    assert!(
+        row.auto_resume_hold_note.is_some(),
+        "a refund keeps the marker"
+    );
+    assert!(!row.is_held(), "decided");
+    assert!(
+        row.excluded_from_auto_resume(),
+        "decided for refund, but still never an auto-resume candidate"
+    );
+
+    // The refund path now proceeds; a second decision is refused (not
+    // held any more), and the resume path refuses (refund lifecycle).
+    assert!(ledger
+        .solana_refund_db_checks(held_id)
+        .unwrap()
+        .hold_blocker
+        .is_none());
+    let verified = verified_for(&ledger, held_id);
+    ledger
+        .begin_solana_refund(held_id, &verified, "n", "a", 2_100)
+        .unwrap();
+    assert!(ledger
+        .record_operator_decision(
+            held_id,
+            OperatorDecision::Process,
+            "p",
+            "cli:op",
+            false,
+            review_after + 1
+        )
+        .is_err());
+    assert!(ledger
+        .process_held_manual_review(held_id, "p", "cli:op", review_after + 1)
+        .is_err());
+    assert!(
+        ledger
+            .begin_solana_refund(held_id, &verified, "n", "a", 2_200)
+            .is_err(),
+        "no second refund lifecycle"
+    );
+}
+
+/// An OPERATOR hold: indefinite (no `review_after` needed), refunds only
+/// on the recorded decision, `process` works immediately (there is no
+/// minimum review hold on an operator hold), and `release` records the
+/// decision and restores an ordinary park.
+#[test]
+fn operator_hold_is_indefinite_and_ends_only_by_explicit_decision() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .set_manual_review_hold(request_id, None, "indefinite", "cli:op", 1_500)
+        .unwrap();
+    let row = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        row.manual_review_disposition,
+        ManualReviewDisposition::OperatorHold
+    );
+    assert_eq!(
+        row.hold_reason.as_deref(),
+        Some(Ledger::OPERATOR_HOLD_REASON)
+    );
+    assert_eq!(row.held_by.as_deref(), Some("cli:op"));
+    assert_eq!(row.hold_started_at, Some(1_500));
+    assert_eq!(row.review_after, None);
+    assert!(row.review_available(1_500));
+    assert!(row.is_held());
+
+    // Refund needs the decision.
+    let checks = ledger.solana_refund_db_checks(request_id).unwrap();
+    assert!(checks.hold_blocker.is_some());
+
+    // Re-holding keeps the original start time; the note is replaced.
+    ledger
+        .set_manual_review_hold(request_id, Some(9_000), "renewed", "cli:op", 1_600)
+        .unwrap();
+    let row = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(row.hold_started_at, Some(1_500));
+    assert_eq!(row.review_after, Some(9_000));
+    assert_eq!(row.auto_resume_hold_note.as_deref(), Some("renewed"));
+
+    // Release: decision recorded, disposition back to normal, and the
+    // ordinary resume works again (the reserve is still paused, which
+    // resume deliberately ignores).
+    assert!(ledger
+        .clear_manual_review_hold(request_id, "false alarm", "cli:op", 1_700)
+        .unwrap());
+    let row = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        row.manual_review_disposition,
+        ManualReviewDisposition::Normal
+    );
+    assert_eq!(row.operator_decision, Some(OperatorDecision::Release));
+    assert_eq!(row.operator_note.as_deref(), Some("false alarm"));
+    assert!(!row.is_held());
+    assert_eq!(
+        ledger
+            .resume_manual_review_sol_to_glc(request_id, "ok", "operator", 1_800)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+
+    // A fresh operator hold on another park, then PROCESS straight away.
+    let SolFoldOutcome::FoldedManualReview { request_id: second } = ledger
+        .fold_sol_deposit(1, amounts(100_000), [3u8; 32], &[4u8; 32], None, 2_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .set_manual_review_hold(second, None, "freeze", "cli:op", 2_100)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .process_held_manual_review(second, "settle it", "cli:op", 2_200)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+    let row = ledger.get_request(second).unwrap().unwrap();
+    assert_eq!(row.operator_decision, Some(OperatorDecision::Process));
+    assert_eq!(row.state, RequestState::SourceFinalized);
+}
+
+/// v30 reclassifies every pre-existing v29 hold as an operator hold
+/// (with its start time recovered from the state log and `review_after`
+/// from the old marker), leaves every other row `normal`, and is
+/// idempotent.
+#[test]
+fn v30_backfills_v29_holds_as_operator_holds_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (held, unheld) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..2u64 {
+            let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+                .fold_sol_deposit(
+                    i,
+                    amounts(100_000),
+                    [i as u8 + 1; 32],
+                    &[i as u8 + 10; 32],
+                    None,
+                    1_000,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            ids.push(request_id);
+        }
+        // Simulate a v29-era hold: marker columns only, disposition
+        // still at the default, hold_started_at unset.
+        ledger
+            .conn_for_tests()
+            .execute(
+                "UPDATE bridge_requests SET auto_resume_hold_note = 'v29 freeze',
+                    auto_resume_hold_until = 260000 WHERE id = ?1",
+                [ids[0]],
+            )
+            .unwrap();
+        ledger
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO bridge_request_state_log (request_id, from_state, to_state, at, reason, actor)
+                 VALUES (?1, 'ManualReview', 'ManualReview', 1500, 'auto_resume_hold', 'cli:ops')",
+                [ids[0]],
+            )
+            .unwrap();
+        // Rewind the version stamp so the next open runs the v30 step.
+        ledger
+            .conn_for_tests()
+            .execute_batch("UPDATE schema_version SET version = 29")
+            .unwrap();
+        (ids[0], ids[1])
+    };
+    for _ in 0..2 {
+        let ledger = Ledger::open(&db_path).unwrap();
+        let row = ledger.get_request(held).unwrap().unwrap();
+        assert_eq!(
+            row.manual_review_disposition,
+            ManualReviewDisposition::OperatorHold
+        );
+        assert_eq!(row.hold_reason.as_deref(), Some("operator_hold"));
+        assert_eq!(row.held_by.as_deref(), Some("cli:ops"));
+        assert_eq!(row.hold_started_at, Some(1_500));
+        assert_eq!(row.review_after, Some(260_000));
+        assert!(row.is_held());
+        let other = ledger.get_request(unheld).unwrap().unwrap();
+        assert_eq!(
+            other.manual_review_disposition,
+            ManualReviewDisposition::Normal
+        );
+        assert_eq!(other.hold_started_at, None);
+        assert!(!other.is_held());
+        assert!(ledger.rapid_burst_policy().unwrap().is_none());
+    }
 }

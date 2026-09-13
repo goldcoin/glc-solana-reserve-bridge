@@ -776,6 +776,17 @@ impl<R: GoldcoinRpc> Indexer<R> {
                      24-hour window — recorded and routed to ManualReview, no payout"
                 );
             }
+            GlcObservationOutcome::RapidBurstHeld { rule, review_after } => {
+                tracing::warn!(
+                    request_id,
+                    txid_hex,
+                    vout,
+                    rule = rule.as_str(),
+                    review_after,
+                    "deposit matched the rapid-burst rule — recorded and HELD in ManualReview \
+                     for an explicit operator decision, no payout"
+                );
+            }
             GlcObservationOutcome::NoMatchingRequest => {
                 tracing::warn!(
                     request_id,

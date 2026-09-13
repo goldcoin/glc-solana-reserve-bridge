@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glc_reserve_bridge_service::admin_api::{
-    audited_manual_review_hold, audited_manual_review_hold_release, audited_resume_manual_review,
-    audited_set_admission, audited_set_local_pause, audited_set_robinhood_local_pause,
-    audited_set_route_admission, audited_set_route_enabled,
+    audited_manual_review_hold, audited_manual_review_hold_release, audited_manual_review_process,
+    audited_manual_review_refund_decision, audited_resume_manual_review, audited_set_admission,
+    audited_set_local_pause, audited_set_robinhood_local_pause, audited_set_route_admission,
+    audited_set_route_enabled,
 };
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
@@ -302,27 +303,71 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       proof — identical to running manual-review-settle on each candidate.
       --db: no RPC, so the ledger half of the verdict only; the chain half
       is not evaluated and each row says so.
-  glc-admin manual-review-hold --db PATH --request-ids N[,N...] --hold-hours H --note TEXT
-      Places an operator AUTO-RESUME HOLD (schema v29) on each listed
-      request, one audited mutation per id. While held, the daemon's
-      automatic ManualReview recovery pass skips the request entirely and
-      `resume-manual-review` / `manual-review-settle` refuse it; refund
-      commands are unaffected (a hold keeps a request FOR refunding).
-      Per id, refuses unless the request is currently ManualReview with no
-      destination txid and no destination payout row — a request already
-      processing can never be held. Ids are explicit and nothing else is
-      touched: a request folded after this command is exactly as it always
-      was (folds never read or write the hold). `--hold-hours` records the
-      moment the operator intends to act (`auto_resume_hold_until = now +
-      H*3600`); it has no effect on the daemon and the hold does NOT
-      expire on its own — release or refund is always an explicit act.
-      Prints one verdict line per id; exits 1 if any id was refused
-      (the others stay held).
-  glc-admin manual-review-hold-release --db PATH --request-id N --note TEXT
-      Clears one hold. No-op on an unheld request. Never changes state.
+  glc-admin manual-review-hold --db PATH --request-ids N[,N...] [--hold-hours H] --note TEXT
+      Places an explicit, INDEFINITE operator hold (schema v29/v30,
+      disposition operator_hold) on each listed request, one audited
+      mutation per id. While held, the daemon's automatic ManualReview
+      recovery pass skips the request entirely — regardless of liquidity
+      recovery, route reopening, restarts or time — and every resume entry
+      point refuses it; a refund requires the `refund` decision to be
+      recorded first (manual-review-refund). Per id, refuses unless the
+      request is currently ManualReview with no destination txid and no
+      destination payout row — a request already processing can never be
+      held — and is not a rapid-burst hold. Ids are explicit and nothing
+      else is touched: a request folded after this command is exactly as it
+      always was (folds never read or write the hold). `--hold-hours`, if
+      given, records `review_after = now + H*3600` — the moment the
+      operator intends to revisit the row. It is informational: the hold
+      NEVER expires on its own. Prints one verdict line per id; exits 1 if
+      any id was refused (the others stay held).
+  glc-admin manual-review-release --db PATH --request-id N --note TEXT
+      (alias: manual-review-hold-release) Releases one OPERATOR hold: the
+      request becomes an ordinary park again under its original
+      manual_review_note (auto-resumable if that reason is). The `release`
+      decision, time and note stay on the row as audit. No-op on an unheld
+      request. Never changes state. REFUSES a rapid-burst hold — those end
+      only with manual-review-process or manual-review-refund.
+  glc-admin manual-review-process --db PATH --request-id N --note TEXT
+      The explicit PROCESS decision on a HELD request (operator hold or
+      rapid-burst hold): records the decision and, in the SAME transaction,
+      re-admits the request through the SAME shared resume every other
+      recovery uses (ManualReview -> SourceFinalized, capacity reserved —
+      the normal payout pipeline takes it from there; there is no second
+      payout implementation). That resume independently re-checks state,
+      the fold-time reason, the refund lifecycle, existing payout rows /
+      destination txid, both rolling-24h windows, the mature-UTXO floor,
+      the safety buffer and the reserve invariant; if it refuses, the
+      decision is rolled back with it and the request stays held. On a
+      rapid-burst hold this is REFUSED before review_after (there is no
+      override — a payout is never brought forward). Route read from the
+      request; covers all four inbound/cross routes.
+  glc-admin manual-review-refund --config PATH --request-id N --note TEXT \
+      [--emergency] [--keypair ADMIN_KEYPAIR] [--execute]
+      The explicit REFUND decision on a HELD request, then the refund
+      itself through the EXISTING, unchanged tooling for the request's own
+      route (refund-manual-review for SolToGlc/SolToRhn, robinhood-refund
+      for RhnToGlc/RhnToSol, refund-glc-manual-review for GlcToSol) — every
+      one of whose checks (state, whitelist, no payout, no destination
+      txid, no existing refund, reserve invariant, on-chain proof) still
+      runs. Those refund paths REQUIRE the recorded decision for a held
+      row, so a held request can never be refunded by a script or by a
+      command that did not state the decision. Without --execute: dry run
+      — prints the decision-gate verdict and the underlying refund dry run
+      (which reports the gate as not yet satisfied), writes nothing. With
+      --execute: records the decision (audited) and immediately runs the
+      underlying refund with --execute (same --keypair rules as that
+      command). On a rapid-burst hold the decision is normally refused
+      before review_after; `--emergency` is the one early exit (it returns
+      funds, never pays out) and is recorded as such in the audit trail.
   glc-admin manual-review-hold-list --db PATH
-      Read-only: every request carrying a hold, with state, route, gross,
-      hold_until (and whether it has passed), note.
+      Read-only: every held request (and every request that ever carried a
+      hold), with state, route, gross, disposition, hold reason, held_by,
+      hold_started_at, review_after (and whether it has passed), decision.
+  glc-admin rapid-burst-policy-show --db PATH
+      Read-only: the rapid-burst policy the daemon seeded from
+      [rapid_burst] at its last start (enabled, window, per-identity
+      maxima, minimum review hold), and every request currently under a
+      rapid-burst hold.
 
 ROBINHOOD NETWORK (the four routes the custody contract models: GlcToRhn,
 RhnToGlc and, since Phase H, SolToRhn and RhnToSol. All four ship DISABLED
@@ -871,8 +916,12 @@ fn main() {
         "manual-review-settle" => cmd_manual_review_settle(&args),
         "manual-review-settle-list" => cmd_manual_review_settle_list(&args),
         "manual-review-hold" => cmd_manual_review_hold(&args),
+        "manual-review-release" => cmd_manual_review_hold_release(&args),
         "manual-review-hold-release" => cmd_manual_review_hold_release(&args),
+        "manual-review-process" => cmd_manual_review_process(&args),
+        "manual-review-refund" => cmd_manual_review_refund(&args),
         "manual-review-hold-list" => cmd_manual_review_hold_list(&args),
+        "rapid-burst-policy-show" => cmd_rapid_burst_policy_show(&args),
         "refund-glc-manual-review" => cmd_refund_glc_manual_review(&args),
         "glc-refund-list" => cmd_glc_refund_list(&args),
         "reconcile-unmatched-deposit" => cmd_reconcile_unmatched_deposit(&args),
@@ -1404,12 +1453,18 @@ fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
 fn cmd_manual_review_hold(args: &[String]) -> Result<(), String> {
     let db = require(args, "--db");
     let ids_raw = require(args, "--request-ids");
-    let hold_hours: i64 = require(args, "--hold-hours")
-        .parse()
-        .map_err(|e| format!("--hold-hours must be an integer: {e}"))?;
-    if !(1..=24 * 365).contains(&hold_hours) {
-        return Err("--hold-hours must be within 1..=8760".to_string());
-    }
+    let hold_hours: Option<i64> = match flag(args, "--hold-hours") {
+        Some(raw) => {
+            let h: i64 = raw
+                .parse()
+                .map_err(|e| format!("--hold-hours must be an integer: {e}"))?;
+            if !(1..=24 * 365).contains(&h) {
+                return Err("--hold-hours must be within 1..=8760".to_string());
+            }
+            Some(h)
+        }
+        None => None,
+    };
     let note = require_note(args)?;
     let mut ids = Vec::new();
     for part in ids_raw.split(',') {
@@ -1428,17 +1483,21 @@ fn cmd_manual_review_hold(args: &[String]) -> Result<(), String> {
         return Err("--request-ids must name at least one request".to_string());
     }
     let now = now_unix();
-    let hold_until = now + hold_hours * 3600;
+    let review_after = hold_hours.map(|h| now + h * 3600);
+    let review_after_label = match (review_after, hold_hours) {
+        (Some(t), Some(h)) => format!("review_after={t} ({h}h from now; informational)"),
+        _ => "review_after=none (indefinite, at operator discretion)".to_string(),
+    };
     let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
     let actor = cli_actor();
     let mut held = 0usize;
     let mut refused = Vec::new();
     for id in &ids {
-        match audited_manual_review_hold(&mut ledger, *id, hold_until, note, &actor) {
+        match audited_manual_review_hold(&mut ledger, *id, review_after, note, &actor) {
             Ok(_) => {
                 held += 1;
-                println!("request {id}: HELD (auto_resume_hold_until={hold_until})");
+                println!("request {id}: HELD (disposition=operator_hold, {review_after_label})");
             }
             Err(e) => {
                 refused.push(*id);
@@ -1447,7 +1506,8 @@ fn cmd_manual_review_hold(args: &[String]) -> Result<(), String> {
         }
     }
     println!(
-        "\n{held} held, {} refused; hold_until={hold_until} ({hold_hours}h from now); note: {note}",
+        "\n{held} held, {} refused; {review_after_label}; the hold does not expire — release, \
+         process or refund only by explicit operator action; note: {note}",
         refused.len()
     );
     if refused.is_empty() {
@@ -1491,21 +1551,203 @@ fn cmd_manual_review_hold_list(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let now = now_unix();
     println!(
-        "HELD REQUESTS (schema v29 auto_resume_hold) — {} row(s), now={now}",
+        "HELD REQUESTS (schema v30 manual_review_disposition / v29 auto_resume_hold) — {} row(s), \
+         now={now}",
         rows.len()
     );
     for r in &rows {
-        let until = r.auto_resume_hold_until.unwrap_or(0);
+        println!("{}", render_hold_row(r, now));
+    }
+    Ok(())
+}
+
+/// One line per held row, shared by `manual-review-hold-list` and
+/// `rapid-burst-policy-show`.
+fn render_hold_row(r: &glc_reserve_bridge_service::ledger::BridgeRequest, now: i64) -> String {
+    let review = match r.review_after {
+        Some(t) if t <= now => format!("{t} (ELAPSED — operator decision required)"),
+        Some(t) => format!("{t} (review available after)"),
+        None => "none".to_string(),
+    };
+    format!(
+        "  id={} route={} state={} gross={} disposition={} held={} reason={} held_by={} \
+         hold_started_at={} review_after={} decision={} decided_at={} note={}",
+        r.id,
+        r.direction.as_str(),
+        r.state.as_str(),
+        r.gross_amount_atomic,
+        r.manual_review_disposition.as_str(),
+        r.is_held(),
+        r.hold_reason.as_deref().unwrap_or("-"),
+        r.held_by.as_deref().unwrap_or("-"),
+        r.hold_started_at
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        review,
+        r.operator_decision
+            .map(|d| d.as_str())
+            .unwrap_or("none (awaiting operator decision)"),
+        r.operator_decision_at
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        r.auto_resume_hold_note.as_deref().unwrap_or("")
+    )
+}
+
+/// `manual-review-process` — the explicit PROCESS decision on a held
+/// request. Everything that matters happens inside
+/// `Ledger::process_held_manual_review` (one atomic unit: decision +
+/// the shared resume); this function only parses arguments and prints.
+fn cmd_manual_review_process(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let (outcome, receipt) =
+        audited_manual_review_process(&mut ledger, request_id, note, &cli_actor())
+            .map_err(|e| e.to_string())?;
+    match outcome {
+        glc_reserve_bridge_service::ledger::ResumeManualReviewOutcome::Resumed => println!(
+            "request {request_id}: PROCESS decision recorded and request re-admitted \
+             (ManualReview -> SourceFinalized); audit row {}",
+            receipt.audit_id
+        ),
+        glc_reserve_bridge_service::ledger::ResumeManualReviewOutcome::AlreadyResumed { state } => {
+            println!(
+                "request {request_id}: already resumed (state {}) — no mutation performed",
+                state.as_str()
+            )
+        }
+    }
+    Ok(())
+}
+
+/// `manual-review-refund` — the explicit REFUND decision on a held
+/// request, then the request's own route's EXISTING refund command with
+/// the very same arguments. Decision first, refund second, both audited;
+/// the refund path's begin re-checks that the decision is recorded.
+fn cmd_manual_review_refund(args: &[String]) -> Result<(), String> {
+    let config_path = require(args, "--config");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let emergency = args.iter().any(|a| a == "--emergency");
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let request = ledger
+        .get_request(request_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("request {request_id} not found"))?;
+    let now = now_unix();
+    println!(
+        "request {request_id}: route={} state={} disposition={} held={} review_after={} ({})",
+        request.direction.as_str(),
+        request.state.as_str(),
+        request.manual_review_disposition.as_str(),
+        request.is_held(),
+        request
+            .review_after
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        if request.review_available(now) {
+            "operator decision available"
+        } else {
+            "minimum review hold NOT elapsed"
+        }
+    );
+    if !request.is_held() {
+        return Err(format!(
+            "request {request_id} is not held — use the route's own refund command directly \
+             (refund-manual-review / robinhood-refund / refund-glc-manual-review)"
+        ));
+    }
+    if execute {
+        if request.operator_decision
+            == Some(glc_reserve_bridge_service::ledger::OperatorDecision::Refund)
+        {
+            println!("request {request_id}: refund decision already recorded — proceeding");
+        } else {
+            let receipt = audited_manual_review_refund_decision(
+                &mut ledger,
+                request_id,
+                note,
+                &cli_actor(),
+                emergency,
+            )
+            .map_err(|e| e.to_string())?;
+            println!(
+                "request {request_id}: REFUND decision recorded{} (audit row {})",
+                if emergency {
+                    " — EMERGENCY, before review_after"
+                } else {
+                    ""
+                },
+                receipt.audit_id
+            );
+        }
+    } else {
+        let gate = if request.operator_decision
+            == Some(glc_reserve_bridge_service::ledger::OperatorDecision::Refund)
+        {
+            "already recorded".to_string()
+        } else if request.manual_review_disposition
+            == glc_reserve_bridge_service::ledger::ManualReviewDisposition::RapidBurstHold
+            && !request.review_available(now)
+            && !emergency
+        {
+            "WOULD REFUSE — minimum review hold not elapsed (pass --emergency to record an \
+             emergency refund decision)"
+                .to_string()
+        } else {
+            format!(
+                "would record{} on --execute",
+                if emergency { " (EMERGENCY)" } else { "" }
+            )
+        };
         println!(
-            "  id={} route={} state={} gross={} hold_until={} ({}) note={}",
-            r.id,
-            r.direction.as_str(),
-            r.state.as_str(),
-            r.gross_amount_atomic,
-            until,
-            if until <= now { "ELAPSED" } else { "active" },
-            r.auto_resume_hold_note.as_deref().unwrap_or("")
+            "DRY RUN — decision gate: {gate}. The underlying refund dry run follows; its \
+             'held … decision' check reads the CURRENT row, so it passes only once the decision \
+             is recorded."
         );
+    }
+    drop(ledger);
+    use glc_reserve_bridge_service::ledger::Direction;
+    match request.direction {
+        Direction::SolToGlc | Direction::SolToRhn => cmd_refund_manual_review(args),
+        Direction::RhnToGlc | Direction::RhnToSol => cmd_robinhood_refund(args),
+        Direction::GlcToSol | Direction::GlcToRhn => cmd_refund_glc_manual_review(args),
+    }
+}
+
+fn cmd_rapid_burst_policy_show(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    match ledger.rapid_burst_policy().map_err(|e| e.to_string())? {
+        None => println!("RAPID-BURST POLICY: never seeded (the daemon has not started with a v30 binary) — rule OFF"),
+        Some(p) => println!(
+            "RAPID-BURST POLICY: enabled={} window_secs={} max_per_source_wallet={} \
+             max_per_destination_wallet={} max_per_pair={} minimum_review_hold_secs={} ({}h)",
+            p.enabled,
+            p.window_secs,
+            p.max_per_source_wallet,
+            p.max_per_destination_wallet,
+            p.max_per_pair,
+            p.minimum_review_hold_secs,
+            p.minimum_review_hold_secs / 3600
+        ),
+    }
+    let rows = ledger
+        .rapid_burst_held_requests()
+        .map_err(|e| e.to_string())?;
+    let now = now_unix();
+    println!(
+        "RAPID-BURST HELD REQUESTS — {} row(s), now={now}",
+        rows.len()
+    );
+    for r in &rows {
+        println!("{}", render_hold_row(r, now));
     }
     Ok(())
 }

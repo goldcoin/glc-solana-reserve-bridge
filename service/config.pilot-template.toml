@@ -167,6 +167,23 @@ utxo_shaping_max_outputs_per_split = 25
 # initial_checkpoint_hash = "<REPLACE_WITH_LIVE_getblockhash_OUTPUT>"
 # initial_checkpoint_operator_acknowledged_no_prior_deposits = false
 
+# Rapid-burst anti-abuse hold (docs/09-runbook.md, "ManualReview holds and
+# the rapid-burst anti-abuse rule", schema v30). OFF unless enabled here:
+# a config that omits this section applies no rule. When a deposit takes
+# an identity past a maximum inside the rolling window it is custodied
+# and HELD in ManualReview for an explicit operator decision (process or
+# refund), normally not before minimum_review_hold_secs — a MINIMUM
+# review hold, never an expiry and never a refund timer. Scoped to the
+# bridge's own observed identities; not a global rate. The rolling-24h
+# wallet uniqueness windows remain in force separately.
+# [rapid_burst]
+# enabled = true
+# window_secs = 900
+# max_per_source_wallet = 3
+# max_per_destination_wallet = 3
+# max_per_pair = 2
+# minimum_review_hold_secs = 259200
+
 [reserve]
 # No tolerance for unexplained drift at pilot scale — see
 # docs/09-runbook.md.

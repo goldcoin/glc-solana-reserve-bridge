@@ -785,6 +785,109 @@ async fn resume_manual_review_succeeds_through_the_real_ledger_path() {
     assert_eq!(rows[0].old_value.as_deref(), Some("ManualReview"));
 }
 
+/// `POST /manual-review/{id}/process` on a HELD request: the ManualReview
+/// listing shows the hold fields; the ordinary resume route is refused
+/// (409) while held; `process` records the decision and re-admits through
+/// the real ledger path, audited as `manual_review_process`.
+#[tokio::test]
+async fn process_manual_review_decides_a_held_request_through_the_real_ledger_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let now = now_unix();
+    let request_id = park_request(&db_path, 1, 10, now - 100);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_manual_review_hold(request_id, None, "snapshot freeze", "cli:ops", now - 50)
+            .unwrap();
+    }
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    // The listing carries the hold.
+    let listing: serde_json::Value = client()
+        .get(format!("{base}/manual-review"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let item = listing["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["request_id"] == request_id)
+        .unwrap()
+        .clone();
+    assert_eq!(item["disposition"], "operator_hold");
+    assert_eq!(item["held"], true);
+    assert_eq!(item["hold_reason"], "operator_hold");
+    assert_eq!(item["hold_note"], "snapshot freeze");
+    assert_eq!(item["held_by"], "cli:ops");
+    assert_eq!(item["hold_started_at"], now - 50);
+    assert!(item["review_after"].is_null());
+    assert_eq!(item["review_available"], true);
+    assert!(item["operator_decision"].is_null());
+
+    // The plain resume route is refused while held.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"note":"trying"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // The process decision goes through.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/process"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"note":"reviewed: legitimate"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::SourceFinalized);
+    assert_eq!(
+        req.operator_decision,
+        Some(crate::ledger::OperatorDecision::Process)
+    );
+    assert_eq!(req.operator_note.as_deref(), Some("reviewed: legitimate"));
+    assert!(!req.is_held());
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows[0].action, "manual_review_process");
+    assert_eq!(rows[0].outcome, AdminAuditOutcome::Success);
+    assert!(rows[0]
+        .old_value
+        .as_deref()
+        .unwrap()
+        .contains("disposition=operator_hold"));
+    assert_eq!(
+        rows[0].new_value.as_deref(),
+        Some("decision=process state=SourceFinalized")
+    );
+    // A second process is refused (not held) and audited as a failure.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/process"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"note":"again"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+}
+
 #[tokio::test]
 async fn resume_refuses_a_rate_limited_recipient_exactly_like_the_ledger() {
     let dir = tempfile::tempdir().unwrap();

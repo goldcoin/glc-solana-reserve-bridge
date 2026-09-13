@@ -741,6 +741,11 @@ pub fn assemble_refund_dry_run(
         db_checks.never_advanced_past_manual_review,
         String::new(),
     );
+    push(
+        "not held, or held with the `refund` operator decision recorded",
+        db_checks.hold_blocker.is_none(),
+        db_checks.hold_blocker.clone().unwrap_or_default(),
+    );
     match &plan {
         Ok(p) => {
             push(

@@ -226,6 +226,63 @@ struct RawConfig {
     /// unknown or non-executable name is a config error naming itself.
     #[serde(default)]
     fees: Option<std::collections::BTreeMap<String, u64>>,
+    /// OPTIONAL `[rapid_burst]` — the deterministic anti-abuse rule
+    /// (`ledger::rapid_burst`, schema v30). Absent, or present with
+    /// `enabled = false` (the default), means NO rule: every fold
+    /// behaves exactly as before v30. See [`RawRapidBurst`].
+    #[serde(default)]
+    rapid_burst: Option<RawRapidBurst>,
+}
+
+/// The `[rapid_burst]` section — every threshold of the rapid-burst hold
+/// (`docs/09-runbook.md`, "Rapid-burst hold"). Each rule is scoped to an
+/// identity the bridge itself observed and counts requests created
+/// inside a rolling `window_secs` window; a deposit that would take an
+/// identity past its maximum is held for an explicit operator decision,
+/// normally not before `minimum_review_hold_secs` have elapsed.
+///
+/// ```toml
+/// [rapid_burst]
+/// enabled = true
+/// window_secs = 900
+/// max_per_source_wallet = 3
+/// max_per_destination_wallet = 3
+/// max_per_pair = 2
+/// minimum_review_hold_secs = 259200   # 72 h — a MINIMUM review hold, not a refund timer
+/// ```
+///
+/// Defaults are chosen so that `[rapid_burst]` with only `enabled = true`
+/// is a sane policy; `enabled` itself defaults to `false` so a config
+/// file that never mentions the section is unaffected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRapidBurst {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_rapid_burst_window_secs")]
+    window_secs: i64,
+    #[serde(default = "default_rapid_burst_max_per_wallet")]
+    max_per_source_wallet: u32,
+    #[serde(default = "default_rapid_burst_max_per_wallet")]
+    max_per_destination_wallet: u32,
+    #[serde(default = "default_rapid_burst_max_per_pair")]
+    max_per_pair: u32,
+    #[serde(default = "default_rapid_burst_minimum_review_hold_secs")]
+    minimum_review_hold_secs: i64,
+}
+
+fn default_rapid_burst_window_secs() -> i64 {
+    900
+}
+fn default_rapid_burst_max_per_wallet() -> u32 {
+    3
+}
+fn default_rapid_burst_max_per_pair() -> u32 {
+    2
+}
+/// 72 hours.
+fn default_rapid_burst_minimum_review_hold_secs() -> i64 {
+    72 * 3600
 }
 
 /// The `[robinhood]` section: four enable flags and nothing else.
@@ -1026,6 +1083,10 @@ pub struct Config {
     /// `ChainPolicies::insert` refuses the rest — so no edit to a config
     /// file can change the Solana fee or the Solana limits.
     pub chain_policies: crate::chain_policy::ChainPolicies,
+    /// The effective rapid-burst policy (`[rapid_burst]`), seeded into
+    /// the ledger at startup so folds and `glc-admin` read one source.
+    /// Disabled unless the section enables it.
+    pub rapid_burst: crate::ledger::RapidBurstPolicy,
 }
 
 impl Config {
@@ -2026,6 +2087,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     // fallback: after this line every executable route has exactly one
     // rate, and asking for a route that has none is an error.
     let route_fees = resolve_route_fees(raw.fees.as_ref(), &chain_policies, &routes)?;
+    let rapid_burst = resolve_rapid_burst(raw.rapid_burst)?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -2102,6 +2164,61 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         robinhood_auth_remote_signers,
         chain_policies,
         route_fees,
+        rapid_burst,
+    })
+}
+
+/// Resolves `[rapid_burst]` — absent means disabled with the defaults
+/// (so `rapid-burst-policy-show` still prints what WOULD apply).
+fn resolve_rapid_burst(
+    raw: Option<RawRapidBurst>,
+) -> Result<crate::ledger::RapidBurstPolicy, ConfigError> {
+    let raw = raw.unwrap_or(RawRapidBurst {
+        enabled: false,
+        window_secs: default_rapid_burst_window_secs(),
+        max_per_source_wallet: default_rapid_burst_max_per_wallet(),
+        max_per_destination_wallet: default_rapid_burst_max_per_wallet(),
+        max_per_pair: default_rapid_burst_max_per_pair(),
+        minimum_review_hold_secs: default_rapid_burst_minimum_review_hold_secs(),
+    });
+    let invalid = |field: &'static str, detail: String| ConfigError::Invalid { field, detail };
+    if raw.window_secs <= 0 {
+        return Err(invalid(
+            "rapid_burst.window_secs",
+            format!("must be > 0 (got {})", raw.window_secs),
+        ));
+    }
+    for (field, value) in [
+        (
+            "rapid_burst.max_per_source_wallet",
+            raw.max_per_source_wallet,
+        ),
+        (
+            "rapid_burst.max_per_destination_wallet",
+            raw.max_per_destination_wallet,
+        ),
+        ("rapid_burst.max_per_pair", raw.max_per_pair),
+    ] {
+        if value == 0 {
+            return Err(invalid(
+                field,
+                "must be >= 1 (the maximum INCLUDES the request being folded)".to_string(),
+            ));
+        }
+    }
+    if raw.minimum_review_hold_secs < 0 {
+        return Err(invalid(
+            "rapid_burst.minimum_review_hold_secs",
+            format!("must be >= 0 (got {})", raw.minimum_review_hold_secs),
+        ));
+    }
+    Ok(crate::ledger::RapidBurstPolicy {
+        enabled: raw.enabled,
+        window_secs: raw.window_secs,
+        max_per_source_wallet: raw.max_per_source_wallet,
+        max_per_destination_wallet: raw.max_per_destination_wallet,
+        max_per_pair: raw.max_per_pair,
+        minimum_review_hold_secs: raw.minimum_review_hold_secs,
     })
 }
 

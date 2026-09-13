@@ -807,6 +807,164 @@ pub struct BridgeRequest {
     /// Informational companion to the hold: when the operator intends to
     /// act on the row (unix seconds). Has no effect on the daemon.
     pub auto_resume_hold_until: Option<i64>,
+    /// Why this `ManualReview` row is where it is (schema v30):
+    /// [`ManualReviewDisposition::Normal`] for every ordinary park, or
+    /// one of the two HELD dispositions. See [`Self::is_held`].
+    pub manual_review_disposition: ManualReviewDisposition,
+    /// Machine-readable hold reason: `operator_hold`, or
+    /// `rapid_burst:<rule>` naming the burst rule that fired.
+    pub hold_reason: Option<String>,
+    /// Who placed the hold — the operator's actor string, or `system`
+    /// for a fold-time rapid-burst hold.
+    pub held_by: Option<String>,
+    /// When the hold was placed (unix seconds).
+    pub hold_started_at: Option<i64>,
+    /// The EARLIEST moment an operator may normally decide the row's
+    /// fate. A minimum review hold, never an expiry: its passing changes
+    /// nothing about the row (see [`Self::review_available`]).
+    pub review_after: Option<i64>,
+    /// The explicit operator decision that ended (or is ending) the
+    /// hold, with its time and note. `None` while the row awaits one.
+    pub operator_decision: Option<OperatorDecision>,
+    pub operator_decision_at: Option<i64>,
+    pub operator_note: Option<String>,
+}
+
+impl BridgeRequest {
+    /// Whether this row is HELD — awaiting an explicit operator
+    /// decision: a v29 hold marker is set or the disposition is not
+    /// `normal`, and no `operator_decision` has been recorded.
+    /// Deliberately independent of `review_after`, liquidity, route
+    /// state and time: only an explicit operator decision ends a hold.
+    /// A row with the `refund` decision recorded is no longer "held"
+    /// (it is decided) but is still excluded from automatic recovery —
+    /// see [`Self::excluded_from_auto_resume`].
+    pub fn is_held(&self) -> bool {
+        (self.auto_resume_hold_note.is_some()
+            || self.manual_review_disposition != ManualReviewDisposition::Normal)
+            && self.operator_decision.is_none()
+    }
+
+    /// The predicate the automatic recovery pass consults: a row is not
+    /// a candidate while it is held, and — regardless of any decision —
+    /// while the hold marker is still on it (a `refund` decision keeps
+    /// the marker so the row is left to the refund tooling; `process`
+    /// clears it as it resumes; `release` clears it).
+    pub fn excluded_from_auto_resume(&self) -> bool {
+        self.auto_resume_hold_note.is_some() || self.is_held()
+    }
+
+    /// Whether the minimum review hold has elapsed — `review_after` is
+    /// unset or in the past. Informational for operators and the Admin
+    /// UI ("Operator decision required"); NEVER consulted by any
+    /// automatic path.
+    pub fn review_available(&self, now: i64) -> bool {
+        self.review_after.is_none_or(|t| now >= t)
+    }
+}
+
+/// `bridge_requests.manual_review_disposition` (schema v30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualReviewDisposition {
+    /// An ordinary park — every pre-v30 semantics applies unchanged.
+    Normal,
+    /// An explicit operator hold (`glc-admin manual-review-hold`).
+    OperatorHold,
+    /// A fold-time hold: the deposit matched the configured rapid-burst
+    /// rule. Custodied, never paid out, never auto-resumed, never
+    /// auto-refunded; released only by an explicit `process` or `refund`
+    /// decision, normally not before `review_after`.
+    RapidBurstHold,
+}
+
+impl ManualReviewDisposition {
+    pub const ALL: [ManualReviewDisposition; 3] = [
+        ManualReviewDisposition::Normal,
+        ManualReviewDisposition::OperatorHold,
+        ManualReviewDisposition::RapidBurstHold,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ManualReviewDisposition::Normal => "normal",
+            ManualReviewDisposition::OperatorHold => "operator_hold",
+            ManualReviewDisposition::RapidBurstHold => "rapid_burst_hold",
+        }
+    }
+}
+
+impl std::str::FromStr for ManualReviewDisposition {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Self::ALL.into_iter().find(|d| d.as_str() == s).ok_or(())
+    }
+}
+
+impl ToSql for ManualReviewDisposition {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for ManualReviewDisposition {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// `bridge_requests.operator_decision` (schema v30) — the explicit act
+/// that ends a hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorDecision {
+    /// Complete the user's original request: re-admit into the normal
+    /// payout pipeline (the same shared resume every other recovery uses).
+    Process,
+    /// Return the deposit through the official refund tooling.
+    Refund,
+    /// Drop an operator hold and let the row behave as an ordinary park
+    /// again. Never valid for a rapid-burst hold.
+    Release,
+}
+
+impl OperatorDecision {
+    pub const ALL: [OperatorDecision; 3] = [
+        OperatorDecision::Process,
+        OperatorDecision::Refund,
+        OperatorDecision::Release,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OperatorDecision::Process => "process",
+            OperatorDecision::Refund => "refund",
+            OperatorDecision::Release => "release",
+        }
+    }
+}
+
+impl std::str::FromStr for OperatorDecision {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Self::ALL.into_iter().find(|d| d.as_str() == s).ok_or(())
+    }
+}
+
+impl ToSql for OperatorDecision {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for OperatorDecision {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| FromSqlError::InvalidType)
+    }
 }
 
 /// The full gross/fee/net breakdown for one new bridge request, as the

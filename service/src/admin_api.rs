@@ -602,6 +602,29 @@ pub struct ManualReviewItemView {
     /// Unix time until which the SOURCE wallet's rolling-24h window would
     /// refuse a resume, when one applies right now — on every route.
     pub source_wallet_rate_limited_until: Option<i64>,
+    /// `bridge_requests.manual_review_disposition` (schema v30):
+    /// `normal` | `operator_hold` | `rapid_burst_hold`.
+    pub disposition: String,
+    /// Whether the row is HELD right now (`BridgeRequest::is_held`) —
+    /// the automatic pass skips it and only an operator decision ends
+    /// it. The UI shows "Awaiting operator decision" while true.
+    pub held: bool,
+    /// `operator_hold`, or `rapid_burst:<rule>`; `null` when unheld.
+    pub hold_reason: Option<String>,
+    /// The hold's own note (operator text, or the burst description).
+    pub hold_note: Option<String>,
+    pub held_by: Option<String>,
+    pub hold_started_at: Option<i64>,
+    /// The earliest moment an operator may normally decide the row's
+    /// fate ("Review available after …"). Its passing changes nothing.
+    pub review_after: Option<i64>,
+    /// `review_after` is unset or in the past — the UI shows "Operator
+    /// decision required". NEVER an automatic trigger.
+    pub review_available: bool,
+    /// `process` | `refund` | `release` once decided; `null` otherwise.
+    pub operator_decision: Option<String>,
+    pub operator_decision_at: Option<i64>,
+    pub operator_note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1080,6 +1103,14 @@ pub trait AdminSource: Send + Sync + 'static {
         actor: String,
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
     fn resume_manual_review(
+        &self,
+        request_id: i64,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
+    /// `POST /manual-review/{id}/process` — the operator's `process`
+    /// decision on a HELD request ([`audited_manual_review_process`]).
+    fn process_manual_review(
         &self,
         request_id: i64,
         note: String,
@@ -1833,7 +1864,7 @@ pub fn audited_set_route_admission(
 pub fn audited_manual_review_hold(
     ledger: &mut Ledger,
     request_id: i64,
-    hold_until: i64,
+    review_after: Option<i64>,
     note: &str,
     actor: &str,
 ) -> Result<MutationReceipt, AdminError> {
@@ -1845,7 +1876,12 @@ pub fn audited_manual_review_hold(
             action: "manual_review_hold",
             target: request_id.to_string(),
             note,
-            new_value: Some(format!("auto_resume_hold_until={hold_until}")),
+            new_value: Some(format!(
+                "disposition=operator_hold review_after={}",
+                review_after
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "none (indefinite)".to_string())
+            )),
         },
         |l| {
             Ok(l.get_request(request_id)?.map(|r| {
@@ -1859,7 +1895,7 @@ pub fn audited_manual_review_hold(
             }))
         },
         |l| {
-            l.set_manual_review_hold(request_id, hold_until, note, actor, now_unix())
+            l.set_manual_review_hold(request_id, review_after, note, actor, now_unix())
                 .map_err(AdminError::from)
         },
         |_, _| {},
@@ -1896,7 +1932,7 @@ pub fn audited_manual_review_hold_release(
             }))
         },
         |l| {
-            l.clear_manual_review_hold(request_id, actor, now_unix())
+            l.clear_manual_review_hold(request_id, note, actor, now_unix())
                 .map_err(AdminError::from)
         },
         |released, params| {
@@ -1910,6 +1946,116 @@ pub fn audited_manual_review_hold_release(
 }
 
 /// ManualReview resume, audited — the one implementation behind both
+/// The operator's `process` decision on a HELD `ManualReview` request
+/// (schema v30), audited and atomic — see
+/// [`Ledger::process_held_manual_review`]: the decision is recorded and
+/// the SAME shared resume every other recovery path uses re-admits the
+/// request, in one unit; a refused resume rolls the decision back and the
+/// row stays held. Normally refused before `review_after` on a
+/// rapid-burst hold; never brought forward by any flag.
+pub fn audited_manual_review_process(
+    ledger: &mut Ledger,
+    request_id: i64,
+    note: &str,
+    actor: &str,
+) -> Result<(crate::ledger::ResumeManualReviewOutcome, MutationReceipt), AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "manual_review_process",
+            target: request_id.to_string(),
+            note,
+            new_value: None,
+        },
+        |l| {
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "state={} disposition={} review_after={}",
+                    r.state.as_str(),
+                    r.manual_review_disposition.as_str(),
+                    r.review_after
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            }))
+        },
+        |l| {
+            l.process_held_manual_review(request_id, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |outcome, params| {
+            params.new_value = Some(match outcome {
+                crate::ledger::ResumeManualReviewOutcome::Resumed => {
+                    "decision=process state=SourceFinalized".to_string()
+                }
+                crate::ledger::ResumeManualReviewOutcome::AlreadyResumed { state } => {
+                    format!("no-op: already resumed (state={})", state.as_str())
+                }
+            });
+        },
+    )
+}
+
+/// The operator's `refund` decision on a HELD `ManualReview` request
+/// (schema v30), audited — see [`Ledger::record_operator_decision`].
+/// Records the decision ONLY; the refund itself then runs through the
+/// existing, unchanged refund tooling (`glc-admin manual-review-refund`
+/// → `refund-manual-review` / `robinhood-refund` / `refund-glc-manual-
+/// review`), whose begin-paths require exactly this recorded decision
+/// for a held row. `emergency` is the before-`review_after` exit for a
+/// rapid-burst hold and is recorded as such.
+pub fn audited_manual_review_refund_decision(
+    ledger: &mut Ledger,
+    request_id: i64,
+    note: &str,
+    actor: &str,
+    emergency: bool,
+) -> Result<MutationReceipt, AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: if emergency {
+                "manual_review_refund_decision_emergency"
+            } else {
+                "manual_review_refund_decision"
+            },
+            target: request_id.to_string(),
+            note,
+            new_value: Some("decision=refund".to_string()),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "state={} disposition={} decision={}",
+                    r.state.as_str(),
+                    r.manual_review_disposition.as_str(),
+                    r.operator_decision
+                        .map(|d| d.as_str().to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            }))
+        },
+        |l| {
+            l.record_operator_decision(
+                request_id,
+                crate::ledger::OperatorDecision::Refund,
+                note,
+                actor,
+                emergency,
+                now_unix(),
+            )
+            .map(|_| ())
+            .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
 /// `POST /manual-review/{id}/resume` and `glc-admin
 /// resume-manual-review`. The authenticated `actor` is recorded on BOTH
 /// trails: the admin audit row and `bridge_request_state_log`'s
@@ -2287,6 +2433,17 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                         created_at: req.created_at,
                         recipient_rate_limited_until: recipient_until,
                         source_wallet_rate_limited_until: wallet_until,
+                        disposition: req.manual_review_disposition.as_str().to_string(),
+                        held: req.is_held(),
+                        hold_reason: req.hold_reason.clone(),
+                        hold_note: req.auto_resume_hold_note.clone(),
+                        held_by: req.held_by.clone(),
+                        hold_started_at: req.hold_started_at,
+                        review_after: req.review_after,
+                        review_available: req.review_available(now),
+                        operator_decision: req.operator_decision.map(|d| d.as_str().to_string()),
+                        operator_decision_at: req.operator_decision_at,
+                        operator_note: req.operator_note.clone(),
                     });
                 }
             }
@@ -2480,6 +2637,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
             audited_resume_manual_review(&mut ledger, request_id, &note, &actor)
+                .map(|(_outcome, receipt)| receipt)
+        })
+    }
+
+    fn process_manual_review(
+        &self,
+        request_id: i64,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
+        Box::pin(async move {
+            let mut ledger = self.open_ledger()?;
+            audited_manual_review_process(&mut ledger, request_id, &note, &actor)
                 .map(|(_outcome, receipt)| receipt)
         })
     }
@@ -3004,6 +3174,13 @@ fn parse_manual_review_resume_path(path: &str) -> Option<i64> {
     id.parse::<i64>().ok()
 }
 
+/// `/manual-review/{id}/process` path parsing.
+fn parse_manual_review_process_path(path: &str) -> Option<i64> {
+    let rest = path.strip_prefix("/manual-review/")?;
+    let id = rest.strip_suffix("/process")?;
+    id.parse::<i64>().ok()
+}
+
 async fn handle<S: AdminSource>(
     req: Request<hyper::body::Incoming>,
     source: Arc<S>,
@@ -3204,6 +3381,22 @@ async fn handle<S: AdminSource>(
                         Ok(note) => {
                             match source
                                 .resume_manual_review(request_id, note.to_string(), actor)
+                                .await
+                            {
+                                Ok(v) => json_response(StatusCode::OK, &v),
+                                Err(e) => error_response(e),
+                            }
+                        }
+                        Err(e) => error_response(e),
+                    },
+                    Err(resp) => *resp,
+                }
+            } else if let Some(request_id) = parse_manual_review_process_path(other_path) {
+                match read_json::<NoteInput>(req).await {
+                    Ok(input) => match require_note(&input.note) {
+                        Ok(note) => {
+                            match source
+                                .process_manual_review(request_id, note.to_string(), actor)
                                 .await
                             {
                                 Ok(v) => json_response(StatusCode::OK, &v),

@@ -1528,8 +1528,24 @@ impl Ledger {
         )?;
         let reserve_blocker = gates.blocker(amounts.net_destination_atomic as i64, limits);
 
-        let payable =
-            route_open && refusal.is_none() && destination.is_some() && reserve_blocker.is_none();
+        // The rapid-burst rule (`ledger::rapid_burst`, schema v30), on
+        // the custody contract's own recorded `depositor` and the
+        // recipient — ranked above every other reason, as in
+        // `fold_sol_deposit`.
+        let burst = Self::rapid_burst_verdict_in(
+            &tx,
+            direction,
+            Some(&observation.observation.depositor[..]),
+            destination,
+            now,
+            crate::ledger::WalletWindowScope::NewRequest,
+        )?;
+
+        let payable = route_open
+            && refusal.is_none()
+            && destination.is_some()
+            && reserve_blocker.is_none()
+            && burst.is_none();
 
         // The refusal an operator sees, ranked most specific first. The
         // route-specific conditions are ranked above the shared
@@ -1539,6 +1555,8 @@ impl Ledger {
         // stop doing so.
         let note: Option<String> = if payable {
             None
+        } else if burst.is_some() {
+            Some(Self::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD.to_string())
         } else if let Some(explicit) = refusal {
             Some(explicit.to_string())
         } else if destination.is_none() {
@@ -1627,6 +1645,9 @@ impl Ledger {
             Some("fold_robinhood_deposit"),
             "system",
         )?;
+        if let Some(matched) = &burst {
+            Self::mark_rapid_burst_hold_in(&tx, request_id, matched, now)?;
+        }
 
         // The link back to the observation. Its unique index is the
         // second half of the replay guard: one observation can name at
