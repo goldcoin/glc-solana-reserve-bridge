@@ -217,6 +217,10 @@ async fn main() {
         );
     let vault_signers_for_refunds = Arc::new(vault_signers_for_refunds_vec);
     let submitter = or_exit(config.load_submitter(), "load the submitter key");
+    // The fee-payer's PUBLIC key only, for the admin API's balance read
+    // (`GET /submitters`). The keypair itself goes to the orchestrator
+    // and nowhere else.
+    let solana_submitter_pubkey = solana_sdk::signer::Signer::pubkey(&submitter);
     let vault = or_exit(
         MultisigVault::new(
             config.operators.vault_pubkeys.clone(),
@@ -1063,7 +1067,37 @@ async fn main() {
         .with_refund_executor(refund_executor)
         .with_route_fees(config.route_fees.clone())
         .with_rate_book(rate_book.clone())
-        .with_program_compat(Arc::clone(&program_compat));
+        .with_program_compat(Arc::clone(&program_compat))
+        .with_route_gate(Arc::clone(&route_gate))
+        .with_solana_submitter(solana_submitter_pubkey);
+        // Read-only Robinhood contract flags and submitter balance for the
+        // operator console's `GET /routes` / `GET /submitters`
+        // (docs/39-admin-console-v2.md). Its own RPC client, like the
+        // public reader above, for the same reason; it holds no key and
+        // calls only `eth_call` / `eth_getBalance`.
+        let admin_api_base = match (&config.robinhood_indexer, &config.robinhood_settlement) {
+            (Some(indexer_cfg), Some(settlement_cfg)) => {
+                let rpc = or_exit(
+                    robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                        url: indexer_cfg.rpc_url.clone(),
+                        connect_timeout_ms: indexer_cfg.request_timeout_ms,
+                        read_timeout_ms: indexer_cfg.request_timeout_ms,
+                    }),
+                    "construct the Robinhood EVM RPC client for the admin route/submitter reads",
+                );
+                admin_api_base.with_robinhood_reader(Arc::new(
+                    admin_api::robinhood_read::LiveRobinhoodAdminReader::new(
+                        rpc,
+                        settlement_cfg.bridge_contract,
+                        settlement_cfg.submitter_address,
+                        glc_reserve_bridge_service::evm::EvmU256::from_u128(
+                            settlement_cfg.min_submitter_balance_wei,
+                        ),
+                    ),
+                ))
+            }
+            _ => admin_api_base,
+        };
         // Attached only when Robinhood is configured. It grants no
         // capability — the admin API remains structurally incapable of
         // broadcasting a Robinhood transaction, and `glc-admin

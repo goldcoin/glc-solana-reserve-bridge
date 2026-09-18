@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 37;
+const CURRENT_SCHEMA_VERSION: i64 = 38;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -93,6 +93,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v35(conn)?;
         apply_v36(conn)?;
         apply_v37(conn)?;
+        apply_v38(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -205,6 +206,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(37) {
             apply_v37(conn)?;
+        }
+        if current < Some(38) {
+            apply_v38(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2945,6 +2949,71 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v38 — **route-scoped admission for every route** (2026-09-18,
+/// docs/39-admin-console-v2.md).
+///
+/// # What it widens, and why
+///
+/// v25 gave the two inbound-to-Goldcoin routes their own admission gate
+/// and v27 extended it to the two Solana<->Robinhood routes: exactly the
+/// routes whose source deposit is OBSERVED on chain and folded. The two
+/// Goldcoin-sourced routes (`GlcToSol`, `GlcToRhn`) were left out on the
+/// reasoning that their deposits are REQUESTED (`POST /transfers`) rather
+/// than observed, so the destination reserve's own pause was "their
+/// control". In production that control is shared: pausing the Solana
+/// reserve stops `GlcToSol` AND `RhnToSol`, pausing the Robinhood reserve
+/// stops `GlcToRhn` AND `SolToRhn`. An operator who needs to stop ONE
+/// Goldcoin-sourced route had no supported way to do it.
+///
+/// This migration gives every route the same gate: the `route_id` CHECK
+/// is widened to all six spellings and the two missing rows are seeded
+/// OPEN. `Route::is_admission_settable` becomes true for every route and
+/// `Ledger::create_request_from` — the admission moment of a
+/// Goldcoin-sourced route, where its capacity is reserved — reads the
+/// gate inside its own write transaction and refuses a new request while
+/// it is closed. `GET /chains` needed no change: it already evaluates
+/// `InboundAdmissionGates` for every route, and the route gate is ranked
+/// first there.
+///
+/// # This migration changes no behaviour
+///
+/// Both new rows are seeded `admission_closed = 0` with `INSERT OR
+/// IGNORE`, and `Ledger::route_admission_closed` resolves an absent row
+/// to OPEN, so a ledger before and after this migration admits exactly
+/// the same requests and `GET /chains` publishes exactly the same
+/// verdicts. The four existing rows are copied through the CHECK rebuild
+/// untouched — an operator's own closed gate survives the upgrade,
+/// pinned by `upgrading_from_v37_keeps_a_closed_gate_closed`.
+///
+/// Rollback is the ledger snapshot the deploy step takes: a v37 binary
+/// refuses a v38 ledger (`LedgerError::SchemaTooNew`) rather than
+/// relabelling it, exactly as every earlier version does.
+fn apply_v38(conn: &Connection) -> Result<(), LedgerError> {
+    widen_check_constraint_labelled(
+        conn,
+        "v38",
+        "route_admission",
+        &format!("CHECK ({V27_ROUTE_ADMISSION_CHECK})"),
+        &format!("CHECK ({V38_ROUTE_ADMISSION_CHECK})"),
+    )?;
+    conn.execute_batch(
+        r#"
+        INSERT OR IGNORE INTO route_admission
+            (route_id, admission_closed, admission_closed_reason, updated_at)
+        VALUES
+            ('GlcToSol', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('GlcToRhn', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER));
+        "#,
+    )?;
+    Ok(())
+}
+
+/// The `route_admission.route_id` CHECK v38 leaves behind — every route,
+/// in `Route::ALL` order. Pinned against `Route::ADMISSION_SETTABLE` by
+/// `the_v38_check_literal_matches_the_rust_enum`.
+pub(super) const V38_ROUTE_ADMISSION_CHECK: &str =
+    "route_id IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc','SolToRhn','RhnToSol')";
+
 /// v37 — **the persisted bridge quote** (docs/38-elastic-bridge-rate.md,
 /// Phase 2A).
 ///
@@ -3832,7 +3901,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 37);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 38);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -5019,7 +5088,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 37);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 38);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -5719,10 +5788,12 @@ mod tests {
     /// `Route::is_admission_settable` shows up here as a FAILING TEST
     /// instead of silently rewriting what a migration seeds.
     fn expected_route_admission_seed() -> Vec<(String, i64)> {
-        // v25's two inbound-to-Goldcoin rows plus v27's two cross-route
-        // rows, all OPEN. Sorted by route_id, as `route_admission_rows`
-        // reads them.
+        // v25's two inbound-to-Goldcoin rows, v27's two cross-route rows
+        // and v38's two Goldcoin-sourced rows, all OPEN. Sorted by
+        // route_id, as `route_admission_rows` reads them.
         [
+            ("GlcToRhn", 0),
+            ("GlcToSol", 0),
             ("RhnToGlc", 0),
             ("RhnToSol", 0),
             ("SolToGlc", 0),
@@ -5734,14 +5805,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_database_seeds_route_admission_open_for_every_observed_deposit_route() {
+    fn a_fresh_database_seeds_route_admission_open_for_every_route() {
         let conn = Connection::open_in_memory().unwrap();
         open_and_migrate(&conn).unwrap();
 
         assert_eq!(
             route_admission_rows(&conn),
             expected_route_admission_seed(),
-            "a fresh ledger must seed all four observed-deposit routes, all OPEN"
+            "a fresh ledger must seed all six routes, all OPEN"
         );
     }
 
@@ -5777,8 +5848,29 @@ mod tests {
                 .map(|r| r.as_str().to_string())
                 .collect::<Vec<_>>()
         );
+        // v27's literal is HISTORICAL: the four observed-deposit routes,
+        // which v38 then widens to every route. Pinned as the literal
+        // list because the migration's `from` text must never move.
         assert_eq!(
             spelled(V27_ROUTE_ADMISSION_CHECK),
+            ["SolToGlc", "RhnToGlc", "SolToRhn", "RhnToSol"]
+        );
+    }
+
+    /// The v38 literal names exactly `Route::ADMISSION_SETTABLE` — every
+    /// route, in `Route::ALL` order — so a seventh route is a failing test
+    /// here rather than a row the database silently refuses.
+    #[test]
+    fn the_v38_check_literal_matches_the_rust_enum() {
+        use crate::routes::Route;
+        let spelled: Vec<String> = V38_ROUTE_ADMISSION_CHECK
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            spelled,
             Route::ADMISSION_SETTABLE
                 .iter()
                 .map(|r| r.as_str().to_string())
@@ -5830,15 +5922,18 @@ mod tests {
             "CHECK (route IS NULL OR ((kind = 'Payout') = (route = 'GlcToRhn')))",
         )
         .unwrap();
+        // A fresh ledger carries v38's six-route CHECK and six rows;
+        // rewind both to v26's shape (v25's two rows, v25's CHECK).
         conn.execute_batch(
-            "DELETE FROM route_admission WHERE route_id IN ('SolToRhn','RhnToSol');",
+            "DELETE FROM route_admission
+              WHERE route_id IN ('SolToRhn','RhnToSol','GlcToSol','GlcToRhn');",
         )
         .unwrap();
         widen_check_constraint_labelled(
             &conn,
             "rewind",
             "route_admission",
-            &format!("CHECK ({V27_ROUTE_ADMISSION_CHECK})"),
+            &format!("CHECK ({V38_ROUTE_ADMISSION_CHECK})"),
             "CHECK (route_id IN ('SolToGlc','RhnToGlc'))",
         )
         .unwrap();
@@ -5886,6 +5981,8 @@ mod tests {
         assert_eq!(
             route_admission_rows(&conn),
             [
+                ("GlcToRhn", 0),
+                ("GlcToSol", 0),
                 ("RhnToGlc", 0),
                 ("RhnToSol", 0),
                 ("SolToGlc", 1),
@@ -6148,14 +6245,15 @@ mod tests {
     }
 
     /// The table's own CHECK is a second, independent backstop under
-    /// `Route::is_admission_settable`: no route outside the
-    /// inbound-to-Goldcoin pair can be given a row, even by hand.
+    /// `Route::is_admission_settable`: no spelling outside the six routes
+    /// can be given a row, even by hand — and the six that can already
+    /// have one (PRIMARY KEY), so no second row for a route can exist.
     #[test]
     fn route_admission_refuses_a_row_for_any_other_route() {
         let conn = Connection::open_in_memory().unwrap();
         open_and_migrate(&conn).unwrap();
 
-        for route_id in ["GlcToSol", "GlcToRhn", "SolToRhn", "RhnToSol", "Nonsense"] {
+        for route_id in ["Nonsense", "GlcToGlc", "glctosol", "", "GlcToSol"] {
             let err = conn.execute(
                 "INSERT INTO route_admission (route_id, admission_closed, updated_at)
                  VALUES (?1, 1, 0)",
@@ -6652,7 +6750,7 @@ mod v28_tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 37);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 38);
         let amount: i64 = conn
             .query_row(
                 "SELECT gross_amount_atomic FROM bridge_requests WHERE id = 41",
@@ -6726,7 +6824,7 @@ mod v28_tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         insert_minimal_request(&conn, 1);
         let insert = |state: &str, sig: Option<&str>, reason: &str, by: &str| {
             conn.execute(
@@ -6799,7 +6897,7 @@ mod v28_tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         for column in [
             "quote_source_price_e12",
             "quote_destination_price_e12",
@@ -6826,6 +6924,100 @@ mod v28_tests {
         assert_eq!(amount, 12345);
         assert_eq!(src, None, "no backfill: a pre-v37 row stays legacy");
         assert_eq!(locked, None);
+    }
+
+    /// A database migrated by a v37 binary: every migration through v37
+    /// applied on a fresh connection, stamped 37. What production carries
+    /// the day the v38 binary is first started.
+    fn database_at_v37() -> Connection {
+        let conn = database_at_v36();
+        apply_v37(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 37", [])
+            .unwrap();
+        // v37's `route_admission` CHECK still names the four observed
+        // routes and refuses the two Goldcoin-sourced ones.
+        assert!(conn
+            .execute(
+                "INSERT INTO route_admission (route_id, admission_closed, updated_at)
+                 VALUES ('GlcToSol', 0, 0)",
+                [],
+            )
+            .is_err());
+        conn
+    }
+
+    /// v37 -> v38 (docs/39-admin-console-v2.md): the two Goldcoin-sourced
+    /// routes gain a row, seeded OPEN; an operator's own CLOSED gate on
+    /// an existing route survives the CHECK rebuild with its reason and
+    /// timestamp; every request row is kept; the migration is idempotent.
+    #[test]
+    fn upgrading_from_v37_keeps_a_closed_gate_closed_and_seeds_the_two_new_rows_open() {
+        let conn = database_at_v37();
+        insert_minimal_request(&conn, 41);
+        conn.execute(
+            "UPDATE route_admission SET admission_closed = 1,
+                    admission_closed_reason = 'operator incident', updated_at = 1700000000
+              WHERE route_id = 'SolToRhn'",
+            [],
+        )
+        .unwrap();
+
+        open_and_migrate(&conn).unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v38(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 38);
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT route_id, admission_closed FROM route_admission ORDER BY route_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("GlcToRhn", 0),
+                ("GlcToSol", 0),
+                ("RhnToGlc", 0),
+                ("RhnToSol", 0),
+                ("SolToGlc", 0),
+                ("SolToRhn", 1),
+            ]
+            .into_iter()
+            .map(|(r, c)| (r.to_string(), c))
+            .collect::<Vec<_>>()
+        );
+        let (reason, at): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT admission_closed_reason, updated_at FROM route_admission
+                  WHERE route_id = 'SolToRhn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("operator incident"));
+        assert_eq!(at, 1_700_000_000);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_requests WHERE id = 41",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        // The widened CHECK now admits a Goldcoin-sourced row (the seed
+        // wrote it) and still refuses an unknown spelling.
+        assert!(conn
+            .execute(
+                "INSERT INTO route_admission (route_id, admission_closed, updated_at)
+                 VALUES ('Nonsense', 0, 0)",
+                [],
+            )
+            .is_err());
     }
 
     /// The v37 `CHECK`s: a quote is all-or-nothing, prices are positive,

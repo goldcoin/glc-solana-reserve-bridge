@@ -840,31 +840,28 @@ fn route_ledger_rows_report_the_cross_routes_disabled_until_an_operator_opens_th
 
 // ------------------------------- route-scoped admission (schema v25) --
 
-/// `is_admission_settable` is exactly the OBSERVED-deposit set — every
-/// route whose source deposit is folded from a chain observation rather
-/// than created through `POST /transfers`, i.e. exactly the complement of
-/// `Direction::source_is_goldcoin`.
+/// `is_admission_settable` is exactly the set of routes WITH settlement
+/// machinery — since schema v38, every route whose `as_direction` is
+/// `Some`, which is all six.
 ///
 /// Pinned against the `Direction` predicate rather than restated as a
 /// literal list: the two drifting apart would mean an operator could
-/// close a gate no fold consults, or a fold consulting a gate no
-/// operator can reach.
+/// close a gate no admission path consults, or an admission path
+/// consulting a gate no operator can reach.
 #[test]
-fn admission_settable_is_exactly_the_observed_deposit_routes() {
+fn admission_settable_is_exactly_the_routes_with_a_direction() {
     for route in Route::ALL {
-        let expected = route
-            .as_direction()
-            .is_some_and(|d| !d.source_is_goldcoin());
         assert_eq!(
             route.is_admission_settable(),
-            expected,
-            "{} — is_admission_settable must mirror !Direction::source_is_goldcoin",
+            route.as_direction().is_some(),
+            "{} — is_admission_settable must mirror as_direction().is_some()",
             route.as_str()
         );
     }
 }
 
-/// The constant and the predicate agree, in both directions.
+/// The constant and the predicate agree, in both directions, and the
+/// constant is `Route::ALL` in `Route::ALL` order (v38).
 #[test]
 fn admission_settable_list_matches_the_predicate() {
     for route in Route::ADMISSION_SETTABLE {
@@ -882,6 +879,7 @@ fn admission_settable_list_matches_the_predicate() {
             route.as_str()
         );
     }
+    assert_eq!(Route::ADMISSION_SETTABLE, Route::ALL);
 }
 
 /// Every admission-settable route has settlement machinery. Relied on by
@@ -898,7 +896,9 @@ fn admission_settable_routes_all_have_a_direction() {
     }
 }
 
-/// The two axes are DIFFERENT sets, overlapping in exactly three routes.
+/// The two axes are DIFFERENT sets: enablement is the four Robinhood
+/// routes, admission is every route (v38). The legacy pair gains a
+/// route-scoped ADMISSION gate and still no ENABLEMENT switch.
 ///
 /// This is the confusion the doc table on `is_admission_settable` exists
 /// to prevent, pinned so a future edit that collapses one predicate into
@@ -916,12 +916,17 @@ fn enablement_and_admission_are_different_axes() {
         .map(|r| r.as_str())
         .collect();
     assert_eq!(enablement, ["GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol"]);
-    assert_eq!(admission, ["SolToGlc", "RhnToGlc", "SolToRhn", "RhnToSol"]);
+    assert_eq!(
+        admission,
+        ["GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol"]
+    );
 
-    // GlcToSol has NEITHER: its controls remain the Solana reserve's own
-    // pause, and it gains no per-route off switch from either axis.
+    // GlcToSol: a route-scoped admission gate (v38) and still NO
+    // enablement switch — its enablement stays "by construction".
     assert!(!Route::GlcToSol.is_operator_settable());
-    assert!(!Route::GlcToSol.is_admission_settable());
+    assert!(Route::GlcToSol.is_admission_settable());
+    assert!(!Route::SolToGlc.is_operator_settable());
+    assert!(Route::SolToGlc.is_admission_settable());
 }
 
 /// The Solana<->Robinhood routes carry BOTH axes: a direction, an

@@ -198,6 +198,128 @@ fn create_request_rejects_when_direction_is_paused() {
     assert_eq!(outcome, CreateRequestOutcome::Paused);
 }
 
+// ------------------------ route-scoped admission on requested routes (v38) --
+
+/// `GlcToSol`'s own admission gate is enforced at its admission moment —
+/// `create_request_from` — exactly as the reserve pause is: refused before
+/// any row, reservation or deposit address exists, and with the capacity
+/// figure untouched.
+#[test]
+fn create_request_refuses_while_the_routes_own_admission_gate_is_closed() {
+    let mut ledger = setup();
+    ledger
+        .set_route_admission(crate::routes::Route::GlcToSol, true, Some("incident"))
+        .unwrap();
+    assert!(ledger
+        .route_admission_closed(crate::routes::Route::GlcToSol)
+        .unwrap());
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(outcome, CreateRequestOutcome::RouteAdmissionClosed);
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        900_000,
+        "a refused request must reserve nothing"
+    );
+    assert!(ledger
+        .requests_by_state(Direction::GlcToSol, RequestState::AwaitingDeposit)
+        .unwrap()
+        .is_empty());
+
+    // Re-opening the gate is the whole of the remedy: the next request
+    // is admitted through the unchanged path.
+    ledger
+        .set_route_admission(crate::routes::Route::GlcToSol, false, None)
+        .unwrap();
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    assert!(matches!(outcome, CreateRequestOutcome::Reserved { .. }));
+}
+
+/// Closing ONE Goldcoin-sourced route leaves the other admitting: the
+/// gate is route-scoped, never reserve-scoped, and it neither reads nor
+/// writes the destination reserve's pause.
+#[test]
+fn closing_one_requested_route_leaves_the_other_and_the_reserve_untouched() {
+    let mut ledger = setup();
+    ledger
+        .set_route_admission(crate::routes::Route::GlcToRhn, true, Some("incident"))
+        .unwrap();
+    assert!(!ledger.is_paused(ReserveDirection::SolanaReserve).unwrap());
+    assert!(!ledger
+        .route_admission_closed(crate::routes::Route::GlcToSol)
+        .unwrap());
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    assert!(matches!(outcome, CreateRequestOutcome::Reserved { .. }));
+}
+
+/// The pause is ranked before the route gate, as in the folds: a paused
+/// reserve is reported as paused even while the route gate is also
+/// closed, so the operator sees the coarser, emergency statement first.
+#[test]
+fn a_paused_reserve_is_reported_before_a_closed_route_gate() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(ReserveDirection::SolanaReserve, true, Some("stop"))
+        .unwrap();
+    ledger
+        .set_route_admission(crate::routes::Route::GlcToSol, true, Some("incident"))
+        .unwrap();
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(outcome, CreateRequestOutcome::Paused);
+}
+
+/// A fresh ledger seeds a row for every route, all OPEN, in `Route::ALL`
+/// order — so the six-route admission listing is complete from the first
+/// start and no route is reported as "no row".
+#[test]
+fn route_admission_rows_list_every_route_open_on_a_fresh_ledger() {
+    let ledger = setup();
+    let state = ledger.route_admission_rows().unwrap().expect("v38 table");
+    assert_eq!(
+        state.rows.iter().map(|r| r.route).collect::<Vec<_>>(),
+        crate::routes::Route::ALL.to_vec()
+    );
+    assert!(state.rows.iter().all(|r| !r.admission_closed));
+    assert!(state.unknown_route_ids.is_empty());
+}
+
 #[test]
 fn concurrent_reservations_never_double_spend_the_same_capacity() {
     // Sequential calls stand in for "concurrent" here since sqlite

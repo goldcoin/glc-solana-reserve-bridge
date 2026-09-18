@@ -244,7 +244,7 @@ fn client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-const GET_PATHS: [&str; 9] = [
+const GET_PATHS: [&str; 11] = [
     "/whoami",
     "/status",
     "/reserve-health",
@@ -254,6 +254,8 @@ const GET_PATHS: [&str; 9] = [
     "/refunds",
     "/rebalances",
     "/audit-log",
+    "/routes",
+    "/submitters",
 ];
 
 // ------------------------------------------------------------- authz --
@@ -3129,4 +3131,552 @@ async fn manual_refund_closures_carry_the_verified_refund_and_are_listed() {
         .find(|c| c["request_id"] == other)
         .unwrap();
     assert!(plain["manual_refund"].is_null());
+}
+
+// ------------------------------ admin console v2: routes and admission --
+
+const ALL_ROUTES: [&str; 6] = [
+    "GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol",
+];
+
+async fn routes_view(base: &str) -> serde_json::Value {
+    let resp = client()
+        .get(format!("{base}/routes"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+fn route_of<'a>(view: &'a serde_json::Value, route: &str) -> &'a serde_json::Value {
+    view["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["route"] == route)
+        .unwrap_or_else(|| panic!("{route} missing from GET /routes"))
+}
+
+fn blockers(route: &serde_json::Value) -> Vec<String> {
+    route["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b.as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn post_note(base: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+    let resp = client()
+        .post(format!("{base}{path}"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap())
+}
+
+/// `GET /routes` lists every route with the fields the console keys on,
+/// and no route's `available` disagrees with what its blockers say.
+#[tokio::test]
+async fn routes_view_lists_all_six_routes_with_consistent_verdicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let view = routes_view(&base).await;
+    let routes = view["routes"].as_array().unwrap();
+    assert_eq!(
+        routes
+            .iter()
+            .map(|r| r["route"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ALL_ROUTES
+    );
+    for r in routes {
+        let available = r["available"].as_bool().unwrap();
+        let blockers = blockers(r);
+        assert_eq!(
+            available,
+            blockers.is_empty(),
+            "{}: available={available} but blockers={blockers:?}",
+            r["route"]
+        );
+        if !available {
+            assert!(
+                r["primary_reason"].is_string(),
+                "{}: an unavailable route names a primary reason",
+                r["route"]
+            );
+        }
+        assert!(r["reserve_siblings"].is_array());
+        assert!(r["destination_reserve"].is_string());
+        assert_eq!(
+            r["route_admission_closed"], false,
+            "{} seeded open",
+            r["route"]
+        );
+    }
+    // The fake program reports release_paused: the two Solana-bound
+    // routes are blocked on chain, and the view says which layer.
+    for route in ["GlcToSol", "RhnToSol"] {
+        let r = route_of(&view, route);
+        assert_eq!(r["onchain_blocked"], true);
+        assert!(blockers(r).contains(&"onchain_paused".to_string()));
+    }
+    // The Solana-sourced routes are not.
+    assert_eq!(route_of(&view, "SolToGlc")["onchain_blocked"], false);
+    // No Robinhood reader on this server: the contract is reported as
+    // not configured, never as enabled or paused.
+    assert_eq!(view["robinhood_contract"]["availability"], "not_configured");
+    assert!(route_of(&view, "GlcToRhn")["contract_route_enabled"].is_null());
+    // The unconfigured Robinhood reserve is reported as exactly that.
+    assert_eq!(route_of(&view, "GlcToRhn")["reserve_not_configured"], true);
+    // Siblings: the two routes drawing on the Solana reserve name each
+    // other and nobody else.
+    assert_eq!(
+        route_of(&view, "GlcToSol")["reserve_siblings"],
+        serde_json::json!(["RhnToSol"])
+    );
+    assert_eq!(
+        route_of(&view, "SolToGlc")["reserve_siblings"],
+        serde_json::json!(["RhnToGlc"])
+    );
+    assert_eq!(view["solana_program"]["release_paused"], true);
+}
+
+/// The six-route isolation matrix: closing ONE route's admission adds
+/// exactly one blocker to exactly that route, every other route's
+/// blocker list is byte-identical before and after, and re-opening
+/// restores the original view. One audit row per mutation, success or
+/// refusal.
+#[tokio::test]
+async fn closing_one_routes_admission_touches_exactly_that_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    configure_robinhood_reserve(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let baseline = routes_view(&base).await;
+    let mut audit_rows_expected = 0usize;
+    for route in ALL_ROUTES {
+        let (status, receipt) = post_note(
+            &base,
+            &format!("/routes/{route}/admission/close"),
+            r#"{"note":"matrix"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{route}: {receipt}");
+        assert_eq!(receipt["action"], "route_admission_close");
+        assert_eq!(receipt["target"], route);
+        assert_eq!(receipt["old_value"], "admission_closed=false");
+        assert_eq!(receipt["new_value"], "admission_closed=true");
+        audit_rows_expected += 1;
+
+        let closed = routes_view(&base).await;
+        for other in ALL_ROUTES {
+            let before = route_of(&baseline, other);
+            let after = route_of(&closed, other);
+            if other == route {
+                assert_eq!(after["route_admission_closed"], true);
+                assert_eq!(after["available"], false);
+                assert_eq!(after["route_admission_reason"], "matrix");
+                let mut expected = blockers(before);
+                // Ranked right after enablement, before the reserve gates.
+                let at = if expected.first().is_some_and(|b| b == "route_disabled") {
+                    1
+                } else {
+                    0
+                };
+                expected.insert(at, "route_admission_closed".to_string());
+                assert_eq!(blockers(after), expected, "{route} after closing itself");
+            } else {
+                assert_eq!(
+                    after["route_admission_closed"], false,
+                    "{other} after closing {route}"
+                );
+                assert_eq!(
+                    blockers(after),
+                    blockers(before),
+                    "{other} must be untouched by closing {route}"
+                );
+                assert_eq!(after["available"], before["available"]);
+            }
+        }
+
+        let (status, receipt) = post_note(
+            &base,
+            &format!("/routes/{route}/admission/open"),
+            r#"{"note":"matrix over"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{route}: {receipt}");
+        assert_eq!(receipt["action"], "route_admission_open");
+        assert_eq!(receipt["old_value"], "admission_closed=true");
+        assert_eq!(receipt["new_value"], "admission_closed=false");
+        let reopened = routes_view(&base).await;
+        for other in ALL_ROUTES {
+            assert_eq!(
+                blockers(route_of(&reopened, other)),
+                blockers(route_of(&baseline, other)),
+                "{other} restored after re-opening {route}"
+            );
+        }
+        audit_rows_expected += 1;
+    }
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            limit: Some(100),
+            ..AdminAuditFilter::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), audit_rows_expected);
+    assert!(rows.iter().all(|r| r.actor == "alice"));
+    assert!(rows.iter().all(|r| r.outcome == AdminAuditOutcome::Success));
+}
+
+fn configure_robinhood_reserve(db_path: &std::path::Path) {
+    let mut ledger = Ledger::open(db_path).unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            1_000_000_000,
+            1_000,
+            900_000_000,
+            500_000_000,
+            100_000,
+            0,
+        )
+        .unwrap();
+}
+
+/// Opening a route whose destination reserve cannot pass the safety
+/// checks — here: a Robinhood reserve that was never configured — is
+/// refused (409), leaves the gate CLOSED, and the refusal is audited.
+/// Closing needed no such check.
+#[tokio::test]
+async fn opening_a_route_onto_an_unconfigured_reserve_is_refused_and_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let (status, _) = post_note(
+        &base,
+        "/routes/GlcToRhn/admission/close",
+        r#"{"note":"close"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = post_note(
+        &base,
+        "/routes/GlcToRhn/admission/open",
+        r#"{"note":"open"}"#,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("refusing to open admission for route GlcToRhn"));
+
+    let view = routes_view(&base).await;
+    assert_eq!(route_of(&view, "GlcToRhn")["route_admission_closed"], true);
+    let ledger = Ledger::open(&db_path).unwrap();
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].action, "route_admission_open");
+    assert!(matches!(rows[0].outcome, AdminAuditOutcome::Error(_)));
+    assert_eq!(rows[1].action, "route_admission_close");
+    assert_eq!(rows[1].outcome, AdminAuditOutcome::Success);
+}
+
+/// An unknown route, an unknown verb and a missing note are refused
+/// before anything is written.
+#[tokio::test]
+async fn route_admission_endpoint_validates_route_verb_and_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let (status, _) = post_note(&base, "/routes/GlcToGlc/admission/close", r#"{"note":"x"}"#).await;
+    assert_eq!(status, 404);
+    let (status, _) = post_note(
+        &base,
+        "/routes/GlcToSol/admission/toggle",
+        r#"{"note":"x"}"#,
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, _) = post_note(&base, "/routes/GlcToSol/admission/close", r#"{"note":""}"#).await;
+    assert_eq!(status, 400);
+    let (status, _) = post_note(&base, "/routes/GlcToSol/admission/close", r#"{}"#).await;
+    assert_eq!(status, 400);
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(!ledger
+        .route_admission_closed(crate::routes::Route::GlcToSol)
+        .unwrap());
+    assert!(ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// Pausing a reserve blocks exactly the routes drawing on it — the
+/// `reserve_siblings` the view advertises — and no other; resuming
+/// restores the baseline. Pause and admission remain distinguishable
+/// in the blockers.
+#[tokio::test]
+async fn pausing_a_reserve_blocks_exactly_its_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let baseline = routes_view(&base).await;
+
+    for (direction, expected_routes) in [
+        ("solana", vec!["GlcToSol", "RhnToSol"]),
+        ("goldcoin", vec!["SolToGlc", "RhnToGlc"]),
+    ] {
+        let (status, receipt) = post_note(
+            &base,
+            "/pause",
+            &format!(r#"{{"direction":"{direction}","note":"stop"}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{receipt}");
+        let paused = routes_view(&base).await;
+        for route in ALL_ROUTES {
+            let r = route_of(&paused, route);
+            let has = blockers(r).contains(&"reserve_paused".to_string());
+            assert_eq!(
+                has,
+                expected_routes.contains(&route),
+                "{route} while {direction} is paused"
+            );
+            assert!(
+                !blockers(r).contains(&"route_admission_closed".to_string()),
+                "a pause is never reported as a closed admission"
+            );
+            if expected_routes.contains(&route) {
+                assert_eq!(r["reserve_paused"], true);
+                assert_eq!(r["reserve_pause_reason"], "stop");
+                assert_eq!(r["available"], false);
+            } else {
+                assert_eq!(blockers(r), blockers(route_of(&baseline, route)));
+            }
+        }
+        let (status, _) = post_note(
+            &base,
+            "/unpause",
+            &format!(r#"{{"direction":"{direction}","note":"go"}}"#),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let resumed = routes_view(&base).await;
+        for route in ALL_ROUTES {
+            assert_eq!(
+                blockers(route_of(&resumed, route)),
+                blockers(route_of(&baseline, route)),
+                "{route} restored after resuming {direction}"
+            );
+        }
+    }
+}
+
+/// `direction: robinhood` on `/pause` and `/unpause` reaches the third
+/// reserve's own guarded implementation: pausing is unconditional,
+/// unpausing runs the guard, both are audited under the same action
+/// names as the other two reserves.
+#[tokio::test]
+async fn robinhood_local_pause_over_http_is_guarded_and_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    configure_robinhood_reserve(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let (status, receipt) = post_note(
+        &base,
+        "/pause",
+        r#"{"direction":"robinhood","note":"rhn stop"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{receipt}");
+    assert_eq!(receipt["action"], "pause");
+    assert_eq!(receipt["target"], "robinhood");
+    let view = routes_view(&base).await;
+    for route in ["GlcToRhn", "SolToRhn"] {
+        assert_eq!(route_of(&view, route)["reserve_paused"], true, "{route}");
+    }
+    for route in ["GlcToSol", "SolToGlc", "RhnToGlc", "RhnToSol"] {
+        assert_eq!(route_of(&view, route)["reserve_paused"], false, "{route}");
+    }
+
+    let (status, receipt) = post_note(
+        &base,
+        "/unpause",
+        r#"{"direction":"robinhood","note":"rhn go"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{receipt}");
+    assert_eq!(receipt["action"], "unpause");
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(!ledger
+        .is_paused(ReserveDirection::RobinhoodReserve)
+        .unwrap());
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].target.as_deref(), Some("robinhood"));
+
+    // An unknown direction is still a 400 with nothing written.
+    let (status, _) = post_note(&base, "/pause", r#"{"direction":"mars","note":"x"}"#).await;
+    assert_eq!(status, 400);
+}
+
+/// `GET /submitters` on a server with neither submitter wired reports
+/// both as absent — never a zero balance for an address it does not
+/// know.
+#[tokio::test]
+async fn submitters_view_reports_absence_when_not_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let resp = client()
+        .get(format!("{base}/submitters"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["solana"].is_null());
+    assert!(body["robinhood"].is_null());
+    assert!(body["as_of"].is_i64());
+}
+
+/// The contract flags, when a reader is wired, fold into the view: a
+/// route the contract has disabled, or whose leg it has paused, is
+/// unavailable with the contract gate named — while a failed read is
+/// reported as `contract_unread` and closes nothing.
+#[tokio::test]
+async fn contract_flags_fold_into_the_route_view_and_unread_closes_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct FakeReader {
+        fail: AtomicBool,
+    }
+    impl robinhood_read::RobinhoodAdminReader for FakeReader {
+        fn contract_flags(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Option<robinhood_read::RobinhoodContractFlags>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if self.fail.load(Ordering::SeqCst) {
+                    return None;
+                }
+                Some(robinhood_read::RobinhoodContractFlags {
+                    deposits_paused: true,
+                    payouts_paused: false,
+                    route_enabled: vec![
+                        (crate::routes::Route::GlcToRhn, false),
+                        (crate::routes::Route::RhnToGlc, true),
+                        (crate::routes::Route::SolToRhn, true),
+                        (crate::routes::Route::RhnToSol, true),
+                    ],
+                    read_at: now_unix(),
+                })
+            })
+        }
+        fn submitter(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = robinhood_read::RobinhoodSubmitterRead> + Send + '_>>
+        {
+            Box::pin(async move {
+                robinhood_read::RobinhoodSubmitterRead {
+                    address: crate::evm::EvmAddress::from_bytes([7u8; 20]),
+                    balance_wei: Some(crate::evm::EvmU256::from_u128(5)),
+                    min_balance_wei: crate::evm::EvmU256::from_u128(10),
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let reader = Arc::new(FakeReader {
+        fail: AtomicBool::new(false),
+    });
+    let api = AdminApi::new(db_path.clone(), FakeSolanaRpc)
+        .with_robinhood_reader(reader.clone() as Arc<dyn robinhood_read::RobinhoodAdminReader>);
+
+    let view = api.routes().await.unwrap();
+    let find = |route: &str| view.routes.iter().find(|r| r.route == route).unwrap();
+    assert_eq!(view.robinhood_contract.availability, "available");
+    assert_eq!(view.robinhood_contract.deposits_paused, Some(true));
+    // GlcToRhn: routeEnabled=false on chain.
+    let r = find("GlcToRhn");
+    assert_eq!(r.contract_route_enabled, Some(false));
+    assert_eq!(r.contract_paused, Some(false), "payouts are not paused");
+    assert!(r.blockers.contains(&"contract_route_disabled".to_string()));
+    assert!(!r.available);
+    // RhnToGlc: enabled on chain but deposits are paused (Robinhood is
+    // its source).
+    let r = find("RhnToGlc");
+    assert_eq!(r.contract_route_enabled, Some(true));
+    assert_eq!(r.contract_paused, Some(true));
+    assert!(r.blockers.contains(&"contract_deposits_paused".to_string()));
+    // SolToRhn: enabled, payouts not paused: no contract blocker.
+    let r = find("SolToRhn");
+    assert!(!r.blockers.iter().any(|b| b.starts_with("contract_")));
+    // A Solana-only route never carries a contract field.
+    let r = find("GlcToSol");
+    assert_eq!(r.contract_route_enabled, None);
+    assert_eq!(r.contract_paused, None);
+
+    let submitters = api.submitters().await.unwrap();
+    let rhn = submitters.robinhood.unwrap();
+    assert_eq!(rhn.balance_wei.as_deref(), Some("5"));
+    assert_eq!(rhn.min_balance_wei, "10");
+    assert_eq!(rhn.funded, Some(false));
+    assert!(submitters.solana.is_none());
+
+    // The cache serves the read for CONTRACT_FLAGS_CACHE_SECS; a
+    // failing reader afterwards is reported as unread and adds no
+    // blocker.
+    reader.fail.store(true, Ordering::SeqCst);
+    let cached = api.routes().await.unwrap();
+    assert_eq!(cached.robinhood_contract.availability, "available");
+    {
+        let mut cache = api.contract_flags_cache.lock().await;
+        if let Some(flags) = cache.as_mut() {
+            flags.read_at -= CONTRACT_FLAGS_CACHE_SECS + 1;
+        }
+    }
+    let unread = api.routes().await.unwrap();
+    assert_eq!(unread.robinhood_contract.availability, "unavailable");
+    let r = unread
+        .routes
+        .iter()
+        .find(|r| r.route == "GlcToRhn")
+        .unwrap();
+    assert_eq!(r.contract_route_enabled, None);
+    assert!(r.warnings.contains(&"contract_unread".to_string()));
+    assert!(!r.blockers.iter().any(|b| b.starts_with("contract_")));
 }

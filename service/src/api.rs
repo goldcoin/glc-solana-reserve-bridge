@@ -975,6 +975,71 @@ pub struct RouteProbes {
     pub sol_to_glc: Option<AdmissionProbe>,
 }
 
+/// The `SolToGlc` probe — the Solana program's `per_transfer_limit`
+/// netted through the route fee — from inputs the caller already read.
+/// Pure, so `GET /chains` and the admin API's `GET /routes` strike the
+/// SAME probe from the same config and cannot disagree about what "a
+/// normal transfer" is. `None` fails closed (no probe → `SolToGlc` is
+/// reported unavailable with `AVAILABILITY_REASON_PROBE_UNAVAILABLE`).
+pub(crate) fn sol_to_glc_probe_from(
+    config: &accounts::BridgeConfigSnapshot,
+    decimals: u8,
+    route_fees: &crate::fees::RouteFees,
+    rate_book: Option<&crate::bridge_rate::RateBook>,
+    now: i64,
+) -> Option<AdmissionProbe> {
+    let route = crate::routes::Route::SolToGlc;
+    let gross = match crate::amount_conversion::SolanaAtomic(config.per_transfer_limit)
+        .to_canonical(decimals)
+    {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                per_transfer_limit = config.per_transfer_limit,
+                "per_transfer_limit does not widen to canonical; SolToGlc availability fails closed"
+            );
+            return None;
+        }
+    };
+    let fee_bps = match route_fees.fee_bps(route) {
+        Ok(bps) => bps,
+        Err(e) => {
+            tracing::warn!(error = %e, "SolToGlc is unpriced; availability fails closed");
+            return None;
+        }
+    };
+    // Goldcoin is the destination: scale 1. The probe is a CAPACITY
+    // heuristic (what a limit-sized deposit would ask of the reserve),
+    // never a settlement figure, so when the live book cannot quote it
+    // falls back to the fee rule alone — the route is closed for the
+    // rate's own reason by `route_availability` in that case, and the
+    // capacity figures stay renderable alongside it. No book at all is
+    // the fixed unit rate, which the fee rule alone reproduces exactly.
+    let quoted = rate_book.map(|book| book.quote(route, gross, fee_bps, now, 1));
+    let net = match quoted {
+        Some(Ok(struck)) => struck.quote.net_out.0,
+        Some(Err(crate::bridge_rate::RateError::Refused(_))) | None => {
+            match crate::amount_conversion::compute_fee_at_bps(gross, fee_bps) {
+                Ok(fb) => fb.net.0,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SolToGlc probe fee computation failed; fails closed");
+                    return None;
+                }
+            }
+        }
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "SolToGlc probe bridge quote failed; fails closed");
+            return None;
+        }
+    };
+    Some(AdmissionProbe {
+        gross_canonical: gross.0,
+        fee_bps,
+        net_destination_atomic: i64::try_from(net).ok()?.max(1),
+    })
+}
+
 /// The full availability verdict [`route_availability`] returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteAvailability {
@@ -1037,7 +1102,27 @@ pub enum BridgeRateVerdict {
 }
 
 impl BridgeRateVerdict {
-    fn view(&self) -> Option<RouteBridgeRateView> {
+    /// The verdict for `route` from an OPTIONAL rate book — `None` (no
+    /// book configured) is a fixed unit rate, exactly as `BridgeApi`
+    /// treats `RateBook::fixed_unit`. Shared with the admin API's
+    /// `GET /routes` so the operator view and `GET /chains` resolve the
+    /// rate through one function.
+    pub(crate) fn from_book(
+        book: Option<&crate::bridge_rate::RateBook>,
+        route: crate::routes::Route,
+        now: i64,
+    ) -> BridgeRateVerdict {
+        match book {
+            None => BridgeRateVerdict::Fixed,
+            Some(book) => match book.route_status(route, now) {
+                Ok((_, None)) => BridgeRateVerdict::Fixed,
+                Ok((_, Some(rate))) => BridgeRateVerdict::Live(rate),
+                Err(refusal) => BridgeRateVerdict::Refused(refusal),
+            },
+        }
+    }
+
+    pub(crate) fn view(&self) -> Option<RouteBridgeRateView> {
         match self {
             BridgeRateVerdict::Fixed => None,
             BridgeRateVerdict::Live(rate) => Some(RouteBridgeRateView {
@@ -1065,7 +1150,7 @@ impl BridgeRateVerdict {
     }
 
     /// The availability reason the verdict imposes, if any.
-    fn blocker(&self) -> Option<&'static str> {
+    pub(crate) fn blocker(&self) -> Option<&'static str> {
         match self {
             BridgeRateVerdict::Fixed => None,
             BridgeRateVerdict::Live(rate) if rate.band_exceeded => {
@@ -1232,7 +1317,7 @@ impl RouteCapabilities {
 /// and never the rule, so asking never moves a gate; and the automatic
 /// gate, the buffer thresholds and every resume policy are untouched —
 /// this changes what is REPORTED, never what is admitted.
-fn route_availability(
+pub(crate) fn route_availability(
     ledger: &Ledger,
     onchain: SolanaProgramPause,
     probes: RouteProbes,
@@ -3240,7 +3325,6 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         &self,
         config: &accounts::BridgeConfigSnapshot,
     ) -> Option<AdmissionProbe> {
-        let route = crate::routes::Route::SolToGlc;
         let decimals = match accounts::fetch_reserve_mint_decimals(
             &self.solana_rpc,
             &config.reserve_token_mint,
@@ -3256,53 +3340,13 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
                 return None;
             }
         };
-        let gross = match crate::amount_conversion::SolanaAtomic(config.per_transfer_limit)
-            .to_canonical(decimals)
-        {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    per_transfer_limit = config.per_transfer_limit,
-                    "per_transfer_limit does not widen to canonical; SolToGlc availability fails closed"
-                );
-                return None;
-            }
-        };
-        let fee_bps = match self.route_fees.fee_bps(route) {
-            Ok(bps) => bps,
-            Err(e) => {
-                tracing::warn!(error = %e, "SolToGlc is unpriced; availability fails closed");
-                return None;
-            }
-        };
-        // Goldcoin is the destination: scale 1. The probe is a CAPACITY
-        // heuristic (what a limit-sized deposit would ask of the reserve),
-        // never a settlement figure, so when the live book cannot quote it
-        // falls back to the fee rule alone — the route is closed for the
-        // rate's own reason by `route_availability` in that case, and the
-        // capacity figures stay renderable alongside it.
-        let net = match self.rate_book.quote(route, gross, fee_bps, now_unix(), 1) {
-            Ok(struck) => struck.quote.net_out.0,
-            Err(crate::bridge_rate::RateError::Refused(_)) => {
-                match crate::amount_conversion::compute_fee_at_bps(gross, fee_bps) {
-                    Ok(fb) => fb.net.0,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "SolToGlc probe fee computation failed; fails closed");
-                        return None;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SolToGlc probe bridge quote failed; fails closed");
-                return None;
-            }
-        };
-        Some(AdmissionProbe {
-            gross_canonical: gross.0,
-            fee_bps,
-            net_destination_atomic: i64::try_from(net).ok()?.max(1),
-        })
+        sol_to_glc_probe_from(
+            config,
+            decimals,
+            &self.route_fees,
+            Some(&self.rate_book),
+            now_unix(),
+        )
     }
 
     /// [`SolanaProgramPause`] and [`RouteProbes`] together, from ONE
@@ -3384,11 +3428,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
 
     /// The rate book's verdict for `route` at `now`, for the listings.
     fn bridge_rate_verdict(&self, route: crate::routes::Route, now: i64) -> BridgeRateVerdict {
-        match self.rate_book.route_status(route, now) {
-            Ok((_, None)) => BridgeRateVerdict::Fixed,
-            Ok((_, Some(rate))) => BridgeRateVerdict::Live(rate),
-            Err(refusal) => BridgeRateVerdict::Refused(refusal),
-        }
+        BridgeRateVerdict::from_book(Some(&self.rate_book), route, now)
     }
 
     /// Live rolling-24h-volume headroom remaining for one direction's
@@ -4145,6 +4185,12 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     })
                 }
                 CreateRequestOutcome::Paused => Err(ApiError::Paused),
+                // The route's own admission gate (schema v38): the same
+                // cause-agnostic copy as a pause, because which operator
+                // switch closed the route is an operator detail the
+                // admin API reports, not something this endpoint tells
+                // the public.
+                CreateRequestOutcome::RouteAdmissionClosed => Err(ApiError::Paused),
                 CreateRequestOutcome::WalletLimited { eligibility } => {
                     let (_, retry_after) = eligibility
                         .blocker()

@@ -76,13 +76,16 @@ Read-only (still authenticated):
 | `GET /manual-review` | the ManualReview backlog with reasons and, for SolToGlc, live recipient/source-wallet rate-limit `*_until` context |
 | `GET /rebalances`, `GET /rebalances/{id}` | `rebalance::assess` per direction + the request workflow rows |
 | `GET /audit-log` | the admin audit trail |
+| `GET /routes` | every route's effective state — enablement, its own admission gate, the destination reserve's gates, the Solana program and Robinhood contract flags, rate, counts, blockers (docs/39-admin-console-v2.md) |
+| `GET /submitters` | the Solana and Robinhood fee-payers' addresses and live balances |
 
 UI-executable mutations (each: mandatory note, audited, existing Ledger
 logic only):
 
 | Endpoint | Backing logic |
 |---|---|
-| `POST /pause`, `POST /unpause` | `Ledger::set_paused` (local reserve direction) — see "What local pause does and does not stop" below |
+| `POST /pause`, `POST /unpause` | `Ledger::set_paused` (local reserve direction: `goldcoin`, `solana`, or — since docs/39 — `robinhood`, whose unpause runs `guard::unpause_robinhood_reserve_guarded`) — see "What local pause does and does not stop" below |
+| `POST /routes/{route}/admission/close\|open` | `audited_set_route_admission` — the route's OWN admission gate, every route since schema v38; open runs the same three reserve safety checks as `/admission/open` |
 | `POST /admission/close` | `Ledger::set_admission` (goldcoin direction only, as in the CLI) |
 | `POST /admission/open` | `guard::open_admission_guarded` — invariant + UTXO-liquidity gates, shared verbatim with `glc-admin open-admission` |
 | `POST /manual-review/{id}/resume` | `Ledger::resume_manual_review_sol_to_glc`, called as-is |

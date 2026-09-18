@@ -379,7 +379,7 @@ impl InboundAdmissionGates {
     }
 
     /// Whether the mature-UTXO pool floor is satisfied.
-    fn utxo_liquidity_ok(&self) -> bool {
+    pub(crate) fn utxo_liquidity_ok(&self) -> bool {
         self.min_available_utxo_count == 0
             || self.available_utxo_count > self.min_available_utxo_count
     }
@@ -394,7 +394,7 @@ impl InboundAdmissionGates {
     /// ```
     ///
     /// rearranged around the already-computed headroom.
-    fn liquidity_buffer_ok(&self, net_destination_atomic: i64) -> bool {
+    pub(crate) fn liquidity_buffer_ok(&self, net_destination_atomic: i64) -> bool {
         self.admission_buffer_atomic <= 0
             || self.confirmed_headroom_atomic - net_destination_atomic
                 >= self.admission_buffer_atomic

@@ -865,6 +865,7 @@ pub async fn run_load_profile(
                             }
                             CreateRequestOutcome::InsufficientLiquidity { .. }
                             | CreateRequestOutcome::Paused
+                            | CreateRequestOutcome::RouteAdmissionClosed
                             | CreateRequestOutcome::WalletLimited { .. } => {
                                 requests_rejected_at_creation += 1;
                             }

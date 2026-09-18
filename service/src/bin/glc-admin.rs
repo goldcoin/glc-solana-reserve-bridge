@@ -106,49 +106,54 @@ admitted. See docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
       reopen threshold). See docs/09-runbook.md 'Confirmed-liquidity
       admission safety buffer'; `status` prints both figures.
 
-ROUTE-SCOPED ADMISSION (schema v25. The commands above are RESERVE-wide:
-`pause` is the emergency stop for everything drawing on a reserve, and
-`close-admission --direction goldcoin` closes SolToGlc AND RhnToGlc
-together, because both fold against the same GoldcoinReserve row.
+ROUTE-SCOPED ADMISSION (schema v25, every route since v38. The commands
+above are RESERVE-wide: `pause` is the emergency stop for everything
+drawing on a reserve, and `close-admission --direction goldcoin` closes
+SolToGlc AND RhnToGlc together, because both fold against the same
+GoldcoinReserve row.
 
-These close or open ONE inbound-to-Goldcoin route at a time, so SolToGlc
-can run while RhnToGlc is shut, or the reverse.
+These close or open ONE route at a time, so SolToGlc can run while
+RhnToGlc is shut, GlcToSol while RhnToSol is shut, or the reverse.
 
-*** BOTH AXES MUST BE OPEN. *** A route admits a new deposit only when its
-own gate AND every reserve-wide gate say yes. Opening a route never
+*** BOTH AXES MUST BE OPEN. *** A route admits a new transfer only when
+its own gate AND every reserve-wide gate say yes. Opening a route never
 unpauses a reserve, and unpausing a reserve never opens a route whose own
 gate an operator closed — reserve-wide pause remains the emergency stop
 and nothing here weakens it.
 
-SolToGlc and RhnToGlc have this gate (the two routes whose DESTINATION
-reserve is Goldcoin), and since Phase H so do SolToRhn and RhnToSol (whose
-source deposit is likewise observed on-chain and folded). GlcToSol and
-GlcToRhn are refused: their destination reserves are Solana and Robinhood,
-whose own pause is their control. This is a different axis from
-`robinhood-route-enable` below, which sets ENABLEMENT.
+All six routes carry this gate. On the four OBSERVED-deposit routes
+(SolToGlc, RhnToGlc, SolToRhn, RhnToSol) a closed gate parks each newly
+observed deposit in ManualReview at fold time. On the two REQUESTED-deposit
+routes (GlcToSol, GlcToRhn — schema v38) a closed gate refuses the new
+request at `POST /transfers`, before any row, reservation or deposit
+address exists; a request created before the gate closed keeps settling.
+This is a different axis from `robinhood-route-enable` below, which sets
+ENABLEMENT.
 
 Already-accepted obligations (anything already SourceFinalized or later)
 are NEVER affected — payout processing has never been gated by any
-admission flag and still isn't; this only ever blocks a NEW deposit from
+admission flag and still isn't; this only ever blocks a NEW transfer from
 being admitted.)
   glc-admin route-admission-show (--db PATH | --config PATH) [--json] [--porcelain]
-      READ-ONLY. Each inbound-to-Goldcoin route's own admission gate, the
-      reserve-wide pause and admission it is ANDed with, and whether the
-      route would admit a deposit right now — from the SAME evaluator the
-      folds and GET /chains use, so this listing and a fold cannot
-      disagree. Resolves nothing: a ledger with no `route_admission` table
-      (pre-v25) is reported as HAVING NO TABLE rather than as defaults.
-      Writes nothing, contacts no chain, loads no keypair, reads no secret.
-  glc-admin route-admission-close --db PATH --route <SolToGlc|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
-      Always allowed. New deposits on THAT ROUTE ONLY fold into
-      ManualReview with `route_admission_closed_at_fold` instead of
-      SourceFinalized, until re-opened. The other inbound route keeps
+      READ-ONLY. Each route's own admission gate, the reserve-wide pause
+      and admission it is ANDed with, and whether the route would admit a
+      transfer right now — from the SAME evaluator the folds, POST
+      /transfers and GET /chains use, so this listing and an admission
+      decision cannot disagree. Resolves nothing: a ledger with no
+      `route_admission` table (pre-v25) is reported as HAVING NO TABLE
+      rather than as defaults. Writes nothing, contacts no chain, loads no
+      keypair, reads no secret.
+  glc-admin route-admission-close --db PATH --route <GlcToSol|SolToGlc|GlcToRhn|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
+      Always allowed. New transfers on THAT ROUTE ONLY are held — parked
+      into ManualReview with `route_admission_closed_at_fold` on an
+      observed-deposit route, refused at POST /transfers on a
+      requested-deposit route — until re-opened. Every other route keeps
       running. Never automatic — only this command ever closes a route's
       admission, and nothing ever auto-reopens it.
       Parked requests stay recoverable (`resume-manual-review`,
       `manual-review-settle`) and refundable (`refund-manual-review`,
       `robinhood-refund`) exactly like any other fold-time park.
-  glc-admin route-admission-open --db PATH --route <SolToGlc|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
+  glc-admin route-admission-open --db PATH --route <GlcToSol|SolToGlc|GlcToRhn|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
       Refuses unconditionally (no override) unless the route's DESTINATION
       reserve passes the same three checks `open-admission` requires: the
       hard reserve invariant holds, the mature-UTXO floor is satisfied, and
@@ -6908,7 +6913,7 @@ fn cmd_route_admission_show(args: &[String]) -> Result<(), String> {
              binary of this version) against this ledger once to migrate.\n"
         );
     }
-    println!("ROUTE-SCOPED ADMISSION (schema v25 `route_admission`)");
+    println!("ROUTE-SCOPED ADMISSION (schema v25 `route_admission`, every route since v38)");
     println!(
         "  The route's own gate, ANDed with the reserve-wide gates beside it. A route admits a"
     );
@@ -7012,13 +7017,22 @@ fn cmd_route_admission(args: &[String], closed: bool) -> Result<(), String> {
         route.as_str()
     );
     if closed {
-        println!(
-            "NEW {} deposits will now park in ManualReview with \
-             `route_admission_closed_at_fold`. Already-accepted obligations are unaffected and \
-             keep processing. The other inbound-to-Goldcoin route is unchanged — check it with \
-             `glc-admin route-admission-show --db PATH`.",
-            route.as_str()
-        );
+        if route.as_direction().is_some_and(|d| d.source_is_goldcoin()) {
+            println!(
+                "NEW {} requests will now be refused at POST /transfers (no row, no reservation, \
+                 no deposit address). Requests created before this keep processing. Every other \
+                 route is unchanged — check with `glc-admin route-admission-show --db PATH`.",
+                route.as_str()
+            );
+        } else {
+            println!(
+                "NEW {} deposits will now park in ManualReview with \
+                 `route_admission_closed_at_fold`. Already-accepted obligations are unaffected and \
+                 keep processing. Every other route is unchanged — check with \
+                 `glc-admin route-admission-show --db PATH`.",
+                route.as_str()
+            );
+        }
     } else {
         println!(
             "This opens ONE gate. {} still needs its reserve unpaused and its reserve-wide \

@@ -95,6 +95,7 @@ pub mod auth;
 pub mod cli_command;
 pub mod glc_refund_exec;
 pub mod guard;
+pub mod robinhood_read;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -1081,7 +1082,7 @@ pub struct RebalancesView {
     pub requests: Vec<RebalanceView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AuditRowView {
     pub id: i64,
     pub at: i64,
@@ -1124,6 +1125,202 @@ pub struct AuditLogView {
 #[derive(Debug, Serialize)]
 pub struct WhoamiView {
     pub operator: String,
+}
+
+// ------------------------------------------ effective route state (v2) --
+
+/// `GET /routes` — the operator console's ONE authoritative view of every
+/// route (docs/39-admin-console-v2.md, "Effective route state model").
+///
+/// Each route's `available` is the SAME verdict `GET /chains` publishes
+/// — computed by [`crate::api::route_availability`] from the same
+/// [`crate::ledger::InboundAdmissionGates`] evaluator, the same Solana
+/// program pause read and the same `SolToGlc` probe — extended by the
+/// Robinhood custody contract's own flags when they were read. Nothing
+/// here is a second opinion about admission; the view DECOMPOSES the
+/// verdict into the gates behind it so an operator can see which one to
+/// act on, and names every closed gate rather than only the top-ranked
+/// one.
+#[derive(Debug, Serialize)]
+pub struct RoutesAdminView {
+    pub routes: Vec<EffectiveRouteView>,
+    /// The Solana program's live pause flags, shared by every Solana leg;
+    /// `null` when the `BridgeConfig` read failed — in which case every
+    /// Solana leg is reported as blocked (`onchain_unread`), the same
+    /// fail-closed rule `GET /chains` applies.
+    pub solana_program: Option<SolanaProgramPauseView>,
+    /// The Robinhood custody contract's flags, shared by every Robinhood
+    /// leg. `availability` is `available` | `unavailable` | `not_configured`.
+    pub robinhood_contract: RobinhoodContractFlagsView,
+    pub as_of: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SolanaProgramPauseView {
+    pub paused: bool,
+    pub release_paused: bool,
+    pub deposit_paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RobinhoodContractFlagsView {
+    pub availability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposits_paused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payouts_paused: Option<bool>,
+    /// `routeEnabled(route)` for the four routes the contract models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_enabled: Vec<RouteFlagView>,
+    /// When the flags were read; a cached read is reported with its own
+    /// age, never as "now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteFlagView {
+    pub route: String,
+    pub enabled: bool,
+}
+
+/// One route, every gate. Field groups mirror the AND in the design doc:
+/// enablement, the route's own admission, the destination reserve, the
+/// on-chain layers, the rate — then the verdict and the blockers.
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveRouteView {
+    pub route: String,
+    pub source_chain: String,
+    pub destination_chain: String,
+    /// The reserve this route's payout draws on — the one whose pause and
+    /// admission gates apply to it.
+    pub destination_reserve: String,
+    /// The reserve this route's deposit lands in.
+    pub source_reserve: String,
+    /// Every route the destination reserve's LOCAL PAUSE also stops,
+    /// excluding this one — what a "pause this route" action really
+    /// touches, spelled out so no console can hide it.
+    pub reserve_siblings: Vec<String>,
+    pub implemented: bool,
+    /// `RouteGate`'s three-place AND (config, `bridge_routes`, adapter).
+    pub enabled: bool,
+    /// Which enablement gate refused (`config` | `ledger` | `adapter`),
+    /// `null` when enabled.
+    pub disabled_by: Option<String>,
+    /// Whether an operator may write `bridge_routes.enabled` for this
+    /// route (the four Robinhood routes).
+    pub enablement_settable: bool,
+
+    /// The route's OWN admission gate (schema v38: every route).
+    pub route_admission_closed: bool,
+    pub route_admission_reason: Option<String>,
+    pub route_admission_updated_at: Option<i64>,
+
+    /// The destination reserve's LOCAL pause (`reserve_ledger.paused`).
+    pub reserve_paused: bool,
+    pub reserve_pause_reason: Option<String>,
+    /// The reserve-wide operator admission switch (Goldcoin reserve).
+    pub reserve_admission_closed: bool,
+    pub reserve_admission_reason: Option<String>,
+    /// The automatic confirmed-liquidity gate's persisted state.
+    pub liquidity_admission_closed: bool,
+    pub confirmed_headroom_atomic: Option<i64>,
+    pub admission_buffer_atomic: Option<i64>,
+    pub max_admissible_net_atomic: Option<i64>,
+    /// `true` when the destination reserve has no `reserve_ledger` row.
+    pub reserve_not_configured: bool,
+
+    /// Whether the Solana program's pause blocks this route's Solana leg.
+    /// `null` for a route with no Solana leg, or when the config could
+    /// not be read (then `blockers` carries `onchain_unread`).
+    pub onchain_blocked: Option<bool>,
+    /// The contract's `routeEnabled` for this route; `null` for a route
+    /// the contract does not model or when unread.
+    pub contract_route_enabled: Option<bool>,
+    /// The contract pause flag that applies to THIS route's Robinhood
+    /// leg (`depositsPaused` when Robinhood is the source, `payoutsPaused`
+    /// when it is the destination); `null` when not applicable or unread.
+    pub contract_paused: Option<bool>,
+
+    /// The route's bridge rate as `GET /chains` publishes it; `null` at a
+    /// fixed unit rate.
+    pub bridge_rate: Option<crate::api::RouteBridgeRateView>,
+    pub fee_bps: Option<u64>,
+
+    /// Requests in an active (non-terminal) state on this route.
+    pub pending_requests: i64,
+    pub manual_review_count: i64,
+    /// The newest audit row whose target is this route or its
+    /// destination reserve — the last operator touch.
+    pub last_audit: Option<AuditRowView>,
+
+    /// THE verdict, identical to `GET /chains`' `available` for this
+    /// route, ANDed with the contract flags when they were read.
+    pub available: bool,
+    /// The top-ranked gate, as `GET /chains` names it in
+    /// `availability_reason` (or a contract gate when that is what
+    /// closed the route).
+    pub primary_reason: Option<String>,
+    /// EVERY closed gate, most operator-actionable first. Empty when
+    /// available.
+    pub blockers: Vec<String>,
+    /// Conditions that do not close the route but the operator should
+    /// see (e.g. `contract_unread`, `probe_unavailable`).
+    pub warnings: Vec<String>,
+}
+
+/// `GET /submitters` — the two fee-payers' addresses and live balances.
+#[derive(Debug, Serialize)]
+pub struct SubmittersView {
+    pub solana: Option<SolanaSubmitterView>,
+    pub robinhood: Option<RobinhoodSubmitterView>,
+    pub as_of: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SolanaSubmitterView {
+    pub address: String,
+    /// `null` when the account read failed (never `0`).
+    pub lamports: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RobinhoodSubmitterView {
+    pub address: String,
+    /// Decimal wei, or `null` when the read failed.
+    pub balance_wei: Option<String>,
+    pub min_balance_wei: String,
+    /// `balance_wei >= min_balance_wei`; `null` when unread.
+    pub funded: Option<bool>,
+}
+
+/// `POST /routes/{route}/admission/{close|open}` path parsing.
+fn parse_route_admission_path(path: &str) -> Option<(crate::routes::Route, bool)> {
+    let rest = path.strip_prefix("/routes/")?;
+    let (route, verb) = rest.split_once("/admission/")?;
+    let route = route.parse::<crate::routes::Route>().ok()?;
+    match verb {
+        "close" => Some((route, true)),
+        "open" => Some((route, false)),
+        _ => None,
+    }
+}
+
+/// `direction` for `/pause` and `/unpause`: the two reserves
+/// [`parse_reserve_direction`] knows plus `robinhood`, whose local gate
+/// is written through its own guarded implementation
+/// ([`audited_set_robinhood_local_pause`]) — added for the operator
+/// console (docs/39-admin-console-v2.md) so every reserve's local pause
+/// has one audited HTTP path.
+fn parse_pause_direction(s: &str) -> Result<ReserveDirection, AdminError> {
+    match s {
+        "robinhood" => Ok(ReserveDirection::RobinhoodReserve),
+        other => parse_reserve_direction(other).map_err(|_| {
+            AdminError::BadRequest(format!(
+                "unknown direction {other:?} (expected goldcoin|solana|robinhood)"
+            ))
+        }),
+    }
 }
 
 // -------------------------------------------------------------- trait --
@@ -1249,6 +1446,19 @@ pub trait AdminSource: Send + Sync + 'static {
         &self,
         direction: ReserveDirection,
         paused: bool,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
+    /// `GET /routes` — see [`RoutesAdminView`].
+    fn routes(&self) -> BoxFut<'_, Result<RoutesAdminView, AdminError>>;
+    /// `GET /submitters` — see [`SubmittersView`].
+    fn submitters(&self) -> BoxFut<'_, Result<SubmittersView, AdminError>>;
+    /// `POST /routes/{route}/admission/{close|open}` — the route's OWN
+    /// admission gate ([`audited_set_route_admission`]).
+    fn set_route_admission(
+        &self,
+        route: crate::routes::Route,
+        closed: bool,
         note: String,
         actor: String,
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
@@ -1418,7 +1628,31 @@ pub struct AdminApi<SR: SolanaRpc> {
     /// until `with_rate_book`, which reports the endpoint as not
     /// configured.
     rate_book: Option<crate::bridge_rate::RateBook>,
+    /// The daemon's route gate, for `GET /routes`' enablement column.
+    /// Defaults to [`crate::routes::RouteGate::legacy_only`] — the
+    /// resolved state of a deployment with no Robinhood section — until
+    /// `with_route_gate` hands over the daemon's own.
+    route_gate: Arc<crate::routes::RouteGate>,
+    /// Read-only Robinhood contract and submitter reads for `GET /routes`
+    /// and `GET /submitters` (docs/39-admin-console-v2.md). `None` on a
+    /// deployment without a Robinhood contract; the views then report
+    /// the contract as `not_configured`, never as enabled or paused.
+    robinhood_reader: Option<Arc<dyn robinhood_read::RobinhoodAdminReader>>,
+    /// The most recent contract read, kept for
+    /// [`CONTRACT_FLAGS_CACHE_SECS`] so a console polling every few
+    /// seconds does not turn into one `eth_call` burst per poll. Age is
+    /// reported (`read_at`) so nothing renders a cached flag as live.
+    contract_flags_cache: tokio::sync::Mutex<Option<robinhood_read::RobinhoodContractFlags>>,
+    /// The Solana fee-payer's public key, for `GET /submitters`. Public
+    /// by nature — it appears on every release transaction — and the
+    /// admin API holds only the key's ADDRESS, never the key.
+    solana_submitter: Option<Pubkey>,
 }
+
+/// How long a Robinhood contract read serves `GET /routes` before it is
+/// re-read. Ten seconds is the console's own poll interval: one read per
+/// poll at most, never one per route.
+pub const CONTRACT_FLAGS_CACHE_SECS: i64 = 10;
 
 /// `GET /bridge-rate` — the live bridge-rate book, read-only
 /// (docs/38-elastic-bridge-rate.md, "Observability"). `mode` is
@@ -1611,7 +1845,36 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             // mistake for a real one.
             route_fees: crate::fees::RouteFees::new(),
             rate_book: None,
+            route_gate: Arc::new(crate::routes::RouteGate::legacy_only()),
+            robinhood_reader: None,
+            contract_flags_cache: tokio::sync::Mutex::new(None),
+            solana_submitter: None,
         }
+    }
+
+    /// The daemon's own route gate, so `GET /routes` reports enablement
+    /// from the same three-place AND every transfer is admitted by.
+    pub fn with_route_gate(mut self, route_gate: Arc<crate::routes::RouteGate>) -> Self {
+        self.route_gate = route_gate;
+        self
+    }
+
+    /// Read-only Robinhood contract and submitter reads — see
+    /// [`robinhood_read`]. Grants no capability: the reader holds no key
+    /// and the admin API still cannot broadcast a Robinhood transaction.
+    pub fn with_robinhood_reader(
+        mut self,
+        reader: Arc<dyn robinhood_read::RobinhoodAdminReader>,
+    ) -> Self {
+        self.robinhood_reader = Some(reader);
+        self
+    }
+
+    /// The Solana fee-payer's PUBLIC key, for `GET /submitters`' balance
+    /// read. The key itself is never handed to this API.
+    pub fn with_solana_submitter(mut self, submitter: Pubkey) -> Self {
+        self.solana_submitter = Some(submitter);
+        self
     }
 
     /// Shares the daemon's bridge-rate book, for `GET /bridge-rate`.
@@ -1671,19 +1934,317 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             .map_err(|_| AdminError::Ledger("could not open ledger".to_string()))
     }
 
-    fn now() -> i64 {
-        now_unix()
-    }
-
-    async fn fetch_onchain(&self) -> Result<OnchainView, AdminError> {
+    /// The Solana program's `BridgeConfig`, decoded — the read
+    /// `fetch_onchain` and `routes` share.
+    async fn read_bridge_config(&self) -> Result<accounts::BridgeConfigSnapshot, AdminError> {
         let config_account = self
             .rpc
             .get_account(&accounts::bridge_config_pda())
             .await
             .map_err(|e| AdminError::Upstream(format!("bridge config read failed: {e}")))?
             .ok_or_else(|| AdminError::Upstream("bridge config account not found".to_string()))?;
-        let config = accounts::decode_bridge_config(&config_account.data)
-            .map_err(|e| AdminError::Upstream(format!("bridge config decode failed: {e}")))?;
+        accounts::decode_bridge_config(&config_account.data)
+            .map_err(|e| AdminError::Upstream(format!("bridge config decode failed: {e}")))
+    }
+
+    /// The Robinhood contract flags, from the cache while it is younger
+    /// than [`CONTRACT_FLAGS_CACHE_SECS`], else re-read. `None` when no
+    /// reader is configured or the read failed (a stale cache entry is
+    /// NOT served in place of a failed read: the flags are then unread).
+    async fn contract_flags(&self) -> Option<robinhood_read::RobinhoodContractFlags> {
+        let reader = self.robinhood_reader.as_ref()?;
+        let mut cache = self.contract_flags_cache.lock().await;
+        if let Some(flags) = cache.as_ref() {
+            if Self::now() - flags.read_at < CONTRACT_FLAGS_CACHE_SECS {
+                return Some(flags.clone());
+            }
+        }
+        let fresh = reader.contract_flags().await;
+        *cache = fresh.clone();
+        fresh
+    }
+
+    /// One route's [`EffectiveRouteView`]. `probes`/`onchain` come from
+    /// the caller's single `bridge_config` read; `contract` from the one
+    /// contract read; `audit_rows` from the one audit query.
+    #[allow(clippy::too_many_arguments)]
+    fn effective_route(
+        &self,
+        ledger: &Ledger,
+        route: crate::routes::Route,
+        onchain: crate::api::SolanaProgramPause,
+        probes: crate::api::RouteProbes,
+        contract: Option<&robinhood_read::RobinhoodContractFlags>,
+        contract_configured: bool,
+        admission_rows: Option<&crate::ledger::RouteAdmissionState>,
+        audit_rows: &[AdminAuditRow],
+        now: i64,
+    ) -> Result<EffectiveRouteView, AdminError> {
+        use crate::ledger::InboundAdmissionBlocker;
+        use crate::routes::{Chain, Route};
+
+        let direction = route.as_direction();
+        let reserve_of = |chain: Chain| match chain {
+            Chain::Goldcoin => ReserveDirection::GoldcoinReserve,
+            Chain::Solana => ReserveDirection::SolanaReserve,
+            Chain::Robinhood => ReserveDirection::RobinhoodReserve,
+        };
+        let destination_reserve = reserve_of(route.destination_chain());
+        let source_reserve = reserve_of(route.source_chain());
+        let reserve_siblings: Vec<String> = Route::ALL
+            .iter()
+            .filter(|r| **r != route && reserve_of(r.destination_chain()) == destination_reserve)
+            .map(|r| r.as_str().to_string())
+            .collect();
+
+        // ---- enablement: the daemon's own three-place AND ----
+        let (enabled, disabled_by) = match self.route_gate.ensure_enabled(ledger, route) {
+            Ok(()) => (true, None),
+            Err(crate::routes::RouteGateError::Disabled { disabled_by, .. }) => {
+                (false, Some(disabled_by.as_str().to_string()))
+            }
+            Err(crate::routes::RouteGateError::Ledger(e)) => return Err(e.into()),
+        };
+
+        // ---- the route's own admission row (v38: every route) ----
+        let admission_row = admission_rows.and_then(|state| state.row(route));
+        let route_admission_closed = admission_row.is_some_and(|r| r.admission_closed);
+
+        // ---- the destination reserve's gates ----
+        let mut reserve_not_configured = false;
+        let reserve_paused = match ledger.is_paused(destination_reserve) {
+            Ok(p) => p,
+            Err(LedgerError::ReserveNotInitialized(_)) => {
+                reserve_not_configured = true;
+                false
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let (
+            reserve_pause_reason,
+            reserve_admission_closed,
+            reserve_admission_reason,
+            liquidity_closed,
+        ) = if reserve_not_configured {
+            (None, false, None, false)
+        } else {
+            (
+                ledger.pause_reason(destination_reserve)?,
+                ledger.is_admission_closed(destination_reserve)?,
+                ledger.admission_reason(destination_reserve)?,
+                ledger.is_liquidity_admission_closed(destination_reserve)?,
+            )
+        };
+        let gates = match direction.map(|d| ledger.inbound_admission_gates(d)) {
+            Some(Ok(g)) => Some(g),
+            Some(Err(LedgerError::ReserveNotInitialized(_))) | None => None,
+            Some(Err(e)) => return Err(e.into()),
+        };
+        let probe_net = match route {
+            Route::SolToGlc => probes.sol_to_glc.map(|p| p.net_destination_atomic),
+            _ => None,
+        };
+
+        // ---- the verdict, from the SAME function GET /chains uses ----
+        let rate = crate::api::BridgeRateVerdict::from_book(self.rate_book.as_ref(), route, now);
+        let rate_blocker = rate.blocker().map(str::to_string);
+        let verdict = crate::api::route_availability(ledger, onchain, probes, route, enabled, rate);
+
+        // ---- the on-chain layers ----
+        let onchain_blocked = direction.and_then(|d| {
+            let has_solana_leg =
+                route.source_chain() == Chain::Solana || route.destination_chain() == Chain::Solana;
+            has_solana_leg.then(|| onchain.blocks(d))
+        });
+        let (contract_route_enabled, contract_paused) = match (route.contract_route_id(), contract)
+        {
+            (None, _) => (None, None),
+            (Some(_), None) => (None, None),
+            (Some(_), Some(flags)) => (
+                flags.route_enabled(route),
+                Some(match route.source_chain() {
+                    Chain::Robinhood => flags.deposits_paused,
+                    _ => flags.payouts_paused,
+                }),
+            ),
+        };
+
+        // ---- every closed gate, most operator-actionable first ----
+        let mut blockers: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        if !enabled {
+            blockers.push(crate::api::AVAILABILITY_REASON_ROUTE_DISABLED.to_string());
+        }
+        if route_admission_closed {
+            blockers.push(
+                InboundAdmissionBlocker::RouteAdmissionClosed
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if reserve_admission_closed {
+            blockers.push(
+                InboundAdmissionBlocker::AdmissionClosed
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        if reserve_paused {
+            blockers.push(InboundAdmissionBlocker::ReservePaused.as_str().to_string());
+        }
+        if reserve_not_configured {
+            blockers.push(crate::api::AVAILABILITY_REASON_RESERVE_UNAVAILABLE.to_string());
+        }
+        if onchain_blocked == Some(true) {
+            blockers.push(crate::api::AVAILABILITY_REASON_ONCHAIN_PAUSED.to_string());
+        }
+        if route.contract_route_id().is_some() {
+            match contract {
+                Some(_) => {
+                    if contract_route_enabled == Some(false) {
+                        blockers.push("contract_route_disabled".to_string());
+                    }
+                    if contract_paused == Some(true) {
+                        blockers.push(
+                            match route.source_chain() {
+                                Chain::Robinhood => "contract_deposits_paused",
+                                _ => "contract_payouts_paused",
+                            }
+                            .to_string(),
+                        );
+                    }
+                }
+                None => warnings.push(
+                    if contract_configured {
+                        "contract_unread"
+                    } else {
+                        "contract_not_configured"
+                    }
+                    .to_string(),
+                ),
+            }
+        }
+        if let Some(reason) = &rate_blocker {
+            blockers.push(reason.clone());
+        }
+        if let Some(g) = &gates {
+            if !g.utxo_liquidity_ok() {
+                blockers.push(
+                    InboundAdmissionBlocker::UtxoLiquidityLow
+                        .as_str()
+                        .to_string(),
+                );
+            }
+            let net = probe_net.unwrap_or(1);
+            if g.liquidity_admission_closed || !g.liquidity_buffer_ok(net) {
+                blockers.push(
+                    InboundAdmissionBlocker::LiquidityBufferLow
+                        .as_str()
+                        .to_string(),
+                );
+            } else if net > g.confirmed_headroom_atomic {
+                blockers.push(
+                    InboundAdmissionBlocker::InsufficientCapacity
+                        .as_str()
+                        .to_string(),
+                );
+            }
+        }
+        if route == Route::SolToGlc && probes.sol_to_glc.is_none() {
+            blockers.push(crate::api::AVAILABILITY_REASON_PROBE_UNAVAILABLE.to_string());
+        }
+        blockers.dedup();
+        // The public verdict's own reason is always listed, even when the
+        // decomposition above did not name it (a new gate this view does
+        // not yet spell): the two can never silently disagree.
+        if let Some(reason) = &verdict.availability_reason {
+            if !blockers.contains(reason) {
+                blockers.push(reason.clone());
+            }
+        }
+        let contract_ok = contract_route_enabled != Some(false) && contract_paused != Some(true);
+        let available = verdict.available && contract_ok;
+        let primary_reason = verdict.availability_reason.clone().or_else(|| {
+            if available {
+                None
+            } else {
+                blockers.first().cloned()
+            }
+        });
+
+        // ---- counts and the last operator touch ----
+        let (pending_requests, manual_review_count) = match direction {
+            Some(d) => {
+                let mut pending = 0i64;
+                let mut manual = 0i64;
+                for (state, count) in ledger.request_state_counts(d)? {
+                    if state.is_active() {
+                        pending += count;
+                    }
+                    if state == RequestState::ManualReview {
+                        manual += count;
+                    }
+                }
+                (pending, manual)
+            }
+            None => (0, 0),
+        };
+        let reserve_name = direction_name(destination_reserve);
+        let last_audit = audit_rows
+            .iter()
+            .find(|r| {
+                r.target.as_deref() == Some(route.as_str())
+                    || r.target.as_deref() == Some(reserve_name)
+            })
+            .cloned()
+            .map(AuditRowView::from_row);
+
+        Ok(EffectiveRouteView {
+            route: route.as_str().to_string(),
+            source_chain: route.source_chain().as_str().to_string(),
+            destination_chain: route.destination_chain().as_str().to_string(),
+            destination_reserve: reserve_name.to_string(),
+            source_reserve: direction_name(source_reserve).to_string(),
+            reserve_siblings,
+            implemented: direction.is_some(),
+            enabled,
+            disabled_by,
+            enablement_settable: route.is_operator_settable(),
+            route_admission_closed,
+            route_admission_reason: admission_row.and_then(|r| r.admission_closed_reason.clone()),
+            route_admission_updated_at: admission_row.map(|r| r.updated_at),
+            reserve_paused,
+            reserve_pause_reason,
+            reserve_admission_closed,
+            reserve_admission_reason,
+            liquidity_admission_closed: liquidity_closed,
+            confirmed_headroom_atomic: gates.as_ref().map(|g| g.confirmed_headroom_atomic),
+            admission_buffer_atomic: gates.as_ref().map(|g| g.admission_buffer_atomic),
+            max_admissible_net_atomic: gates
+                .as_ref()
+                .map(|g| g.max_admissible_net_destination_atomic()),
+            reserve_not_configured,
+            onchain_blocked,
+            contract_route_enabled,
+            contract_paused,
+            bridge_rate: verdict.bridge_rate,
+            fee_bps: self.route_fees.fee_bps(route).ok(),
+            pending_requests,
+            manual_review_count,
+            last_audit,
+            available,
+            primary_reason,
+            blockers,
+            warnings,
+        })
+    }
+
+    fn now() -> i64 {
+        now_unix()
+    }
+
+    async fn fetch_onchain(&self) -> Result<OnchainView, AdminError> {
+        let config = self.read_bridge_config().await?;
 
         let now = Self::now();
         let mut rolling_windows = Vec::with_capacity(2);
@@ -3330,7 +3891,182 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            audited_set_local_pause(&mut ledger, direction, paused, &note, &actor)
+            match direction {
+                // The third reserve's local gate has its own guarded
+                // unpause (`guard::unpause_robinhood_reserve_guarded`);
+                // routing it here keeps ONE audited implementation per
+                // reserve rather than a second pause path.
+                ReserveDirection::RobinhoodReserve => {
+                    audited_set_robinhood_local_pause(&mut ledger, paused, &note, &actor)
+                }
+                ReserveDirection::GoldcoinReserve | ReserveDirection::SolanaReserve => {
+                    audited_set_local_pause(&mut ledger, direction, paused, &note, &actor)
+                }
+            }
+        })
+    }
+
+    fn routes(&self) -> BoxFut<'_, Result<RoutesAdminView, AdminError>> {
+        Box::pin(async move {
+            let now = Self::now();
+            // ONE `bridge_config` read for every Solana leg — the same
+            // fail-closed rule `GET /chains` applies: unreadable means
+            // every Solana leg is treated as paused and `SolToGlc` has
+            // no probe.
+            let (onchain, probes, solana_program) = match self.read_bridge_config().await {
+                Ok(config) => {
+                    let decimals = if config.reserve_token_mint == Pubkey::default() {
+                        None
+                    } else {
+                        accounts::fetch_reserve_mint_decimals(&self.rpc, &config.reserve_token_mint)
+                            .await
+                            .ok()
+                    };
+                    let probes = crate::api::RouteProbes {
+                        sol_to_glc: decimals.and_then(|d| {
+                            crate::api::sol_to_glc_probe_from(
+                                &config,
+                                d,
+                                &self.route_fees,
+                                self.rate_book.as_ref(),
+                                now,
+                            )
+                        }),
+                    };
+                    (
+                        crate::api::SolanaProgramPause::from_config(&config),
+                        probes,
+                        Some(SolanaProgramPauseView {
+                            paused: config.paused,
+                            release_paused: config.release_paused,
+                            deposit_paused: config.deposit_paused,
+                        }),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "GET /routes: bridge config unreadable; Solana legs fail closed");
+                    (
+                        crate::api::SolanaProgramPause::UNKNOWN,
+                        crate::api::RouteProbes::default(),
+                        None,
+                    )
+                }
+            };
+            let contract = self.contract_flags().await;
+            let robinhood_contract = match (&self.robinhood_reader, &contract) {
+                (None, _) => RobinhoodContractFlagsView {
+                    availability: crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED.to_string(),
+                    deposits_paused: None,
+                    payouts_paused: None,
+                    route_enabled: Vec::new(),
+                    read_at: None,
+                },
+                (Some(_), None) => RobinhoodContractFlagsView {
+                    availability: crate::robinhood::public::AVAILABILITY_UNAVAILABLE.to_string(),
+                    deposits_paused: None,
+                    payouts_paused: None,
+                    route_enabled: Vec::new(),
+                    read_at: None,
+                },
+                (Some(_), Some(flags)) => RobinhoodContractFlagsView {
+                    availability: crate::robinhood::public::AVAILABILITY_AVAILABLE.to_string(),
+                    deposits_paused: Some(flags.deposits_paused),
+                    payouts_paused: Some(flags.payouts_paused),
+                    route_enabled: flags
+                        .route_enabled
+                        .iter()
+                        .map(|(r, e)| RouteFlagView {
+                            route: r.as_str().to_string(),
+                            enabled: *e,
+                        })
+                        .collect(),
+                    read_at: Some(flags.read_at),
+                },
+            };
+            let ledger = self.open_ledger()?;
+            let admission_rows = ledger.route_admission_rows()?;
+            // The newest audit rows once, then the last touch per route
+            // is picked out of them — never one query per route.
+            let audit_rows = ledger.list_admin_audit(&AdminAuditFilter {
+                limit: Some(200),
+                ..AdminAuditFilter::default()
+            })?;
+            let mut routes = Vec::with_capacity(crate::routes::Route::ALL.len());
+            for route in crate::routes::Route::ALL {
+                routes.push(self.effective_route(
+                    &ledger,
+                    route,
+                    onchain,
+                    probes,
+                    contract.as_ref(),
+                    self.robinhood_reader.is_some(),
+                    admission_rows.as_ref(),
+                    &audit_rows,
+                    now,
+                )?);
+            }
+            Ok(RoutesAdminView {
+                routes,
+                solana_program,
+                robinhood_contract,
+                as_of: now,
+            })
+        })
+    }
+
+    fn submitters(&self) -> BoxFut<'_, Result<SubmittersView, AdminError>> {
+        Box::pin(async move {
+            let solana = match self.solana_submitter {
+                None => None,
+                Some(address) => Some(SolanaSubmitterView {
+                    address: address.to_string(),
+                    // An absent account is a zero balance — a real
+                    // figure; a failed read is `null`, never zero.
+                    lamports: match self.rpc.get_account(&address).await {
+                        Ok(account) => Some(account.map(|a| a.lamports).unwrap_or(0)),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Solana submitter balance read failed");
+                            None
+                        }
+                    },
+                }),
+            };
+            let robinhood = match &self.robinhood_reader {
+                None => None,
+                Some(reader) => {
+                    let read = reader.submitter().await;
+                    // Decimal wei, like the public API's Robinhood
+                    // figures; a balance beyond u128 (impossible for a
+                    // gas account) reads as unread rather than as a
+                    // hex word a UI would mis-parse.
+                    let decimal =
+                        |w: crate::evm::EvmU256| w.try_to_u128().ok().map(|v| v.to_string());
+                    Some(RobinhoodSubmitterView {
+                        address: read.address.to_checksum_string(),
+                        balance_wei: read.balance_wei.and_then(decimal),
+                        min_balance_wei: decimal(read.min_balance_wei).unwrap_or_default(),
+                        funded: read.balance_wei.map(|b| b >= read.min_balance_wei),
+                    })
+                }
+            };
+            Ok(SubmittersView {
+                solana,
+                robinhood,
+                as_of: Self::now(),
+            })
+        })
+    }
+
+    fn set_route_admission(
+        &self,
+        route: crate::routes::Route,
+        closed: bool,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
+        Box::pin(async move {
+            let mut ledger = self.open_ledger()?;
+            audited_set_route_admission(&mut ledger, route, closed, &note, &actor)
         })
     }
 
@@ -4030,6 +4766,14 @@ async fn handle<S: AdminSource>(
             Err(e) => error_response(e),
         },
         (&Method::GET, "/fee") => json_response(StatusCode::OK, &fee_view(&source.route_fees())),
+        (&Method::GET, "/routes") => match source.routes().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/submitters") => match source.submitters().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
         (&Method::GET, "/bridge-rate") => json_response(StatusCode::OK, &source.bridge_rate()),
         (&Method::GET, "/manual-review") => match source.manual_review().await {
             Ok(v) => json_response(StatusCode::OK, &v),
@@ -4092,7 +4836,7 @@ async fn handle<S: AdminSource>(
             match read_json::<DirectionNoteInput>(req).await {
                 Ok(input) => {
                     match (
-                        parse_reserve_direction(&input.direction),
+                        parse_pause_direction(&input.direction),
                         require_note(&input.note),
                     ) {
                         (Ok(direction), Ok(note)) => {
@@ -4153,7 +4897,23 @@ async fn handle<S: AdminSource>(
             }
         }
         (&Method::POST, other_path) => {
-            if let Some(request_id) = parse_glc_refund_execute_path(other_path) {
+            if let Some((route, closed)) = parse_route_admission_path(other_path) {
+                match read_json::<NoteInput>(req).await {
+                    Ok(input) => match require_note(&input.note) {
+                        Ok(note) => {
+                            match source
+                                .set_route_admission(route, closed, note.to_string(), actor)
+                                .await
+                            {
+                                Ok(v) => json_response(StatusCode::OK, &v),
+                                Err(e) => error_response(e),
+                            }
+                        }
+                        Err(e) => error_response(e),
+                    },
+                    Err(resp) => *resp,
+                }
+            } else if let Some(request_id) = parse_glc_refund_execute_path(other_path) {
                 // The ONE fund-moving route. Three independent gates
                 // before the handler is even reached, each fail-closed:
                 //

@@ -32,8 +32,9 @@ use glc_reserve_bridge_service::admin_api::{
 };
 use glc_reserve_bridge_service::amount_conversion::{compute_fee, CanonicalAtomic};
 use glc_reserve_bridge_service::ledger::{
-    Direction, InboundAdmissionBlocker, Ledger, RequestAmounts, RequestState, ReserveDirection,
-    RobinhoodDepositObservation, RobinhoodFinality, RobinhoodObservationRow, SolFoldOutcome,
+    CreateRequestOutcome, Direction, InboundAdmissionBlocker, Ledger, RequestAmounts, RequestState,
+    ReserveDirection, RobinhoodDepositObservation, RobinhoodFinality, RobinhoodObservationRow,
+    SolFoldOutcome,
 };
 use glc_reserve_bridge_service::robinhood::fold::FoldOutcome;
 use glc_reserve_bridge_service::routes::Route;
@@ -364,13 +365,19 @@ fn reopening_reserve_wide_pause_does_not_override_a_closed_route() {
 // ---------------------------------------------------------------------
 
 /// A freshly migrated ledger admits exactly what it admitted before v25
-/// (and v27): every seeded row open, no gate closed by a migration.
+/// (and v27, and v38): every seeded row open, no gate closed by a
+/// migration. Since v38 that is one row per route — all six.
 #[test]
 fn migration_preserves_existing_behaviour_every_route_open() {
     let ledger = setup();
     let state = ledger.route_admission_rows().unwrap().unwrap();
 
-    assert_eq!(state.rows.len(), 4);
+    assert_eq!(state.rows.len(), Route::ALL.len());
+    assert_eq!(
+        state.rows.iter().map(|r| r.route).collect::<Vec<_>>(),
+        Route::ALL.to_vec(),
+        "one row per route, in registry order"
+    );
     assert!(state.unknown_route_ids.is_empty());
     for row in &state.rows {
         assert!(
@@ -381,8 +388,14 @@ fn migration_preserves_existing_behaviour_every_route_open() {
         assert!(row.admission_closed_reason.is_none());
     }
 
-    // ...and both Goldcoin-bound routes actually admit, exactly as before.
-    for direction in [Direction::SolToGlc, Direction::RhnToGlc] {
+    // ...and both Goldcoin-bound routes actually admit, exactly as before,
+    // as does the Goldcoin-sourced route that draws on the configured
+    // Solana reserve.
+    for direction in [
+        Direction::SolToGlc,
+        Direction::RhnToGlc,
+        Direction::GlcToSol,
+    ] {
         assert_eq!(ledger.route_admission_blocker(direction).unwrap(), None);
     }
     // The Solana-bound cross route admits against the configured Solana
@@ -443,27 +456,89 @@ fn a_closed_route_survives_reopening_the_ledger() {
     assert_eq!(row.admission_closed_reason.as_deref(), Some("test closure"));
 }
 
-/// The write path refuses every route that has no route-level gate —
-/// through the AUDITED entry point, which is the only one an operator
-/// can reach. Exactly the two Goldcoin-SOURCED routes, whose deposits
-/// are requested through `POST /transfers` rather than observed.
+/// Since v38 the two Goldcoin-SOURCED routes carry a route-level gate
+/// too, and it is a REAL gate, not merely a writable row: closing
+/// `GlcToSol` through the AUDITED entry point refuses the next
+/// `POST /transfers`-style request on that route before any row or
+/// reservation exists, leaves `GlcToRhn` (same Goldcoin source) and
+/// `RhnToSol` (same Solana destination reserve) admitting, writes one
+/// audit row, and re-opening restores admission. A route an operator can
+/// close but no admission path consults would be the worst of both
+/// worlds; this pins that neither half drifts.
 #[test]
-fn the_audited_path_refuses_every_goldcoin_sourced_route() {
+fn the_audited_path_closes_a_goldcoin_sourced_route_and_the_request_path_honours_it() {
     let mut ledger = setup();
+    let create = |ledger: &mut Ledger, tag: u8| {
+        ledger
+            .create_request(
+                Direction::GlcToSol,
+                amounts(10 * GLC),
+                &[tag; 32],
+                None,
+                3600,
+                1_000,
+            )
+            .unwrap()
+    };
+    assert!(matches!(
+        create(&mut ledger, 1),
+        CreateRequestOutcome::Reserved { .. }
+    ));
+    let capacity_before = ledger
+        .available_capacity(ReserveDirection::SolanaReserve)
+        .unwrap();
+
     for route in [Route::GlcToSol, Route::GlcToRhn] {
-        let err = audited_set_route_admission(&mut ledger, route, true, "nope", "cli:test")
-            .expect_err("must refuse a route with no route-level admission gate");
-        let message = err.to_string();
-        assert!(
-            message.contains(route.as_str()),
-            "the refusal must name the route, got: {message}"
+        let receipt = audited_set_route_admission(&mut ledger, route, true, "nope", "cli:test")
+            .expect("every route carries a route-level admission gate since v38");
+        assert_eq!(receipt.action, "route_admission_close");
+        assert_eq!(receipt.target, route.as_str());
+        assert_eq!(receipt.old_value.as_deref(), Some("admission_closed=false"));
+        assert_eq!(receipt.new_value.as_deref(), Some("admission_closed=true"));
+    }
+
+    // Both rows recorded, every other route untouched.
+    let state = ledger.route_admission_rows().unwrap().unwrap();
+    assert_eq!(state.rows.len(), Route::ALL.len());
+    for row in &state.rows {
+        assert_eq!(
+            row.admission_closed,
+            matches!(row.route, Route::GlcToSol | Route::GlcToRhn),
+            "{}",
+            row.route.as_str()
         );
     }
 
-    // ...and nothing was written for any of them.
-    let state = ledger.route_admission_rows().unwrap().unwrap();
-    assert_eq!(state.rows.len(), 4);
-    assert!(state.rows.iter().all(|r| !r.admission_closed));
+    // The gate is consulted where a Goldcoin-sourced route is admitted:
+    // the request is refused, nothing is reserved.
+    assert_eq!(
+        create(&mut ledger, 2),
+        CreateRequestOutcome::RouteAdmissionClosed
+    );
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        capacity_before
+    );
+    assert_eq!(
+        ledger.route_admission_blocker(Direction::GlcToSol).unwrap(),
+        Some(InboundAdmissionBlocker::RouteAdmissionClosed)
+    );
+    // The sibling on the same destination reserve still admits.
+    assert_eq!(
+        ledger.route_admission_blocker(Direction::RhnToSol).unwrap(),
+        None
+    );
+
+    // Re-opening `GlcToSol` alone is the whole remedy for that route;
+    // `GlcToRhn` stays closed.
+    open_route(&mut ledger, Route::GlcToSol);
+    assert!(matches!(
+        create(&mut ledger, 3),
+        CreateRequestOutcome::Reserved { .. }
+    ));
+    assert!(ledger.route_admission_closed(Route::GlcToRhn).unwrap());
 }
 
 /// Each Solana<->Robinhood route carries its OWN admission gate (v27):

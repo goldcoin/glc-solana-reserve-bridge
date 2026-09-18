@@ -678,6 +678,12 @@ pub enum CreateRequestOutcome {
     InsufficientLiquidity { available_capacity: i64 },
     /// The destination reserve (or the bridge globally) is paused.
     Paused,
+    /// The route's OWN admission gate (`route_admission`, schema v38 for
+    /// the Goldcoin-sourced routes) is closed by an operator: no row is
+    /// created, no capacity is touched. Distinct from [`Self::Paused`]
+    /// so the two remain distinguishable in logs and tests; the public
+    /// API renders both with the same cause-agnostic copy.
+    RouteAdmissionClosed,
     /// The destination wallet — or the source wallet the caller declared
     /// — is still inside its rolling 24-hour window
     /// (`ledger::wallet_window`): no row is created, no capacity is
@@ -748,7 +754,7 @@ pub struct RouteAdmissionRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteAdmissionState {
     /// One row per recognised route, in `Route::ADMISSION_SETTABLE`
-    /// order.
+    /// order (every route, in `Route::ALL` order, since v38).
     pub rows: Vec<RouteAdmissionRow>,
     /// `route_id` values this build does not model, or models but does
     /// not consider admission-settable. Reported rather than dropped:
@@ -2072,14 +2078,13 @@ impl Ledger {
     ///
     /// # Which routes it accepts
     ///
-    /// Only [`crate::routes::Route::is_admission_settable`] routes:
-    /// `SolToGlc` and `RhnToGlc`, the two whose destination reserve is
-    /// Goldcoin. Everything else is
-    /// [`LedgerError::RouteAdmissionNotSettable`] — a validated refusal,
-    /// not a storage error, so an audited caller records it and rolls
-    /// back rather than treating it as a crash. The `route_admission`
-    /// table's own CHECK refuses the same set independently, so this is
-    /// the second of two guards rather than the only one.
+    /// Every [`crate::routes::Route::is_admission_settable`] route — since
+    /// schema v38, all six. The predicate is still consulted (and the
+    /// `route_admission` table's own CHECK still refuses the same set
+    /// independently) so that a future route variant without settlement
+    /// machinery is a validated [`LedgerError::RouteAdmissionNotSettable`]
+    /// refusal, not a storage error — an audited caller records it and
+    /// rolls back rather than treating it as a crash.
     ///
     /// # Why a missing row is an error rather than an insert
     ///
@@ -2103,26 +2108,11 @@ impl Ledger {
         if !route.is_admission_settable() {
             return Err(LedgerError::RouteAdmissionNotSettable {
                 route: route.as_str(),
-                detail: match route.as_direction() {
-                    // Goldcoin is this route's SOURCE, so it draws on the
-                    // Solana or Robinhood reserve and an
-                    // inbound-to-Goldcoin admission flag would gate a
-                    // reserve it has nothing to do with. Its controls are
-                    // that reserve's own pause and, for GlcToRhn, the
-                    // route enablement gate.
-                    Some(_) => {
-                        "route-level admission exists only for the two INBOUND-TO-GOLDCOIN routes \
-                         (SolToGlc, RhnToGlc); this route's destination reserve is not Goldcoin, \
-                         so its control is that reserve's own pause"
-                    }
-                    // No settlement machinery at all, so there is no
-                    // admission to open or close — the same structural
-                    // refusal `set_route_enabled` gives these two.
-                    None => {
-                        "this route has no settlement machinery (Route::as_direction is None) and \
-                         can never be executed, so it has no admission to open or close"
-                    }
-                },
+                // Unreachable for every route this build models (v38
+                // made all six settable), kept as the validated refusal
+                // a seventh variant would need until its gate is decided.
+                detail: "this route has no settlement machinery (Route::as_direction is None) and \
+                         can never be executed, so it has no admission to open or close",
             });
         }
         let n = self.conn.execute(
@@ -2767,6 +2757,19 @@ impl Ledger {
         if paused != 0 {
             tx.rollback()?;
             return Ok(CreateRequestOutcome::Paused);
+        }
+        // The route's OWN admission gate (schema v38 for the two
+        // Goldcoin-sourced routes this function serves). Read inside the
+        // same write transaction as the reservation below, so the state
+        // the decision was made against and the decision itself commit
+        // or roll back together — the same discipline both folds apply
+        // through `InboundAdmissionGates::read`. Ranked after the pause
+        // for the same reason the folds rank it: a paused reserve is the
+        // coarser, emergency statement. Nothing is parked: no row exists
+        // yet, so a refused request leaves no trace and reserves nothing.
+        if Self::route_admission_closed_in(&tx, crate::routes::Route::from(direction))? {
+            tx.rollback()?;
+            return Ok(CreateRequestOutcome::RouteAdmissionClosed);
         }
 
         // An empty declaration is no declaration: the column CHECK

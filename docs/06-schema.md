@@ -266,6 +266,17 @@ CREATE UNIQUE INDEX ux_vault_utxo_splits_source
     WHERE state != 'Abandoned';
 ```
 
+```sql
+-- v38 (docs/39-admin-console-v2.md): route_admission.route_id's CHECK is
+-- widened from the four observed-deposit routes to every route, and the
+-- two Goldcoin-sourced routes are seeded OPEN. Their gate is enforced at
+-- Ledger::create_request_from (POST /transfers) rather than at a fold.
+--   route_id TEXT PRIMARY KEY CHECK (route_id IN
+--     ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc','SolToRhn','RhnToSol')),
+INSERT OR IGNORE INTO route_admission (route_id, admission_closed, admission_closed_reason, updated_at)
+VALUES ('GlcToSol', 0, NULL, strftime('%s','now')), ('GlcToRhn', 0, NULL, strftime('%s','now'));
+```
+
 ## Migration notes
 
 Schema versioning follows the old bridge's numbered-migration convention (`db.rs`/`withdrawal_db.rs` used sequential `schema v1..v7` migrations applied at startup). This repo starts fresh at `v1` with the tables above — there is no live data to migrate from the old repo, so "migration" here means schema evolution within this repo going forward, not data migration from the old system. See [08-migration-strategy.md](08-migration-strategy.md).

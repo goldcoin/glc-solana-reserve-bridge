@@ -7189,6 +7189,83 @@ async fn closing_sol_to_glc_leaves_rhn_to_glc_available_on_chains() {
     assert!(route(&view, "GlcToSol").available);
 }
 
+/// Schema v38: the two Goldcoin-sourced routes carry the same
+/// route-scoped gate. Closing `GlcToSol` makes `GET /chains` report it
+/// unavailable with `route_admission_closed` — the same reason spelling
+/// the observed-deposit routes use — refuses a NEW `POST /transfers` with
+/// the cause-agnostic pause copy, leaves nothing behind, and touches no
+/// other route: `RhnToSol` (same Solana reserve) and `GlcToRhn` (same
+/// Goldcoin source) stay exactly as they were.
+#[tokio::test]
+async fn closing_glc_to_sol_admission_refuses_new_requests_and_touches_no_other_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let before = api.chains().await.unwrap();
+    assert!(route(&before, "GlcToSol").available);
+
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::GlcToSol, true, Some("route incident"))
+            .unwrap();
+    }
+    let view = api.chains().await.unwrap();
+    let glc = route(&view, "GlcToSol");
+    assert!(!glc.available);
+    assert_eq!(
+        glc.availability_reason.as_deref(),
+        Some("route_admission_closed")
+    );
+    assert!(glc.enabled, "admission is not enablement");
+    for other in ["SolToGlc", "GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol"] {
+        assert_eq!(
+            route(&view, other).available,
+            route(&before, other).available,
+            "{other} must be untouched by closing GlcToSol"
+        );
+        assert_eq!(
+            route(&view, other).availability_reason,
+            route(&before, other).availability_reason,
+            "{other}"
+        );
+    }
+
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: None,
+            source_address: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Paused), "{err}");
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(ledger
+        .requests_by_state(Direction::GlcToSol, RequestState::AwaitingDeposit)
+        .unwrap()
+        .is_empty());
+    drop(ledger);
+
+    // Re-opening is the whole remedy.
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::GlcToSol, false, None)
+            .unwrap();
+    }
+    assert!(route(&api.chains().await.unwrap(), "GlcToSol").available);
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
+        amount_atomic: AtomicU64(500_000),
+        recipient: Keypair::new().pubkey().to_string(),
+        route: None,
+        source_address: None,
+    })
+    .await
+    .unwrap();
+}
+
 /// Reopening the reserve-wide pause does not override a route-specific
 /// closed gate — asserted at the API boundary, where an operator would
 /// go looking after an incident.
