@@ -9643,3 +9643,86 @@ fn lock_unit_quote_for_tests(ledger: &Ledger, request_id: i64) {
         )
         .unwrap();
 }
+
+// ------------------------------- the auto-resume allowlist, pinned --
+
+/// `AUTO_RESUMABLE_MANUAL_REVIEW_REASONS` is EXACTLY the four approved
+/// reasons — spelled as literals here, not derived from the constants,
+/// so that adding a fifth entry (or renaming one) is a failing test and
+/// a deliberate decision, never a side effect.
+#[test]
+fn the_auto_resume_allowlist_is_exactly_the_four_approved_reasons() {
+    assert_eq!(
+        Ledger::AUTO_RESUMABLE_MANUAL_REVIEW_REASONS,
+        [
+            "utxo_liquidity_low_at_fold",
+            "liquidity_buffer_low_at_fold",
+            "wallet_source_24h_limit",
+            "wallet_destination_24h_limit",
+        ]
+    );
+    // Each is accepted by the predicate (the buffer reason only while
+    // the direction-wide liquidity gate is open — that is the existing
+    // rule, kept).
+    for reason in Ledger::AUTO_RESUMABLE_MANUAL_REVIEW_REASONS {
+        assert!(
+            Ledger::is_auto_resumable_manual_review_reason(Some(reason), true),
+            "{reason} must be eligible while the liquidity gate is open"
+        );
+    }
+    assert!(!Ledger::is_auto_resumable_manual_review_reason(
+        Some(Ledger::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW),
+        false
+    ));
+}
+
+/// Every OTHER `MANUAL_REVIEW_REASON_*` the ledger can write — operator
+/// closures, pauses, exhausted capacity, disabled routes, amount
+/// mismatches, foreign contracts, the rapid-burst (bot) hold, the
+/// bridge-rate parks — is refused by the predicate in BOTH liquidity
+/// gate positions, as is a missing reason and an arbitrary string. This
+/// is the list a future broadening would have to consciously shrink.
+#[test]
+fn every_other_manual_review_reason_is_never_auto_resumable() {
+    let never: Vec<&str> = vec![
+        Ledger::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
+        Ledger::MANUAL_REVIEW_REASON_ROUTE_ADMISSION_CLOSED,
+        Ledger::MANUAL_REVIEW_REASON_PAUSED,
+        Ledger::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
+        Ledger::MANUAL_REVIEW_REASON_ROUTE_DISABLED,
+        Ledger::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD,
+        Ledger::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT,
+        Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS,
+        Ledger::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY_AT_LOCK,
+        "deposit_amount_mismatch",
+        "deposit_amount_mismatch: expected 1 observed 2",
+        "late_deposit_no_capacity",
+        "foreign_contract:0xabc",
+        "operator_hold",
+        "",
+        "anything_else",
+    ]
+    .into_iter()
+    .chain(Ledger::BRIDGE_RATE_MANUAL_REVIEW_REASONS)
+    .collect();
+    for reason in never {
+        for liquidity_open in [true, false] {
+            assert!(
+                !Ledger::is_auto_resumable_manual_review_reason(Some(reason), liquidity_open),
+                "{reason:?} must never be auto-resumable (liquidity_open={liquidity_open})"
+            );
+        }
+    }
+    assert!(!Ledger::is_auto_resumable_manual_review_reason(None, true));
+    // The ONLY strings outside the four that the predicate accepts are
+    // the two pre-generalisation spellings of the SAME two wallet-window
+    // reasons, kept so rows written before the rename keep their exits.
+    // This is recognition of existing rows, not a fifth reason.
+    for legacy in ["recipient_rate_limited", "source_wallet_rate_limited"] {
+        assert!(Ledger::is_wallet_window_manual_review_reason(legacy));
+        assert!(Ledger::is_auto_resumable_manual_review_reason(
+            Some(legacy),
+            false
+        ));
+    }
+}
