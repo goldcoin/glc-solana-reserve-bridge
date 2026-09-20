@@ -1002,6 +1002,17 @@ async fn main() {
             }
             _ => None,
         };
+    // The `SolToRhn` fold's destination-bound check reads the SAME
+    // contract source the public endpoints publish `max_transfer_atomic`
+    // from (docs/40-destination-bound-admission.md), so the fold and the
+    // listing can never disagree about the contract's `outboundMax`.
+    orchestrator =
+        orchestrator.with_robinhood_destination_limits(robinhood_public_contract.as_ref().map(
+            |source| glc_reserve_bridge_service::solana::indexer::RobinhoodDestinationLimits {
+                source: Arc::clone(source),
+                buffer_bps: config.bridge_rate.destination_limit_buffer_bps,
+            },
+        ));
 
     let api_task = config.service.api_bind_addr.map(|api_addr| {
         let api_source = Arc::new(
@@ -1019,6 +1030,7 @@ async fn main() {
                 config.route_fees.clone(),
             )
             .with_rate_book(rate_book.clone())
+            .with_destination_limit_buffer_bps(config.bridge_rate.destination_limit_buffer_bps)
             .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract)
             .with_robinhood_deployment_verified(robinhood_deployment_verified)
             .with_program_compat(Arc::clone(&program_compat)),

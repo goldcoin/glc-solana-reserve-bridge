@@ -109,6 +109,19 @@ pub struct SolanaIndexer<R: SolanaRpc> {
     /// The fold is the lock for a Solana-sourced deposit, so the quote
     /// written here is the one the request settles at.
     rate_book: crate::bridge_rate::RateBook,
+    /// The Robinhood contract's live limits, for the `SolToRhn` fold's
+    /// destination-bound check (docs/40-destination-bound-admission.md)
+    /// — see [`SolanaIndexer::with_robinhood_destination_limits`]. `None`
+    /// = no contract configured; the fold then keeps its pre-existing
+    /// behaviour and `Settler::authorize_payout` remains the only check.
+    robinhood_limits: Option<RobinhoodDestinationLimits>,
+}
+
+/// See [`SolanaIndexer::with_robinhood_destination_limits`].
+pub struct RobinhoodDestinationLimits {
+    pub source: std::sync::Arc<dyn crate::robinhood::public::RobinhoodContractSource>,
+    /// `[bridge_rate] destination_limit_buffer_bps`.
+    pub buffer_bps: u64,
 }
 
 /// See [`SolanaIndexer::with_sol_to_rhn`].
@@ -163,7 +176,37 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             rate_book: crate::bridge_rate::RateBook::fixed_unit(
                 crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
             ),
+            robinhood_limits: None,
         }
+    }
+
+    /// Installs the Robinhood contract reader the `SolToRhn` fold checks
+    /// its quoted payout against (docs/40-destination-bound-admission.md).
+    ///
+    /// A Solana deposit is already irreversible when it is folded, so
+    /// this is not an admission refusal — it is the EARLIEST park: a
+    /// deposit whose quoted net would exceed the contract's `outboundMax`
+    /// (less the buffer) is parked `destination_payout_out_of_bounds` at
+    /// the fold, before any Robinhood capacity is held for it, instead of
+    /// at `Settler::authorize_payout` after it was. The settler's own
+    /// check is untouched and remains the second layer. The contract is
+    /// read once per tick, and only on a tick that has Robinhood-bound
+    /// deposits to fold; an unreadable contract is logged and the fold
+    /// proceeds as before (the settler's check still refuses), because a
+    /// read failure must not park every deposit of a healthy route.
+    pub fn with_robinhood_destination_limits(
+        mut self,
+        limits: Option<RobinhoodDestinationLimits>,
+    ) -> Self {
+        self.set_robinhood_destination_limits(limits);
+        self
+    }
+
+    /// The in-place form of
+    /// [`SolanaIndexer::with_robinhood_destination_limits`], for a caller
+    /// that has already handed this indexer to the orchestrator.
+    pub fn set_robinhood_destination_limits(&mut self, limits: Option<RobinhoodDestinationLimits>) {
+        self.robinhood_limits = limits;
     }
 
     /// Installs the bridge-rate book every fold strikes its quote from
@@ -262,14 +305,49 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             f.route_gate
                 .is_enabled(&self.ledger, crate::routes::Route::SolToRhn)
         });
-        for (index, maybe_account) in new_indices.iter().zip(fetched) {
-            let account =
-                maybe_account.ok_or(SolanaIndexerError::MissingObligationAccount(*index))?;
-            let snap =
-                decode_withdrawal_obligation(&account.data).map_err(SolanaIndexerError::Rpc)?;
+        let snaps = fetched
+            .into_iter()
+            .zip(new_indices.iter())
+            .map(|(maybe_account, index)| {
+                let account =
+                    maybe_account.ok_or(SolanaIndexerError::MissingObligationAccount(*index))?;
+                decode_withdrawal_obligation(&account.data).map_err(SolanaIndexerError::Rpc)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // The contract's limits, read ONCE per tick and only when this
+        // tick has a Robinhood-bound deposit to check them against
+        // (docs/40-destination-bound-admission.md). `None` = no contract
+        // configured, or this read failed (logged): the fold then makes
+        // no destination-bound decision and the settler's check decides.
+        let robinhood_limits = match (&self.robinhood_limits, sol_to_rhn_open) {
+            (Some(limits), Some(_))
+                if snaps
+                    .iter()
+                    .any(|s| destination_is_robinhood(&s.glc_address)) =>
+            {
+                let status = limits.source.state().await;
+                let read = crate::api::destination_limits_from(None, &status);
+                if read.robinhood_unavailable {
+                    tracing::warn!(
+                        "Robinhood contract limits unreadable this tick; SolToRhn deposits fold \
+                         without the destination-bound check (settlement still enforces it)"
+                    );
+                }
+                Some((read, limits.buffer_bps))
+            }
+            _ => None,
+        };
+        for (index, snap) in new_indices.iter().zip(snaps) {
             if let (Some(fold), Some(route_open)) = (&self.sol_to_rhn, sol_to_rhn_open) {
                 if destination_is_robinhood(&snap.glc_address) {
-                    self.fold_to_robinhood(&snap, fold.fee_bps, solana_decimals, route_open, now)?;
+                    self.fold_to_robinhood(
+                        &snap,
+                        fold.fee_bps,
+                        solana_decimals,
+                        route_open,
+                        robinhood_limits.as_ref(),
+                        now,
+                    )?;
                     continue;
                 }
             }
@@ -377,6 +455,7 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
         fee_bps: u64,
         solana_decimals: u8,
         route_open: bool,
+        robinhood_limits: Option<&(crate::api::DestinationLimits, u64)>,
         now: i64,
     ) -> Result<(), SolanaIndexerError> {
         let index = snap.index;
@@ -435,9 +514,45 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
         )
         .err()
         .map(|e| format!("below source minimum: {e}"));
+        // The destination-bound check at the fold's own locked prices
+        // (docs/40-destination-bound-admission.md): the SAME derivation
+        // `POST /transfers` admits a Goldcoin deposit with, so a
+        // Robinhood-bound Solana deposit whose quoted payout the contract
+        // would refuse is parked `destination_payout_out_of_bounds` HERE
+        // — before any Robinhood capacity is held — and not first at
+        // `Settler::authorize_payout`. A limit that could not be read
+        // makes no decision (see `with_robinhood_destination_limits`).
+        // A refused rate carries no quote and is parked for the refusal
+        // (`pricing.park`); there is then no price to check a bound at.
+        let over_destination_bound = robinhood_limits.zip(pricing.quote.as_ref()).and_then(
+            |((limits, buffer_bps), quote)| match crate::api::max_transfer_from(
+                crate::routes::Route::SolToRhn,
+                limits,
+                Some(fee_bps),
+                Some(quote.rail_prices()),
+                *buffer_bps,
+            ) {
+                crate::api::MaxTransfer::Known(max) if gross_canonical.0 > max.0 => {
+                    tracing::warn!(
+                        obligation_index = index,
+                        gross_canonical = gross_canonical.0,
+                        max_transfer_canonical = max.0,
+                        "SolToRhn deposit exceeds the destination-bound maximum at its locked \
+                         quote; parking at the fold"
+                    );
+                    Some(
+                        crate::ledger::Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            },
+        );
         let refusal = match recipient.as_ref().err() {
             Some(destination) => Some(destination.clone()),
-            None => below_minimum.or_else(|| pricing.park.map(str::to_string)),
+            None => below_minimum
+                .or(over_destination_bound)
+                .or_else(|| pricing.park.map(str::to_string)),
         };
         self.ledger.fold_sol_deposit_to_robinhood(
             index,

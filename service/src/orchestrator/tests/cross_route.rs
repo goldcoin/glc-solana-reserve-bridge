@@ -662,6 +662,160 @@ async fn a_malformed_robinhood_destination_parks_as_sol_to_rhn_never_as_sol_to_g
     }
 }
 
+/// docs/40-destination-bound-admission.md at the fold: a Robinhood-bound
+/// Solana deposit whose quoted payout exceeds the contract's `outboundMax`
+/// (less the buffer) is parked `destination_payout_out_of_bounds` AT THE
+/// FOLD — before any Robinhood capacity is held for it — while one at
+/// the maximum folds payable; and a contract that cannot be read makes
+/// no decision (the settler's own check still refuses).
+#[tokio::test]
+async fn a_sol_to_rhn_deposit_above_the_outbound_max_derived_maximum_parks_at_the_fold() {
+    use crate::bridge_rate::{max_source_for_destination_limit, RailPrices};
+    use crate::robinhood::testkit::{MockNode, BRIDGE};
+    use crate::solana::indexer::RobinhoodDestinationLimits;
+
+    // outboundMax 0.06 GLC (18 dp); 450 bps; unit rate; 25 % buffer →
+    // the largest gross whose net fits 0.045 GLC.
+    let node = MockNode::new(BRIDGE);
+    node.with(|s| {
+        s.contract.limits.outbound_max = crate::evm::EvmU256::from_u128(60_000_000_000_000_000)
+    });
+    let max = max_source_for_destination_limit(
+        CanonicalAtomic(6_000_000),
+        RailPrices::unit(0),
+        450,
+        1,
+        2_500,
+    )
+    .unwrap()
+    .0;
+    assert_eq!(max, 4_712_041);
+    let limits = || {
+        Some(RobinhoodDestinationLimits {
+            source: Arc::new(crate::robinhood::public::LiveRobinhoodContractSource::new(
+                node.clone(),
+                BRIDGE,
+            )),
+            buffer_bps: 2_500,
+        })
+    };
+    // Mint units (6 dp) are canonical / 100.
+    for (mint_units, expect_parked, why) in [
+        (max / 100, false, "at the maximum: payable"),
+        (
+            max / 100 + 1,
+            true,
+            "one mint unit above: parked at the fold",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ledger.sqlite3");
+        {
+            let mut ledger = Ledger::open(&db_path).unwrap();
+            configure_every_reserve(&mut ledger);
+        }
+        let gate = open_cross_route_gate(&db_path);
+        let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+        let attestation_signers = attestation_signers();
+        let solana_rpc = sol_to_rhn_node_with_deposit(
+            &attestation_signers,
+            EVM_RECIPIENT_TEXT.as_bytes(),
+            mint_units,
+        );
+        let (vault, vault_signers) = vault_and_signers();
+        let mut orchestrator = build_orchestrator(
+            &db_path,
+            goldcoin_rpc,
+            Arc::clone(&solana_rpc),
+            vault,
+            vault_signers,
+            attestation_signers,
+        )
+        .with_sol_to_rhn(CrossRouteFold {
+            fee_bps: 450,
+            route_gate: gate,
+        })
+        .with_robinhood_destination_limits(limits());
+        let report = orchestrator.tick(10).await;
+        assert_eq!(report.errors, Vec::<String>::new(), "{why}");
+        let request = orchestrator
+            .ledger()
+            .transfers_page(None, None, None, 10)
+            .unwrap()
+            .pop()
+            .expect("one request");
+        assert_eq!(request.direction, Direction::SolToRhn, "{why}");
+        assert_eq!(request.gross_amount_atomic, mint_units * 100, "{why}");
+        let (_, _, reserved, _) = orchestrator
+            .ledger()
+            .reserve_snapshot(ReserveDirection::RobinhoodReserve)
+            .unwrap();
+        if expect_parked {
+            assert_eq!(request.state, RequestState::ManualReview, "{why}");
+            assert_eq!(
+                request.manual_review_note.as_deref(),
+                Some(Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS),
+                "{why}"
+            );
+            assert_eq!(reserved, 0, "{why}: no Robinhood capacity held");
+            // Refundable on Solana, like every other fold-time park.
+            assert_eq!(
+                orchestrator
+                    .ledger()
+                    .solana_refund_db_checks(request.id)
+                    .unwrap()
+                    .first_failure_for_begin(),
+                None,
+                "{why}"
+            );
+        } else {
+            assert_eq!(request.state, RequestState::SourceFinalized, "{why}");
+            assert_eq!(reserved, request.net_destination_atomic, "{why}");
+        }
+    }
+
+    // An unreadable contract: the deposit above the maximum folds as it
+    // did before this check existed (payable at the fold; the settler
+    // refuses it later), never parked on a read failure.
+    node.fail_calls("node down");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_every_reserve(&mut ledger);
+    }
+    let gate = open_cross_route_gate(&db_path);
+    let attestation_signers = attestation_signers();
+    let solana_rpc = sol_to_rhn_node_with_deposit(
+        &attestation_signers,
+        EVM_RECIPIENT_TEXT.as_bytes(),
+        max / 100 + 1,
+    );
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::new(MockGoldcoinRpc::new()),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    )
+    .with_sol_to_rhn(CrossRouteFold {
+        fee_bps: 450,
+        route_gate: gate,
+    })
+    .with_robinhood_destination_limits(limits());
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    let request = orchestrator
+        .ledger()
+        .transfers_page(None, None, None, 10)
+        .unwrap()
+        .pop()
+        .expect("one request");
+    assert_eq!(request.state, RequestState::SourceFinalized);
+}
+
 #[tokio::test]
 async fn a_goldcoin_bound_solana_deposit_still_folds_as_sol_to_glc_with_classification_on() {
     let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
