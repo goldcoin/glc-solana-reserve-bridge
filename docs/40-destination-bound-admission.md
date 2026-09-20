@@ -3,24 +3,26 @@
 **Hotfix, 2026-09-20.** No schema change. Branch
 `fix/destination-bound-admission`.
 
-**What this is, and is not.** Large elastic payouts are INTENDED: at a live
-rate of ~17 Solana units per Goldcoin unit, 50 000 GLC (L1) paying out
-~830 000 GLC (Solana) is correct bridge economics. This document adds a
-*guard*, not an economic cap: the bridge refuses — before a deposit address
-exists — only what the destination chain literally cannot pay in one
-release, and it publishes that figure so a UI can cap its entry at it. The
-figure is derived from the destination's LIVE per-transfer limit, so it is
-whatever the operators make it: the Solana program's `per_transfer_limit`
-is admin-gated-immediate (`glc-admin set-limit --field per-transfer`, no
-redeploy), the Robinhood contract's `outboundMax` is a 2-of-3 `setLimits`.
-The 2026-09-18 incident was a LIMIT sized for a unit rate (50 000) meeting
-an elastic one; the remedy is to size the limit for the intended payouts,
-and then this guard only fires on a rate spike beyond that sizing.
+**SOURCE TRANSFER LIMIT vs DESTINATION PAYOUT CAP (design decision,
+2026-09-20).** Two different things, deliberately kept apart:
 
-This document is the canonical cross-reference target
-("docs/40-destination-bound-admission.md") named in
-`service/src/bridge_rate.rs`, `service/src/api.rs`,
-`service/src/solana/indexer.rs` and `service/src/config.rs`.
+| | Source transfer limit | Destination payout cap |
+|---|---|---|
+| What | the largest amount a user may SEND: **50 000 GLC**, every route (`min_transfer::SOURCE_MAXIMUM_CANONICAL`; 100 GLC minimum beside it) | a chain's own per-transfer ceiling on what ONE settlement may pay: the Solana program's `per_transfer_limit`, the Robinhood contract's `outboundMax` |
+| Nature | the product's economic rule; a policy constant; does not move with any rate | settlement CAPACITY, sized by operators to permit every legitimate payout a ≤ 50 000 GLC transfer can produce at the elastic rate |
+| Published as | `RouteView::max_transfer_atomic` — what a UI caps its entry at | `RouteView::destination_admissible_atomic` (as a source amount) + `destination_capacity_sufficient` — an operator signal |
+| Refusal | `400 above_source_maximum` at quote/create; a chain-sourced deposit above it folds PARKED (`above source maximum`, recoverable), like a sub-minimum one | `400 destination_payout_out_of_bounds` at quote/create, fail-closed, only when the destination genuinely cannot settle the amount in one release; the park at settlement stays as the second layer |
+
+Large elastic payouts are INTENDED: 50 000 GLC (L1) → ~830 000 GLC (Solana)
+at 16.6×, or ~947 000 at 19.5×, is correct bridge behaviour. The
+destination-derived figure is therefore NEVER used to lower the user's
+maximum. When it is below 50 000 GLC the bridge says so (`destination_
+capacity_sufficient = false`, and a quote above it is refused with both
+figures in the error) and the remedy is an operator sizing the cap
+(`glc-admin set-limit --field per-transfer`, no redeploy; Robinhood
+`setLimits` under 2-of-3) — not a smaller limit for the user. The
+2026-09-18 incident was a cap sized for a unit rate (50 000) meeting an
+elastic one.
 
 ## The defect
 
@@ -109,11 +111,11 @@ unbounded.**
 
 | Surface | Routes | Behaviour |
 |---|---|---|
-| `POST /transfers` (`BridgeApi::create_goldcoin_deposit_transfer`) | `GlcToSol`, `GlcToRhn` | After the quote is struck and the band checked, before the rolling window, before `create_request_from`: `gross > max` → **400** `reason = destination_payout_out_of_bounds` with `max_transfer_atomic` / `max_transfer_display` in the body. `Unknown` → **503** (`Upstream`): refused, never admitted on a guess. No row, no deposit address. |
+| `POST /transfers` (`BridgeApi::create_goldcoin_deposit_transfer`) | `GlcToSol`, `GlcToRhn` | After the quote is struck and the band checked, before the rolling window, before `create_request_from`: `gross > source limit` → **400** `above_source_maximum`; `gross > destination capacity` → **400** `destination_payout_out_of_bounds` with `destination_admissible_*` AND `max_transfer_*` (the unchanged user limit) in the body. `Unknown` → **503** (`Upstream`): refused, never admitted on a guess. No row, no deposit address. |
 | `POST /quote` | all six | The same check at the quote's own prices, so a quote is never published for an amount a create would refuse. Successful quotes carry `max_transfer_atomic`. |
 | `SolanaIndexer` fold (`fold_to_robinhood`) | `SolToRhn` | A Solana deposit is irreversible when it is folded, so this is the EARLIEST park, not a refusal: `gross > max` at the fold's locked prices → parked `destination_payout_out_of_bounds` at the fold, before any Robinhood capacity is held, refundable on Solana. The contract is read once per tick and only on a tick with a Robinhood-bound deposit; an unreadable contract makes no decision (logged) — the settler's check still refuses — because a read failure must not park every deposit of a healthy route. |
-| `GET /chains`, `GET /robinhood/reserve` | all six | Every `RouteView` carries `max_transfer_atomic` and `max_transfer_display`. A bounded route whose maximum is `Unknown` is **not advertised**: `available = false`, `availability_reason = destination_limit_unavailable` (ranked after every operator gate). |
-| `GET /limits` | `GlcToSol` | `max_transfer_atomic` beside the program's own `per_transfer_limit`. |
+| `GET /chains`, `GET /robinhood/reserve` | all six | Every `RouteView` carries `max_transfer_atomic` (the SOURCE limit, capped only by the source chain's own deposit ceiling), `destination_admissible_atomic` (the capacity) and `destination_capacity_sufficient`. A capped route whose capacity is `Unknown` is **not advertised**: `available = false`, `availability_reason = destination_limit_unavailable` (ranked after every operator gate). A capacity BELOW the limit does not close the route — smaller transfers still work. |
+| `GET /limits` | `GlcToSol` | `max_transfer_atomic` (source limit) and `destination_admissible_atomic` beside the program's own `per_transfer_limit`. |
 
 Settlement (`Orchestrator::release_out_of_bounds`,
 `Settler::authorize_payout`, `Ledger::park_for_destination_bounds`) is
@@ -164,42 +166,45 @@ settlement park exists for, and it is why the park stays.
 ## Public API contract (for the bridge UI)
 
 - `GET /chains` → `routes[].max_transfer_atomic` (string, canonical
-  8-decimal units of the SOURCE asset) and `routes[].max_transfer_display`
-  (decimal string). **The UI must cap its amount entry at this value,
-  render it ("Max … GLC"), and never derive or hardcode it.** It moves
-  with the rate, the fee, the destination bound, the decimals and the
-  buffer, and it is absent for an unbounded route or one that is not
-  currently advertised.
-- `POST /quote` → the same two fields on success; a gross above the
-  maximum fails `400` with `reason = "destination_payout_out_of_bounds"`,
-  `max_transfer_atomic` and `max_transfer_display` in the error body, so
-  the UI can show the maximum in its validation message before the user
-  can create the transfer.
+  8-decimal units of the SOURCE asset) and `routes[].max_transfer_display`:
+  the SOURCE transfer limit. **The UI caps its amount entry at this value,
+  renders it ("Max … GLC"), and never derives or hardcodes it.** It does
+  not move with the rate. `routes[].destination_admissible_atomic` /
+  `_display` and `destination_capacity_sufficient` describe what the
+  destination can settle right now; a UI may show them as a warning,
+  never as the user's limit.
+- `POST /quote` → the same fields on success; a gross above the source
+  limit fails `400 reason = "above_source_maximum"` with
+  `max_transfer_*`; a gross the destination cannot settle fails `400
+  reason = "destination_payout_out_of_bounds"` with
+  `destination_admissible_*` AND `max_transfer_*` in the error body, so
+  the UI can explain both before the user can create the transfer.
 - `POST /transfers` → the same refusal, with the same body. The UI is
   never the only enforcement layer.
 - `GET /limits` → `max_transfer_atomic` / `max_transfer_display` for
   `GlcToSol`.
 - Existing fields, `min_transfer_atomic` included, are unchanged.
 
-## The limit is the economic knob
+## Sizing the destination cap
 
-The published maximum scales linearly with the destination limit, with no
-code or config change (`api::tests::destination_bound::raising_per_
-transfer_limit_raises_the_maximum_without_a_code_change`). At the
-2026-09-20 live rate (Goldcoin 758 565 116 e12, Solana 44 009 955 e12,
-i.e. 17.24; 300 bps; 25 % buffer):
+The destination capacity scales linearly with the cap, with no code or
+config change, while the published user maximum stays 50 000 GLC
+(`api::tests::destination_bound::raising_per_transfer_limit_raises_the_
+destination_capacity_not_the_user_limit`). At the 2026-09-20 live rate
+(Goldcoin 758 565 116 e12, Solana 44 009 955 e12, i.e. 17.24; 300 bps;
+25 % buffer):
 
-| `per_transfer_limit` (GLC on Solana) | max source (GLC L1) |
-|---|---|
-| 50 000 (today) | 2 242.94 |
-| 1 000 000 | 44 858.79 |
-| 2 000 000 | 89 717.59 |
+| `per_transfer_limit` (GLC on Solana) | destination capacity (GLC L1) | 50 000 GLC admissible |
+|---|---|---|
+| 50 000 (today) | 2 242.94 | no |
+| 1 000 000 | 44 858.79 | no |
+| 2 000 000 | 89 717.59 | yes |
 
-Sizing rule for an intended maximum source S, a rate ceiling R to plan
-for, fee f and buffer b: `L ≥ S · R · (1 − f) / (1 − b)`. Nothing here
-decides L; `glc-admin set-limit` does, and docs/09-runbook.md's
-per-transfer-limit section owns the operational consequences (deposit
-direction, UTXO chunk target, per-transaction blast radius).
+Sizing rule for the source limit S, a rate ceiling R to plan for, fee f
+and buffer b: `L ≥ S · R · (1 − f) / (1 − b)`. Nothing here decides L;
+`glc-admin set-limit` does, and docs/09-runbook.md's per-transfer-limit
+section owns the operational consequences (deposit direction, UTXO chunk
+target, per-transaction blast radius).
 
 ## Availability probe
 

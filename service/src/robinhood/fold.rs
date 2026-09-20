@@ -412,6 +412,24 @@ pub fn fold_observation(
     )
 }
 
+/// The source-side transfer limits, both ends, as one park note: below
+/// the floor or above the ceiling (`crate::min_transfer`). The floor is
+/// the caller's (test-tunable) figure; the ceiling is the policy
+/// constant — a deposit the contract accepted above 50 000 GLC is parked,
+/// recoverable, exactly as a sub-minimum one, because the policy is on
+/// what was SENT and the deposit is already final.
+fn source_limit_refusal(
+    route: Route,
+    gross: CanonicalAtomic,
+    source_minimum: CanonicalAtomic,
+) -> Result<(), String> {
+    crate::min_transfer::enforce_source_minimum_at(route, gross, source_minimum)
+        .map_err(|e| format!("below source minimum: {e}"))?;
+    crate::min_transfer::enforce_source_maximum(route, gross)
+        .map_err(|e| format!("above source maximum: {e}"))?;
+    Ok(())
+}
+
 /// [`fold_observation`] at an explicit bridge-rate book — the form the
 /// settlement loop and deposit recovery call with the daemon's configured
 /// book.
@@ -478,7 +496,7 @@ pub fn fold_observation_with_rate_book(
     // tokens are in the custody contract; the only honest outcome is a
     // recorded request that reserves nothing and is refundable through
     // the normal path.
-    if let Err(refusal) = crate::min_transfer::enforce_source_minimum_at(
+    if let Err(refusal) = source_limit_refusal(
         Route::RhnToGlc,
         CanonicalAtomic(amounts.gross_canonical),
         source_minimum,
@@ -495,7 +513,7 @@ pub fn fold_observation_with_rate_book(
                 request_amounts,
                 destination.as_deref().map(str::as_bytes),
                 false,
-                Some(&format!("below source minimum: {refusal}")),
+                Some(&refusal),
                 now,
             )
             .map_err(FoldError::from);
@@ -621,7 +639,7 @@ pub fn fold_observation_to_solana_with_rate_book(
     // minimum" is a more actionable reason for an operator than "its net
     // does not fit six decimals", and a sub-minimum deposit is refused
     // whether or not its net happens to be spellable.
-    if let Err(refusal) = crate::min_transfer::enforce_source_minimum_at(
+    if let Err(refusal) = source_limit_refusal(
         Route::RhnToSol,
         CanonicalAtomic(amounts.gross_canonical),
         source_minimum,
@@ -632,7 +650,7 @@ pub fn fold_observation_to_solana_with_rate_book(
                 amounts.request_amounts(0),
                 Some(&destination),
                 false,
-                Some(&format!("below source minimum: {refusal}")),
+                Some(&refusal),
                 now,
             )
             .map_err(FoldError::from);

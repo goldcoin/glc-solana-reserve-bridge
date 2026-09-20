@@ -395,17 +395,21 @@ pub struct TransferLimits {
     /// any Robinhood route charges and must never be displayed as one.
     /// For the whole table see [`BridgeStats::route_fees`].
     pub bridge_fee_bps: u64,
-    /// `GlcToSol`'s [`RouteView::max_transfer_atomic`] — the largest
-    /// GROSS (canonical, Goldcoin side) whose quoted payout fits
-    /// `per_transfer_limit` at the current bridge rate with the
-    /// configured buffer. `per_transfer_limit` above is the DESTINATION
-    /// figure in the mint's own units; this is what a user may actually
-    /// send. Absent when it cannot be derived right now (the route is
-    /// then also refused).
+    /// `GlcToSol`'s SOURCE transfer limit ([`RouteView::max_transfer_atomic`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transfer_atomic: Option<AtomicU64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transfer_display: Option<String>,
+    /// `GlcToSol`'s [`RouteView::destination_admissible_atomic`]: the
+    /// largest GROSS (canonical, Goldcoin side) whose quoted payout fits
+    /// `per_transfer_limit` above (the DESTINATION figure, in the mint's
+    /// own units) at the current bridge rate with the configured buffer.
+    /// Settlement capacity, not the user's limit. Absent when it cannot
+    /// be derived right now (the route is then also refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_admissible_atomic: Option<AtomicU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_admissible_display: Option<String>,
 }
 
 /// Non-sensitive operational health, for the same audience as every other
@@ -765,28 +769,50 @@ pub struct RouteView {
     /// absent at a fixed unit rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_rate: Option<RouteBridgeRateView>,
-    /// **The largest GROSS this route accepts right now**, canonical
-    /// 8-decimal units — the figure a UI must cap its entry at and render
-    /// as "Max … GLC". Backend-computed
-    /// ([`crate::bridge_rate::max_source_for_destination_limit`]) from
-    /// the live bridge rate, the route fee, the destination precision, the
-    /// destination chain's per-transfer limit (the Solana program's
-    /// `per_transfer_limit`, the Robinhood contract's `outboundMax`) and
-    /// the configured safety buffer — and, for a Robinhood-sourced route,
-    /// never above the contract's own `inboundMax`. It therefore moves
-    /// with every one of those inputs; a client renders it and never
-    /// derives it. `POST /quote` and `POST /transfers` refuse a larger
-    /// amount with `reason = destination_payout_out_of_bounds`.
+    /// **The user's transfer maximum on this route**, canonical 8-decimal
+    /// units of the source asset — the SOURCE TRANSFER LIMIT
+    /// (`crate::min_transfer::SOURCE_MAXIMUM_CANONICAL`, 50 000 GLC),
+    /// capped only by the source chain's own deposit ceiling (a deposit
+    /// above the Solana program's `per_transfer_limit` or the Robinhood
+    /// contract's `inboundMax` cannot exist). A UI caps its entry at this
+    /// figure and renders it as "Max … GLC". It is NOT derived from any
+    /// destination payout cap and does not move with the bridge rate —
+    /// docs/40-destination-bound-admission.md, "SOURCE TRANSFER LIMIT vs
+    /// DESTINATION PAYOUT CAP". `POST /quote` and `POST /transfers`
+    /// refuse a larger amount with `reason = above_source_maximum`.
     ///
-    /// `null` = this route's destination is unbounded (Goldcoin L1), OR
-    /// the bound or the rate could not be read right now — in which case
-    /// the route is also not `available`, so a client never has to guess.
+    /// Always present; `null` only for a route this build cannot serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transfer_atomic: Option<AtomicU64>,
-    /// `max_transfer_atomic` as a decimal string in the source asset's
-    /// own precision, for display.
+    /// `max_transfer_atomic` as a decimal string, for display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transfer_display: Option<String>,
+    /// **What the destination can settle right now**, as a source amount
+    /// (canonical): the largest gross whose quoted payout fits the
+    /// destination chain's per-transfer payout cap (the Solana program's
+    /// `per_transfer_limit`, the Robinhood contract's `outboundMax`) at
+    /// the live bridge rate, the route fee, the destination's decimals
+    /// and the configured safety buffer. A SETTLEMENT-CAPACITY figure,
+    /// never a user limit: it moves with the rate and with the operators'
+    /// sizing of the cap. When it is below `max_transfer_atomic` the
+    /// destination cannot currently settle a maximum-size transfer in
+    /// one release, and `POST /quote` / `POST /transfers` refuse a
+    /// larger amount fail-closed (`reason =
+    /// destination_payout_out_of_bounds`) rather than admit a deposit
+    /// that would park at settlement. `null` = the destination has no
+    /// cap (Goldcoin L1), or the cap could not be read — in which case
+    /// the route is also not `available` (`destination_limit_unavailable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_admissible_atomic: Option<AtomicU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_admissible_display: Option<String>,
+    /// `destination_admissible_atomic >= max_transfer_atomic`: the
+    /// destination can settle a maximum-size transfer right now. `null`
+    /// when the destination is uncapped or unread. An operator signal —
+    /// `false` means the destination's cap needs sizing, not that the
+    /// user's limit changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_capacity_sufficient: Option<bool>,
     /// **The smallest GROSS this route accepts**, canonical 8-decimal
     /// units — the figure a UI should render as "Min … GLC".
     ///
@@ -1070,94 +1096,106 @@ impl DestinationLimits {
     }
 }
 
-/// The answer to "how much may `route` admit right now" — see
-/// [`max_transfer_from`].
+/// What the DESTINATION can settle for `route` right now, as a SOURCE
+/// amount — see [`destination_admissible_from`]. This is a settlement-
+/// capacity figure, never the user's transfer limit: that is
+/// [`crate::min_transfer::SOURCE_MAXIMUM_CANONICAL`] via
+/// [`published_max_transfer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaxTransfer {
-    /// Neither end of the route bounds a transfer (a Goldcoin destination
-    /// from a Goldcoin source — no such route exists today, kept so the
-    /// enum is total).
+pub enum DestinationAdmissible {
+    /// The destination has no per-transfer payout cap (Goldcoin L1).
     Unbounded,
-    /// The largest gross (canonical) the route admits.
+    /// The largest gross (canonical) whose quoted payout the destination
+    /// can settle in one release, with the configured buffer to spare.
     Known(CanonicalAtomic),
-    /// A bound exists but could not be evaluated: fail closed.
+    /// A cap exists but could not be evaluated: fail closed.
     Unknown,
 }
 
-impl MaxTransfer {
+impl DestinationAdmissible {
     pub fn known(self) -> Option<CanonicalAtomic> {
         match self {
-            MaxTransfer::Known(m) => Some(m),
-            MaxTransfer::Unbounded | MaxTransfer::Unknown => None,
+            DestinationAdmissible::Known(m) => Some(m),
+            DestinationAdmissible::Unbounded | DestinationAdmissible::Unknown => None,
         }
     }
 }
 
-/// The maximum gross `route` admits, from already-read inputs — pure,
-/// and the ONE derivation `GET /chains`, `GET /limits`, `POST /quote`,
-/// `POST /transfers` and the Solana indexer's `SolToRhn` fold share
-/// (docs/40-destination-bound-admission.md):
+/// **The published user maximum** for `route`: the source transfer
+/// limit ([`crate::min_transfer::source_maximum`], 50 000 GLC), never
+/// reduced by any destination payout cap — capped only by the SOURCE
+/// chain's own deposit ceiling ([`DestinationLimits::source_bound`]:
+/// the Solana program's `per_transfer_limit` on `deposit_to_reserve`,
+/// the Robinhood contract's `inboundMax`), because a deposit above that
+/// cannot exist and a UI must not invite one. Pure.
+pub fn published_max_transfer(
+    route: crate::routes::Route,
+    limits: &DestinationLimits,
+    source_maximum: CanonicalAtomic,
+) -> CanonicalAtomic {
+    match limits.source_bound(route) {
+        Some(chain) => CanonicalAtomic(source_maximum.0.min(chain.0)),
+        None => source_maximum,
+    }
+}
+
+/// The largest gross the DESTINATION can settle for `route` in one
+/// release, from already-read inputs — pure, and the ONE derivation
+/// `POST /quote`, `POST /transfers`, the Solana indexer's `SolToRhn` fold
+/// and the listings' `destination_admissible_atomic` share
+/// (docs/40-destination-bound-admission.md): the destination chain's
+/// per-transfer payout cap ([`DestinationLimits::destination_bound`]),
+/// reduced by `buffer_bps`, inverted through THIS route's fee, the live
+/// rail prices and the destination's precision by
+/// [`crate::bridge_rate::max_source_for_destination_limit`] — exactly the
+/// largest gross whose quoted net fits.
 ///
-/// 1. DESTINATION bound: the destination chain's per-transfer limit
-///    ([`DestinationLimits::destination_bound`]), reduced by `buffer_bps`,
-///    inverted through THIS route's fee, the live rail prices and the
-///    destination's precision by
-///    [`crate::bridge_rate::max_source_for_destination_limit`] — so the
-///    figure is exactly the largest gross whose quoted net fits.
-/// 2. SOURCE bound: the source chain's own per-deposit ceiling
-///    ([`DestinationLimits::source_bound`]), which the chain enforces
-///    itself; published so a UI never lets a user sign a deposit the
-///    chain would refuse.
-///
-/// The answer is the smaller of whichever exist. A route with a
-/// destination bound whose limit, decimals, fee or prices are missing is
-/// [`MaxTransfer::Unknown`] — never "unbounded", never a guess.
-pub fn max_transfer_from(
+/// NOT a user limit (docs/40, "SOURCE TRANSFER LIMIT vs DESTINATION
+/// PAYOUT CAP"): the user's maximum is [`published_max_transfer`]. When
+/// this figure is below it the destination cannot currently settle a
+/// maximum-size transfer — an operator sizes the cap, and until then a
+/// transfer above this figure is refused fail-closed rather than
+/// admitted into a park. A route with a cap whose limit, decimals, fee
+/// or prices are missing is [`DestinationAdmissible::Unknown`] — never
+/// "unbounded", never a guess.
+pub fn destination_admissible_from(
     route: crate::routes::Route,
     limits: &DestinationLimits,
     fee_bps: Option<u64>,
     prices: Option<crate::bridge_rate::RailPrices>,
     buffer_bps: u64,
-) -> MaxTransfer {
-    let source_bound = limits.source_bound(route);
-    let destination_derived = if limits.destination_is_bounded(route) {
-        let (Some(bound), Some(fee_bps), Some(prices)) =
-            (limits.destination_bound(route), fee_bps, prices)
-        else {
-            return MaxTransfer::Unknown;
-        };
-        let destination_scale = match route.destination_chain() {
-            crate::routes::Chain::Solana => match limits.solana_decimals {
-                Some(d) => crate::bridge_rate::destination_scale_for_decimals(d),
-                None => return MaxTransfer::Unknown,
-            },
-            crate::routes::Chain::Robinhood | crate::routes::Chain::Goldcoin => 1,
-        };
-        match crate::bridge_rate::max_source_for_destination_limit(
-            bound,
-            prices,
-            fee_bps,
-            destination_scale,
-            buffer_bps,
-        ) {
-            Ok(max) => Some(max),
-            Err(e) => {
-                tracing::warn!(
-                    route = route.as_str(),
-                    error = %e,
-                    "destination-bound maximum could not be derived; route fails closed"
-                );
-                return MaxTransfer::Unknown;
-            }
-        }
-    } else {
-        None
+) -> DestinationAdmissible {
+    if !limits.destination_is_bounded(route) {
+        return DestinationAdmissible::Unbounded;
+    }
+    let (Some(bound), Some(fee_bps), Some(prices)) =
+        (limits.destination_bound(route), fee_bps, prices)
+    else {
+        return DestinationAdmissible::Unknown;
     };
-    match (destination_derived, source_bound) {
-        (Some(d), Some(s)) => MaxTransfer::Known(CanonicalAtomic(d.0.min(s.0))),
-        (Some(d), None) => MaxTransfer::Known(d),
-        (None, Some(s)) => MaxTransfer::Known(s),
-        (None, None) => MaxTransfer::Unbounded,
+    let destination_scale = match route.destination_chain() {
+        crate::routes::Chain::Solana => match limits.solana_decimals {
+            Some(d) => crate::bridge_rate::destination_scale_for_decimals(d),
+            None => return DestinationAdmissible::Unknown,
+        },
+        crate::routes::Chain::Robinhood | crate::routes::Chain::Goldcoin => 1,
+    };
+    match crate::bridge_rate::max_source_for_destination_limit(
+        bound,
+        prices,
+        fee_bps,
+        destination_scale,
+        buffer_bps,
+    ) {
+        Ok(max) => DestinationAdmissible::Known(max),
+        Err(e) => {
+            tracing::warn!(
+                route = route.as_str(),
+                error = %e,
+                "destination payout capacity could not be derived; route fails closed"
+            );
+            DestinationAdmissible::Unknown
+        }
     }
 }
 
@@ -1486,7 +1524,8 @@ impl RouteView {
         probes: RouteProbes,
         capability_inputs: CapabilityInputs,
         rate: BridgeRateVerdict,
-        max_transfer: MaxTransfer,
+        published_max: CanonicalAtomic,
+        destination: DestinationAdmissible,
         route: crate::routes::Route,
     ) -> RouteView {
         // One gate evaluation per route, same call the write paths make
@@ -1505,13 +1544,16 @@ impl RouteView {
         // and a UI with no cap to render must not invite an amount.
         // Ranked after every other reason — an operator-closed route is
         // reported as closed by the operator, whatever the limit reads.
-        if available && matches!(max_transfer, MaxTransfer::Unknown) {
+        if available && matches!(destination, DestinationAdmissible::Unknown) {
             available = false;
             unavailable_reason = Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string());
             availability_reason =
                 Some(AVAILABILITY_REASON_DESTINATION_LIMIT_UNAVAILABLE.to_string());
         }
-        let max_transfer = max_transfer.known();
+        let destination_admissible = destination.known();
+        let display = |m: CanonicalAtomic| {
+            format_atomic_as_decimal_string(m.0, amount_conversion::GOLDCOIN_DECIMALS as u8)
+        };
         RouteView {
             id: route.as_str().to_string(),
             source_chain: route.source_chain().as_str().to_string(),
@@ -1522,10 +1564,11 @@ impl RouteView {
             available,
             unavailable_reason,
             bridge_rate,
-            max_transfer_atomic: max_transfer.map(|m| AtomicU64(m.0)),
-            max_transfer_display: max_transfer.map(|m| {
-                format_atomic_as_decimal_string(m.0, amount_conversion::GOLDCOIN_DECIMALS as u8)
-            }),
+            max_transfer_atomic: Some(AtomicU64(published_max.0)),
+            max_transfer_display: Some(display(published_max)),
+            destination_admissible_atomic: destination_admissible.map(|m| AtomicU64(m.0)),
+            destination_admissible_display: destination_admissible.map(display),
+            destination_capacity_sufficient: destination_admissible.map(|d| d.0 >= published_max.0),
             // Not gated on `implemented`, `enabled` or `available`: the
             // floor is a property of the route's terms, not of whether it
             // happens to be open this minute, and a UI showing a closed
@@ -2457,17 +2500,21 @@ pub struct QuoteOutput {
     /// `gross_amount`/`fee_amount`/`net_amount` above are the same
     /// figures under their pre-quote names, kept for existing clients.
     pub bridge_quote: BridgeQuoteView,
-    /// The largest gross this route would have accepted at the prices
-    /// this quote was struck at — the same figure as
-    /// [`RouteView::max_transfer_atomic`], evaluated for this quote.
-    /// Absent when the route is unbounded. A gross above it is not
-    /// quoted at all: the request fails with
-    /// `reason = destination_payout_out_of_bounds` and the same maximum
-    /// in the error body.
+    /// The route's SOURCE transfer limit — the same figure as
+    /// [`RouteView::max_transfer_atomic`]. A gross above it is not quoted
+    /// (`reason = above_source_maximum`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transfer_atomic: Option<AtomicU64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transfer_display: Option<String>,
+    /// What the destination could settle at the prices this quote was
+    /// struck at — [`RouteView::destination_admissible_atomic`] for this
+    /// quote. Absent for an uncapped destination. A gross above it is not
+    /// quoted (`reason = destination_payout_out_of_bounds`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_admissible_atomic: Option<AtomicU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_admissible_display: Option<String>,
     pub source_decimals: u8,
     /// The DESTINATION chain's own atomic-unit decimals for this
     /// direction — what `net_amount` is actually converted to and
@@ -2960,14 +3007,34 @@ pub enum ApiError {
     /// settlement. `400` with `reason = destination_payout_out_of_bounds`
     /// and the largest source amount this route admits right now.
     #[error(
-        "amount exceeds this route's maximum: the destination chain accepts at most \
-         {max_transfer_display} per transfer at the current bridge rate"
+        "amount exceeds what the destination chain can currently settle in one release: at the \
+         current bridge rate it can pay out a transfer of at most {destination_admissible_display} \
+         (the bridge's own transfer limit is {max_transfer_display})"
     )]
     DestinationOutOfBounds {
+        /// The destination's settlement capacity as a source amount
+        /// (canonical) — NOT the user's limit; see
+        /// `RouteView::destination_admissible_atomic`.
+        destination_admissible_atomic: u64,
+        destination_admissible_display: String,
+        /// The published user maximum (`RouteView::max_transfer_atomic`).
         max_transfer_atomic: u64,
         max_transfer_display: String,
     },
+    /// The amount is above the bridge's SOURCE transfer limit
+    /// (`crate::min_transfer::SOURCE_MAXIMUM_CANONICAL`, 50 000 GLC —
+    /// the user-facing maximum, on every route). `400` with `reason =
+    /// above_source_maximum` and the limit.
+    #[error("{detail}")]
+    AboveSourceMaximum {
+        max_transfer_atomic: u64,
+        max_transfer_display: String,
+        detail: String,
+    },
 }
+
+/// `reason` for [`ApiError::AboveSourceMaximum`].
+pub const REASON_ABOVE_SOURCE_MAXIMUM: &str = "above_source_maximum";
 
 impl From<crate::bridge_rate::RateError> for ApiError {
     fn from(e: crate::bridge_rate::RateError) -> ApiError {
@@ -2994,9 +3061,9 @@ impl From<crate::routes::RouteGateError> for ApiError {
 impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
-            ApiError::BadRequest(_) | ApiError::DestinationOutOfBounds { .. } => {
-                StatusCode::BAD_REQUEST
-            }
+            ApiError::BadRequest(_)
+            | ApiError::DestinationOutOfBounds { .. }
+            | ApiError::AboveSourceMaximum { .. } => StatusCode::BAD_REQUEST,
             ApiError::InsufficientLiquidity { .. }
             | ApiError::Paused
             | ApiError::QuotaExhausted
@@ -3020,6 +3087,7 @@ impl ApiError {
             ApiError::DestinationOutOfBounds { .. } => {
                 Some(crate::ledger::Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS)
             }
+            ApiError::AboveSourceMaximum { .. } => Some(REASON_ABOVE_SOURCE_MAXIMUM),
             _ => None,
         }
     }
@@ -3204,6 +3272,10 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// written with instead of being rewritten around a policy it is not
     /// testing.
     source_minimum: crate::amount_conversion::CanonicalAtomic,
+    /// The source-side transfer maximum (`crate::min_transfer::
+    /// SOURCE_MAXIMUM_CANONICAL`, 50 000 GLC) — the published user limit.
+    /// A field for the same test-only reason as `source_minimum`.
+    source_maximum: crate::amount_conversion::CanonicalAtomic,
 }
 
 impl<SR: SolanaRpc> BridgeApi<SR> {
@@ -3257,6 +3329,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // production `BridgeApi` in existence admits against exactly
             // 100 GLC because this line has no alternative branch.
             source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
+            source_maximum: crate::min_transfer::SOURCE_MAXIMUM_CANONICAL,
         }
     }
 
@@ -3308,6 +3381,19 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         minimum: crate::amount_conversion::CanonicalAtomic,
     ) -> Self {
         self.source_minimum = minimum;
+        self
+    }
+
+    /// Raises the source-side ceiling. **Tests only**, the twin of
+    /// [`Self::with_source_minimum_for_tests`]: fixtures that quote
+    /// amounts above the 50 000 GLC policy to exercise a destination cap
+    /// or an unbounded route.
+    #[doc(hidden)]
+    pub fn with_source_maximum_for_tests(
+        mut self,
+        maximum: crate::amount_conversion::CanonicalAtomic,
+    ) -> Self {
+        self.source_maximum = maximum;
         self
     }
 
@@ -3838,22 +3924,56 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         }
     }
 
-    /// [`max_transfer_from`] for `route`, at this deployment's fee table,
-    /// the rate book's verdict and the configured buffer.
-    fn max_transfer_for_route(
+    /// [`destination_admissible_from`] for `route`, at this deployment's
+    /// fee table, the rate book's verdict and the configured buffer.
+    fn destination_admissible_for_route(
         &self,
         route: crate::routes::Route,
         limits: &DestinationLimits,
         rate: &BridgeRateVerdict,
         now: i64,
-    ) -> MaxTransfer {
-        max_transfer_from(
+    ) -> DestinationAdmissible {
+        destination_admissible_from(
             route,
             limits,
             self.route_fees.fee_bps(route).ok(),
             rate.prices(now),
             self.destination_limit_buffer_bps,
         )
+    }
+
+    /// [`published_max_transfer`] for `route` at this deployment's source
+    /// maximum.
+    fn published_max_for_route(
+        &self,
+        route: crate::routes::Route,
+        limits: &DestinationLimits,
+    ) -> CanonicalAtomic {
+        published_max_transfer(route, limits, self.source_maximum)
+    }
+
+    fn display_canonical(amount: CanonicalAtomic) -> String {
+        format_atomic_as_decimal_string(amount.0, amount_conversion::GOLDCOIN_DECIMALS as u8)
+    }
+
+    /// The SOURCE transfer limit, BEFORE anything else prices or reads a
+    /// chain: `gross` must not exceed [`published_max_transfer`] for the
+    /// route. `400 reason = above_source_maximum`.
+    fn enforce_source_maximum(
+        &self,
+        route: crate::routes::Route,
+        limits: &DestinationLimits,
+        gross: CanonicalAtomic,
+    ) -> Result<CanonicalAtomic, ApiError> {
+        let max = self.published_max_for_route(route, limits);
+        crate::min_transfer::enforce_source_maximum_at(route, gross, max).map_err(|e| {
+            ApiError::AboveSourceMaximum {
+                max_transfer_atomic: max.0,
+                max_transfer_display: Self::display_canonical(max),
+                detail: e.to_string(),
+            }
+        })?;
+        Ok(max)
     }
 
     /// The [`DestinationLimits`] one admission (a quote or a create) on
@@ -3876,15 +3996,21 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
 
     /// The destination-bound admission check (docs/40-destination-bound-
     /// admission.md), BEFORE any capacity is reserved or deposit address
-    /// issued: `gross` must not exceed the route's [`max_transfer_from`]
-    /// at the prices the quote was struck at. Refused with
-    /// [`ApiError::DestinationOutOfBounds`], which carries the maximum so
-    /// a client can show it. A bounded route whose maximum is unknown is
-    /// refused outright (fail-closed) rather than admitted on a guess.
+    /// issued: `gross` must not exceed what the destination can settle
+    /// ([`destination_admissible_from`]) at the prices the quote was
+    /// struck at. Refused with [`ApiError::DestinationOutOfBounds`], which
+    /// carries the destination's capacity AND the (separate, unchanged)
+    /// user limit `published_max`. A capped destination whose capacity is
+    /// unknown is refused outright (fail-closed) rather than admitted on
+    /// a guess.
     ///
-    /// The settlement-time checks (`Orchestrator::release_out_of_bounds`,
-    /// `Settler::authorize_payout`) stay exactly as they were: this is
-    /// the admission half of a two-layer rule, never a replacement.
+    /// This is settlement capacity, not the user's limit: a refusal here
+    /// means "the destination cannot pay this in one release right now",
+    /// the remedy is an operator sizing the destination's cap, and the
+    /// published maximum does not move. The settlement-time checks
+    /// (`Orchestrator::release_out_of_bounds`, `Settler::authorize_payout`)
+    /// stay exactly as they were: this is the admission half of a
+    /// two-layer rule, never a replacement.
     fn enforce_destination_bound(
         &self,
         route: crate::routes::Route,
@@ -3892,31 +4018,31 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         prices: crate::bridge_rate::RailPrices,
         fee_bps: u64,
         gross: CanonicalAtomic,
+        published_max: CanonicalAtomic,
     ) -> Result<Option<CanonicalAtomic>, ApiError> {
-        match max_transfer_from(
+        match destination_admissible_from(
             route,
             limits,
             Some(fee_bps),
             Some(prices),
             self.destination_limit_buffer_bps,
         ) {
-            MaxTransfer::Unbounded => Ok(None),
-            MaxTransfer::Unknown => Err(ApiError::Upstream(format!(
+            DestinationAdmissible::Unbounded => Ok(None),
+            DestinationAdmissible::Unknown => Err(ApiError::Upstream(format!(
                 "the {} destination's per-transfer limit could not be read; \
                  refusing rather than admitting an amount it might not pay out",
                 route.destination_chain().as_str()
             ))),
-            MaxTransfer::Known(max) => {
-                if gross.0 > max.0 {
+            DestinationAdmissible::Known(admissible) => {
+                if gross.0 > admissible.0 {
                     return Err(ApiError::DestinationOutOfBounds {
-                        max_transfer_atomic: max.0,
-                        max_transfer_display: format_atomic_as_decimal_string(
-                            max.0,
-                            amount_conversion::GOLDCOIN_DECIMALS as u8,
-                        ),
+                        destination_admissible_atomic: admissible.0,
+                        destination_admissible_display: Self::display_canonical(admissible),
+                        max_transfer_atomic: published_max.0,
+                        max_transfer_display: Self::display_canonical(published_max),
                     });
                 }
-                Ok(Some(max))
+                Ok(Some(admissible))
             }
         }
     }
@@ -4117,7 +4243,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 .map(|r| {
                     let now = now_unix();
                     let rate = self.bridge_rate_verdict(*r, now);
-                    let max_transfer = self.max_transfer_for_route(*r, &inputs.limits, &rate, now);
+                    let destination =
+                        self.destination_admissible_for_route(*r, &inputs.limits, &rate, now);
                     RouteView::build(
                         &self.route_gate,
                         &ledger,
@@ -4125,7 +4252,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         inputs.probes,
                         inputs.capabilities,
                         rate,
-                        max_transfer,
+                        self.published_max_for_route(*r, &inputs.limits),
+                        destination,
                         *r,
                     )
                 })
@@ -4146,19 +4274,25 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let limits = self
                 .admission_limits(route, Some((&config, decimals)))
                 .await;
-            let max_transfer = self
-                .max_transfer_for_route(route, &limits, &self.bridge_rate_verdict(route, now), now)
+            let destination = self
+                .destination_admissible_for_route(
+                    route,
+                    &limits,
+                    &self.bridge_rate_verdict(route, now),
+                    now,
+                )
                 .known();
+            let published = self.published_max_for_route(route, &limits);
             Ok(TransferLimits {
                 min_transfer_amount: AtomicU64(config.min_transfer_amount),
                 per_transfer_limit: AtomicU64(config.per_transfer_limit),
                 // The SOLANA-bound route's rate, beside the Solana
                 // program's own limits. Never a global one.
                 bridge_fee_bps: self.display_fee_bps(route),
-                max_transfer_atomic: max_transfer.map(|m| AtomicU64(m.0)),
-                max_transfer_display: max_transfer.map(|m| {
-                    format_atomic_as_decimal_string(m.0, amount_conversion::GOLDCOIN_DECIMALS as u8)
-                }),
+                max_transfer_atomic: Some(AtomicU64(published.0)),
+                max_transfer_display: Some(Self::display_canonical(published)),
+                destination_admissible_atomic: destination.map(|m| AtomicU64(m.0)),
+                destination_admissible_display: destination.map(Self::display_canonical),
             })
         })
     }
@@ -4568,12 +4702,16 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let limits = self
                 .admission_limits(route, solana_leg.as_ref().map(|(c, d)| (c, *d)))
                 .await;
+            // The SOURCE transfer limit first (the user's maximum, 50 000
+            // GLC), then the destination's settlement capacity.
+            let published_max = self.enforce_source_maximum(route, &limits, quote.gross_in)?;
             self.enforce_destination_bound(
                 route,
                 &limits,
                 quote.rail_prices(),
                 fee_bps,
                 quote.gross_in,
+                published_max,
             )?;
             let fee_breakdown = quote.breakdown();
             // `net_destination_atomic` is what the DESTINATION reserve
@@ -4947,7 +5085,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 .map(|r| {
                     let now = now_unix();
                     let rate = self.bridge_rate_verdict(*r, now);
-                    let max_transfer = self.max_transfer_for_route(*r, &inputs.limits, &rate, now);
+                    let destination =
+                        self.destination_admissible_for_route(*r, &inputs.limits, &rate, now);
                     RouteView::build(
                         &self.route_gate,
                         &ledger,
@@ -4955,7 +5094,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         inputs.probes,
                         inputs.capabilities,
                         rate,
-                        max_transfer,
+                        self.published_max_for_route(*r, &inputs.limits),
+                        destination,
                         *r,
                     )
                 })
@@ -5205,12 +5345,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let limits = self
                 .admission_limits(route, solana_config.as_ref().zip(solana_decimals))
                 .await;
-            let max_transfer = self.enforce_destination_bound(
+            let published_max = self.enforce_source_maximum(route, &limits, quote.gross_in)?;
+            let destination_admissible = self.enforce_destination_bound(
                 route,
                 &limits,
                 quote.rail_prices(),
                 fee_bps,
                 quote.gross_in,
+                published_max,
             )?;
             let fee_breakdown = quote.breakdown();
             // Confirms the net entitlement is actually deliverable at the
@@ -5293,9 +5435,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     goldcoin_decimals,
                 ),
                 bridge_quote: BridgeQuoteView::from_struck(&struck),
-                max_transfer_atomic: max_transfer.map(|m| AtomicU64(m.0)),
-                max_transfer_display: max_transfer
-                    .map(|m| format_atomic_as_decimal_string(m.0, goldcoin_decimals)),
+                max_transfer_atomic: Some(AtomicU64(published_max.0)),
+                max_transfer_display: Some(Self::display_canonical(published_max)),
+                destination_admissible_atomic: destination_admissible.map(|m| AtomicU64(m.0)),
+                destination_admissible_display: destination_admissible.map(Self::display_canonical),
                 source_decimals,
                 destination_decimals,
                 source_asset: source_asset.to_string(),
@@ -5674,12 +5817,20 @@ struct ErrorBody {
     movement_bps: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     band_bps: Option<u64>,
-    /// On `destination_payout_out_of_bounds`: the largest source amount
-    /// the route admits right now (canonical, and as a decimal string).
+    /// On `above_source_maximum` and `destination_payout_out_of_bounds`:
+    /// the route's SOURCE transfer limit (canonical, and as a decimal
+    /// string) — `RouteView::max_transfer_atomic`.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_transfer_atomic: Option<AtomicU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_transfer_display: Option<String>,
+    /// `destination_payout_out_of_bounds` only: the destination's
+    /// settlement capacity as a source amount — see
+    /// `RouteView::destination_admissible_atomic`. Not the user's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_admissible_atomic: Option<AtomicU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_admissible_display: Option<String>,
 }
 
 impl ErrorBody {
@@ -5693,6 +5844,8 @@ impl ErrorBody {
             band_bps: None,
             max_transfer_atomic: None,
             max_transfer_display: None,
+            destination_admissible_atomic: None,
+            destination_admissible_display: None,
         }
     }
 }
@@ -5728,8 +5881,22 @@ fn error_response(err: ApiError) -> Response<Full<Bytes>> {
             ..ErrorBody::message(err.to_string())
         },
         ApiError::DestinationOutOfBounds {
+            destination_admissible_atomic,
+            destination_admissible_display,
             max_transfer_atomic,
             max_transfer_display,
+        } => ErrorBody {
+            reason: err.reason(),
+            max_transfer_atomic: Some(AtomicU64(*max_transfer_atomic)),
+            max_transfer_display: Some(max_transfer_display.clone()),
+            destination_admissible_atomic: Some(AtomicU64(*destination_admissible_atomic)),
+            destination_admissible_display: Some(destination_admissible_display.clone()),
+            ..ErrorBody::message(err.to_string())
+        },
+        ApiError::AboveSourceMaximum {
+            max_transfer_atomic,
+            max_transfer_display,
+            ..
         } => ErrorBody {
             reason: err.reason(),
             max_transfer_atomic: Some(AtomicU64(*max_transfer_atomic)),

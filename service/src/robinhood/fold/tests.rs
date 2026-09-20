@@ -1812,3 +1812,62 @@ fn the_robinhood_reserve_pause_does_not_gate_rhn_to_glc() {
 
 mod bridge_quote;
 mod cross_route;
+
+/// The SOURCE transfer maximum (`min_transfer::SOURCE_MAXIMUM_CANONICAL`,
+/// 50 000 GLC) at the fold: a deposit the contract accepted above it is
+/// parked with an explicit reason, reserves nothing and stays
+/// refundable — exactly as a sub-minimum one — while one at exactly the
+/// maximum folds payable. The policy is on what was SENT; the ceiling is
+/// the constant, not the caller's (test-tunable) floor.
+#[test]
+fn a_deposit_above_the_source_maximum_is_parked_and_one_at_it_is_payable() {
+    let max = crate::min_transfer::SOURCE_MAXIMUM_CANONICAL.0;
+    for (canonical, parked) in [(max, false), (max + 1, true)] {
+        let mut ledger = Ledger::open_in_memory().expect("an in-memory ledger");
+        // Deep enough that liquidity is not the reason.
+        ledger
+            .configure_reserve(
+                crate::ledger::ReserveDirection::GoldcoinReserve,
+                100_000_000_000_000,
+                0,
+                50_000_000_000_000,
+                20_000_000_000_000,
+                10_000_000_000_000,
+                100,
+            )
+            .unwrap();
+        let row = observation(0, canonical, destination().into_bytes());
+        store(&ledger, &row);
+        let outcome = fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300,
+        )
+        .unwrap();
+        let request_id = match outcome {
+            FoldOutcome::FoldedFinalized { request_id }
+            | FoldOutcome::FoldedManualReview { request_id } => request_id,
+            other => panic!("{canonical}: {other:?}"),
+        };
+        let request = ledger.get_request(request_id).unwrap().unwrap();
+        assert_eq!(request.gross_amount_atomic, canonical);
+        if parked {
+            assert!(matches!(outcome, FoldOutcome::FoldedManualReview { .. }));
+            assert_eq!(request.state, RequestState::ManualReview);
+            let note = request.manual_review_note.as_deref().unwrap();
+            assert!(note.starts_with("above source maximum"), "{note}");
+            assert!(note.contains("amount SENT"), "{note}");
+            let (_, _, reserved, _) = ledger
+                .reserve_snapshot(crate::ledger::ReserveDirection::GoldcoinReserve)
+                .unwrap();
+            assert_eq!(reserved, 0, "nothing is held for a parked deposit");
+        } else {
+            assert!(matches!(outcome, FoldOutcome::FoldedFinalized { .. }));
+            assert_eq!(request.state, RequestState::SourceFinalized);
+        }
+    }
+}
