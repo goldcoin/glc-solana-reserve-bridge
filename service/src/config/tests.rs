@@ -390,6 +390,57 @@ fn a_valid_alert_webhook_url_is_accepted() {
     );
 }
 
+/// `[service] sol_to_glc_probe_gross_atomic` (docs/40-destination-bound-
+/// admission.md, "Availability probe"): defaults to 50_000 GLC canonical,
+/// takes an explicit value, refuses zero.
+#[test]
+fn the_sol_to_glc_probe_size_defaults_to_fifty_thousand_glc_and_refuses_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.service.sol_to_glc_probe_gross_atomic,
+        5_000_000_000_000
+    );
+    assert_eq!(
+        config.service.sol_to_glc_probe_gross_atomic,
+        crate::api::DEFAULT_SOL_TO_GLC_PROBE_GROSS.0
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace(
+            "reservation_ttl_secs = 3600",
+            "reservation_ttl_secs = 3600\nsol_to_glc_probe_gross_atomic = 1000000000000",
+        ),
+    )
+    .unwrap();
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.service.sol_to_glc_probe_gross_atomic,
+        1_000_000_000_000
+    );
+    std::fs::write(
+        &path,
+        text.replace(
+            "reservation_ttl_secs = 3600",
+            "reservation_ttl_secs = 3600\nsol_to_glc_probe_gross_atomic = 0",
+        ),
+    )
+    .unwrap();
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "service.sol_to_glc_probe_gross_atomic",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
 #[test]
 fn a_malformed_alert_webhook_url_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
@@ -2363,6 +2414,13 @@ fn fixed_unit_mode_quotes_at_one_with_the_documented_defaults() {
     assert_eq!(config.bridge_rate.price_window_secs, 360);
     assert_eq!(config.bridge_rate.price_staleness_secs, 120);
     assert_eq!(config.bridge_rate.rate_band_bps, 2_500);
+    // The destination-limit buffer defaults to the band (docs/39-
+    // destination-bound-admission.md).
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 2_500);
+    assert_eq!(
+        config.bridge_rate.destination_limit_buffer_bps,
+        crate::bridge_rate::DEFAULT_DESTINATION_LIMIT_BUFFER_BPS
+    );
     assert_eq!(config.bridge_rate.poll_interval_secs, 20);
     assert!(config.bridge_rate.feeds.is_none());
     let book = config.bridge_rate.rate_book();
@@ -2390,6 +2448,49 @@ fn fixed_unit_mode_quotes_at_one_with_the_documented_defaults() {
             err,
             ConfigError::Invalid {
                 field: "bridge_rate.feeds",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// `[bridge_rate] destination_limit_buffer_bps` (docs/40-destination-
+/// bound-admission.md): follows `rate_band_pct` when absent, is its own
+/// figure when set (in either mode), and is refused above 100 %.
+#[test]
+fn the_destination_limit_buffer_follows_the_band_unless_set_and_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        &format!("mode = \"live\"\nrate_band_pct = 20\n{LIVE_FEEDS}"),
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.rate_band_bps, 2_000);
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 2_000);
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        &format!("mode = \"live\"\nrate_band_pct = 20\ndestination_limit_buffer_bps = 3000\n{LIVE_FEEDS}"),
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.rate_band_bps, 2_000);
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 3_000);
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "mode = \"fixed_unit\"\ndestination_limit_buffer_bps = 0",
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 0);
+    let err = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "mode = \"fixed_unit\"\ndestination_limit_buffer_bps = 10001",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "bridge_rate.destination_limit_buffer_bps",
                 ..
             }
         ),

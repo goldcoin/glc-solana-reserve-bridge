@@ -641,6 +641,15 @@ glc-admin fees-set --config /etc/glc-bridge/config.toml --route SolToGlc --fee-p
 glc-admin fees-set --config /etc/glc-bridge/config.toml --route RhnToGlc --fee-percent 3 --note "elastic bridge rate release (J-8)" --execute
 ```
 
+## Destination bounds (added 2026-09-20)
+
+A live rate makes a destination payout rate-dependent, and the
+destination chains' per-transfer limits do not move with it. The
+admission-time check that keeps a quoted payout inside those limits —
+and the `max_transfer_atomic` every route now publishes — is
+docs/40-destination-bound-admission.md. Its buffer defaults to
+`rate_band_pct`, for the reason given there.
+
 ## Explicitly NOT in Phase 2B
 
 No change to signer keys, multisig, the Solana program, the Robinhood

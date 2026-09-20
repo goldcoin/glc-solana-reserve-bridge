@@ -6950,6 +6950,101 @@ mod v28_tests {
     /// routes gain a row, seeded OPEN; an operator's own CLOSED gate on
     /// an existing route survives the CHECK rebuild with its reason and
     /// timestamp; every request row is kept; the migration is idempotent.
+    /// The zero-admission-race rollout of the destination-bound hotfix
+    /// (docs/40-destination-bound-admission.md) relies on the reserve
+    /// pauses an operator sets on the v37 daemon (`glc-admin pause
+    /// --direction solana`, `robinhood-local-pause`) still being in force
+    /// when the v38 daemon opens the ledger. v38 rewrites only
+    /// `route_admission`; `reserve_ledger` — `paused`, `pause_reason`,
+    /// both admission flags — passes through untouched, and the daemon's
+    /// startup `configure_reserve` updates thresholds only.
+    #[test]
+    fn upgrading_from_v37_keeps_every_reserve_pause_and_admission_flag() {
+        let conn = database_at_v37();
+        for (direction, paused, admission_closed, liquidity_closed) in [
+            ("GoldcoinReserve", 0, 1, 1),
+            ("SolanaReserve", 1, 0, 0),
+            ("RobinhoodReserve", 1, 0, 0),
+        ] {
+            conn.execute(
+                "INSERT INTO reserve_ledger
+                    (direction, total_reserve_balance, balance_refreshed_at, protected_minimum,
+                     target_reserve, warning_reserve, critical_reserve, paused, pause_reason,
+                     admission_closed, admission_reason, liquidity_admission_closed)
+                 VALUES (?1, 1000, 0, 0, 500, 200, 100, ?2, 'rollout broad pause', ?3,
+                         'rollout', ?4)",
+                rusqlite::params![direction, paused, admission_closed, liquidity_closed],
+            )
+            .unwrap();
+        }
+
+        open_and_migrate(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 38);
+
+        let rows: Vec<(String, i64, Option<String>, i64, i64)> = conn
+            .prepare(
+                "SELECT direction, paused, pause_reason, admission_closed,
+                        liquidity_admission_closed
+                   FROM reserve_ledger ORDER BY direction",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "GoldcoinReserve".to_string(),
+                    0,
+                    Some("rollout broad pause".to_string()),
+                    1,
+                    1
+                ),
+                (
+                    "RobinhoodReserve".to_string(),
+                    1,
+                    Some("rollout broad pause".to_string()),
+                    0,
+                    0
+                ),
+                (
+                    "SolanaReserve".to_string(),
+                    1,
+                    Some("rollout broad pause".to_string()),
+                    0,
+                    0
+                ),
+            ]
+        );
+        // And the daemon's own startup call — thresholds only — clears
+        // nothing.
+        let mut ledger = crate::ledger::Ledger::from_connection_for_tests(conn);
+        ledger
+            .configure_reserve(
+                crate::ledger::ReserveDirection::SolanaReserve,
+                0,
+                0,
+                600,
+                300,
+                150,
+                1,
+            )
+            .unwrap();
+        assert!(ledger
+            .is_paused(crate::ledger::ReserveDirection::SolanaReserve)
+            .unwrap());
+        assert!(ledger
+            .is_paused(crate::ledger::ReserveDirection::RobinhoodReserve)
+            .unwrap());
+    }
+
     #[test]
     fn upgrading_from_v37_keeps_a_closed_gate_closed_and_seeds_the_two_new_rows_open() {
         let conn = database_at_v37();

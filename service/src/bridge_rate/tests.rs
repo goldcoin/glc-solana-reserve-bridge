@@ -569,3 +569,301 @@ fn a_live_book_refuses_until_warm_then_quotes_and_flags_a_breach() {
     assert_eq!(inverse.quote.gross_out.0, GLC);
     assert_eq!(inverse.band.unwrap().movement_bps, 5_000);
 }
+
+// ---------------------------------------------------------------------
+// The destination-bound maximum (docs/40-destination-bound-admission.md).
+// ---------------------------------------------------------------------
+
+/// The live prices at which requests 4438 and 4483 were quoted on
+/// 2026-09-18 (`POST /quote` reproduction in the incident report): GLC
+/// (Goldcoin) at 731_245_672 e12, GLC (Solana) at 43_669_983 e12 — a
+/// rate of ~16.7 Solana units per Goldcoin unit.
+const INCIDENT_PRICES: RailPrices = RailPrices {
+    source_price_e12: 731_245_672,
+    destination_price_e12: 43_669_983,
+    source_feed_at: 1_000,
+    destination_feed_at: 1_000,
+};
+/// The program's `per_transfer_limit`: 50_000 GLC at the mint's 6
+/// decimals = 50_000_000_000 mint units, widened to canonical.
+const INCIDENT_LIMIT_CANONICAL: u64 = 50_000 * GLC;
+const SOLANA_SCALE: u64 = 100;
+
+fn net_at(gross: u64, prices: RailPrices, fee_bps: u64, scale: u64) -> Option<u64> {
+    quoted_breakdown(
+        CanonicalAtomic(gross),
+        prices.source_price_e12,
+        prices.destination_price_e12,
+        fee_bps,
+        scale,
+    )
+    .ok()
+    .map(|q| q.net_out.0)
+}
+
+/// `max` is a boundary, not an estimate: the net at `max` fits and the
+/// net one unit above does not.
+fn assert_exact_boundary(
+    limit: u64,
+    prices: RailPrices,
+    fee_bps: u64,
+    scale: u64,
+    buffer_bps: u64,
+) -> u64 {
+    let buffered = buffered_destination_limit(CanonicalAtomic(limit), buffer_bps).0;
+    let max = max_source_for_destination_limit(
+        CanonicalAtomic(limit),
+        prices,
+        fee_bps,
+        scale,
+        buffer_bps,
+    )
+    .unwrap()
+    .0;
+    if buffered < scale || fee_bps == BPS_DENOMINATOR {
+        assert_eq!(
+            max, 0,
+            "nothing deliverable fits a buffered limit of {buffered}"
+        );
+        return 0;
+    }
+    let at = net_at(max, prices, fee_bps, scale).expect("the maximum itself quotes");
+    assert!(
+        at <= buffered,
+        "net at max {max} is {at}, above the buffered limit {buffered}"
+    );
+    // A maximum of zero is a real answer at an extreme rate: one canonical
+    // unit already nets above the limit. Otherwise the net at the maximum
+    // is deliverable — at least one destination unit.
+    if max > 0 {
+        assert!(at >= scale, "the net at the maximum ({at}) is deliverable");
+    }
+    if max < u64::MAX {
+        // One unit more either does not quote at all (overflow) or nets
+        // above the buffered limit.
+        if let Some(above) = net_at(max + 1, prices, fee_bps, scale) {
+            assert!(
+                above > buffered,
+                "net at max+1 ({}) is {above}, still within the buffered limit {buffered}",
+                max + 1
+            );
+        }
+    }
+    max
+}
+
+#[test]
+fn the_buffer_reduces_the_limit_by_basis_points_and_never_rounds_up() {
+    assert_eq!(
+        buffered_destination_limit(CanonicalAtomic(10_000), 0).0,
+        10_000
+    );
+    assert_eq!(
+        buffered_destination_limit(CanonicalAtomic(10_000), 2_500).0,
+        7_500
+    );
+    assert_eq!(
+        buffered_destination_limit(CanonicalAtomic(10_000), 10_000).0,
+        0
+    );
+    assert_eq!(
+        buffered_destination_limit(CanonicalAtomic(10_000), 20_000).0,
+        0
+    );
+    // 7 × 0.75 = 5.25 → 5, never 6.
+    assert_eq!(buffered_destination_limit(CanonicalAtomic(7), 2_500).0, 5);
+    assert_eq!(
+        buffered_destination_limit(CanonicalAtomic(u64::MAX), 2_500).0,
+        (u128::from(u64::MAX) * 7_500 / 10_000) as u64
+    );
+    assert_eq!(DEFAULT_DESTINATION_LIMIT_BUFFER_BPS, 2_500);
+}
+
+/// At a unit rate the maximum is the fee rule inverted, and the
+/// destination floor (J-7) is honoured: a limit of 1_000 at scale 100
+/// admits a gross of 1_099 (net 1_099 → floored 1_000) but not 1_100.
+#[test]
+fn at_a_unit_rate_the_maximum_inverts_the_fee_and_honours_the_floor() {
+    let unit = prices(PRICE_SCALE, PRICE_SCALE);
+    assert_eq!(assert_exact_boundary(1_000, unit, 0, 1, 0), 1_000);
+    assert_eq!(assert_exact_boundary(1_000, unit, 0, 100, 0), 1_099);
+    // 300 bps: net(g) = g − ⌊g·300/10000⌋. net(1030) = 1030 − 30 = 1000;
+    // net(1031) = 1031 − 30 = 1001.
+    assert_eq!(assert_exact_boundary(1_000, unit, 300, 1, 0), 1_030);
+    // With the established 25 % buffer the limit 1_000 admits 750 net:
+    // net(773) = 773 − 23 = 750; net(774) = 774 − 23 = 751.
+    assert_eq!(assert_exact_boundary(1_000, unit, 300, 1, 2_500), 773);
+}
+
+/// The 2026-09-18 figures, pinned: at the incident's live rate a 50_000
+/// GLC limit admits at most 3_078.34991410 GLC (buffer 0) and, with the
+/// established 25 % band as buffer, 2_308.76243559 GLC — and 50_000 GLC
+/// (what 4438 and 4483 sent) is far outside both.
+#[test]
+fn the_incident_rate_yields_the_reported_maximum_and_refuses_the_incident_amount() {
+    let unbuffered = assert_exact_boundary(
+        INCIDENT_LIMIT_CANONICAL,
+        INCIDENT_PRICES,
+        300,
+        SOLANA_SCALE,
+        0,
+    );
+    assert_eq!(unbuffered, 307_834_991_410);
+    let buffered = assert_exact_boundary(
+        INCIDENT_LIMIT_CANONICAL,
+        INCIDENT_PRICES,
+        300,
+        SOLANA_SCALE,
+        DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+    );
+    assert_eq!(buffered, 230_876_243_559);
+    assert!(buffered < unbuffered);
+    // The incident amount nets to ~812_123.40 GLC (Solana) — 16× the limit.
+    let incident_net = net_at(50_000 * GLC, INCIDENT_PRICES, 300, SOLANA_SCALE).unwrap();
+    assert!(incident_net > INCIDENT_LIMIT_CANONICAL);
+    assert_eq!(incident_net, 81_212_340_046_000);
+    assert!(50_000 * GLC > unbuffered);
+}
+
+/// A buffer of 100 % (or a zero limit, or a limit below one destination
+/// unit) admits nothing; a fee of 100 % admits nothing.
+#[test]
+fn a_maximum_of_zero_when_nothing_could_fit() {
+    let unit = prices(PRICE_SCALE, PRICE_SCALE);
+    assert_eq!(assert_exact_boundary(1_000, unit, 300, 1, 10_000), 0);
+    assert_eq!(assert_exact_boundary(0, unit, 300, 1, 0), 0);
+    assert_eq!(assert_exact_boundary(99, unit, 0, 100, 0), 0);
+    assert_eq!(assert_exact_boundary(1_000, unit, 10_000, 1, 0), 0);
+    // Invalid inputs are refused, never answered with a number.
+    assert!(max_source_for_destination_limit(CanonicalAtomic(1), unit, 300, 0, 0).is_err());
+    assert!(max_source_for_destination_limit(CanonicalAtomic(1), unit, 10_001, 1, 0).is_err());
+    assert!(max_source_for_destination_limit(CanonicalAtomic(1), prices(0, 1), 300, 1, 0).is_err());
+}
+
+/// The integer property test: across prices spanning six orders of
+/// magnitude each way, every fee the config admits, every destination
+/// precision and limits from one unit to the whole canonical range, the
+/// maximum is ALWAYS the exact boundary. Deterministic (a fixed
+/// xorshift stream), so a failure reproduces.
+#[test]
+fn max_source_is_the_exact_boundary() {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut cases = 0u32;
+    for _ in 0..4_000 {
+        // Prices between 1e6 and 1e12 e12 (1e-6 .. 1.0 of the reference
+        // asset), so the rate ranges over 1e-6 .. 1e6.
+        let src = 10u64.pow(6 + (next() % 7) as u32) + next() % 1_000_000;
+        let dst = 10u64.pow(6 + (next() % 7) as u32) + next() % 1_000_000;
+        let fee_bps = [0u64, 1, 100, 300, 450, 600, 2_500, 9_999][(next() % 8) as usize];
+        let scale = [1u64, 10, 100, 1_000_000][(next() % 4) as usize];
+        let buffer_bps = [0u64, 1, 2_500, 5_000, 9_999][(next() % 5) as usize];
+        let limit = match next() % 4 {
+            0 => next() % 1_000,
+            1 => next() % (1_000 * GLC),
+            2 => next() % (100_000_000 * GLC),
+            _ => next(),
+        };
+        assert_exact_boundary(limit, prices(src, dst), fee_bps, scale, buffer_bps);
+        cases += 1;
+    }
+    assert_eq!(cases, 4_000);
+    // And the two production shapes, at the extremes of the limit range.
+    for limit in [
+        1u64,
+        100,
+        20_000 * GLC,
+        50_000 * GLC,
+        u64::MAX / 2,
+        u64::MAX,
+    ] {
+        assert_exact_boundary(limit, INCIDENT_PRICES, 300, SOLANA_SCALE, 2_500);
+        assert_exact_boundary(limit, prices(PRICE_SCALE, PRICE_SCALE), 600, 1, 2_500);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The two parked requests (4438, 4483) against candidate program limits.
+// ---------------------------------------------------------------------
+
+/// Requests 4438 and 4483 as the ledger holds them (locked quotes read
+/// from `GET /transfers/{id}` on 2026-09-20): 50_000 GLC gross, 300 bps,
+/// locked rail prices, and the nets the settlement path must pay. Both
+/// were parked `destination_payout_out_of_bounds` against a 50_000 GLC
+/// (Solana) `per_transfer_limit`. This pins, for each candidate limit,
+/// (a) the SETTLEMENT verdict — `Orchestrator::release_out_of_bounds`
+/// compares the locked net in mint units to the raw limit, no buffer —
+/// and (b) the ADMISSION verdict a NEW identical request would get from
+/// docs/40's buffered check. The quote arithmetic is reproduced from the
+/// locked prices bit for bit, so the ledger figures are the oracle.
+#[test]
+fn requests_4438_and_4483_against_candidate_per_transfer_limits() {
+    let fee_bps = 300;
+    let gross = CanonicalAtomic(50_000 * GLC);
+    let cases = [
+        (
+            4438u32,
+            prices(983_906_422, 50_389_216),
+            94_701_734_329_400u64,
+        ),
+        (4483, prices(772_204_750, 45_187_267), 82_881_601_082_400),
+    ];
+    for (id, p, locked_net) in cases {
+        let q = quoted_breakdown(
+            gross,
+            p.source_price_e12,
+            p.destination_price_e12,
+            fee_bps,
+            SOLANA_SCALE,
+        )
+        .unwrap();
+        assert_eq!(
+            q.net_out.0, locked_net,
+            "request {id}: the locked quote reproduces"
+        );
+        let net_mint_units = locked_net / SOLANA_SCALE;
+        // (a) settlement: pays iff net ≤ per_transfer_limit (mint units).
+        for (limit_mint_units, pays) in [
+            (50_000_000_000u64, false), // today: parked (the incident)
+            (1_000_000_000_000, true),  // 1_000_000 GLC (Solana)
+            (2_000_000_000_000, true),  // 2_000_000 GLC (Solana)
+        ] {
+            assert_eq!(
+                net_mint_units <= limit_mint_units,
+                pays,
+                "request {id}: settlement at limit {limit_mint_units}"
+            );
+        }
+        // (b) admission of a NEW identical request under docs/40, at the
+        // established 25 % buffer and with no buffer.
+        for (limit_mint_units, buffer_bps, admitted) in [
+            (1_000_000_000_000u64, 2_500u64, false), // 947k / 829k > 750k
+            (1_000_000_000_000, 0, true),            // both ≤ 1_000_000
+            (2_000_000_000_000, 2_500, true),        // both ≤ 1_500_000
+            (2_000_000_000_000, 0, true),
+        ] {
+            let max = max_source_for_destination_limit(
+                CanonicalAtomic(limit_mint_units * SOLANA_SCALE),
+                p,
+                fee_bps,
+                SOLANA_SCALE,
+                buffer_bps,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(
+                gross.0 <= max,
+                admitted,
+                "request {id}: admission at limit {limit_mint_units} buffer {buffer_bps} (max {max})"
+            );
+        }
+    }
+    // The exact nets, in mint units, beside the candidates.
+    assert_eq!(94_701_734_329_400 / SOLANA_SCALE, 947_017_343_294);
+    assert_eq!(82_881_601_082_400 / SOLANA_SCALE, 828_816_010_824);
+}

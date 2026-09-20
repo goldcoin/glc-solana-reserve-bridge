@@ -84,6 +84,7 @@ use std::sync::Arc;
 
 use crate::amount_conversion::{
     compute_fee_at_bps, verify_fee_breakdown, CanonicalAtomic, ConversionError, FeeBreakdown,
+    BPS_DENOMINATOR,
 };
 use crate::routes::Route;
 
@@ -156,6 +157,18 @@ impl BridgeQuote {
     /// The quote's amounts in the shape every settlement path already
     /// consumes. `gross` here is `gross_out` — the destination-asset figure
     /// the fee and net were derived from — never `gross_in`.
+    /// The rail prices this quote was struck at, as the [`RailPrices`]
+    /// [`max_source_for_destination_limit`] takes — so a maximum derived
+    /// beside a quote is derived at exactly the quote's own prices.
+    pub fn rail_prices(&self) -> RailPrices {
+        RailPrices {
+            source_price_e12: self.source_price_e12,
+            destination_price_e12: self.destination_price_e12,
+            source_feed_at: self.source_feed_at,
+            destination_feed_at: self.destination_feed_at,
+        }
+    }
+
     pub fn breakdown(&self) -> FeeBreakdown {
         FeeBreakdown {
             gross: self.gross_out,
@@ -660,6 +673,135 @@ pub fn format_rate_e12(source_price_e12: u64, destination_price_e12: u64) -> Str
     let whole = scaled / u128::from(PRICE_SCALE);
     let frac = scaled % u128::from(PRICE_SCALE);
     format!("{whole}.{frac:012}")
+}
+
+// ------------------------------------------- destination-bound admission --
+
+/// The default `destination_limit_buffer_bps`: one rate band (the
+/// configured `rate_band_pct`, 25 % in production → 2500 bps). See
+/// [`buffered_destination_limit`] for why one band is the right unit.
+pub const DEFAULT_DESTINATION_LIMIT_BUFFER_BPS: u64 = 2_500;
+
+/// The largest quoted destination net this deployment ADMITS against a
+/// destination-chain limit of `limit_canonical`:
+/// `⌊limit · (10000 − buffer_bps) / 10000⌋`, canonical units.
+///
+/// # Why a buffer, and why one band is enough
+///
+/// A Goldcoin-sourced request is quoted at `POST /transfers` and LOCKED
+/// at its first deposit observation (docs/38, J-4) — the payout the
+/// destination chain finally sees is struck at the observation-time
+/// rate, not the quote-time rate. The destination chain's limit (the
+/// Solana program's `per_transfer_limit`, the Robinhood contract's
+/// `outboundMax`) is checked again before any signer is asked
+/// (`Orchestrator::release_out_of_bounds`, `Settler::authorize_payout`)
+/// and a breach parks the request `destination_payout_out_of_bounds`.
+/// Admitting a request whose quote sits exactly at the limit therefore
+/// admits a request that any upward rate move turns unpayable.
+///
+/// The live book bounds the rate's movement between consecutive price
+/// windows to `rate_band_bps` (`RouteRate::band_exceeded` parks a
+/// deposit that moved further). A deposit observed within one window of
+/// its quote can thus have moved at most one band, so a buffer of one
+/// band keeps every such order payable. A deposit observed later can
+/// have drifted further (each window is bounded, the sum is not); that
+/// remains the settlement check's job — the buffer makes the park rare,
+/// it cannot and must not make it unreachable.
+///
+/// A buffer of `10000` bps (or more) admits nothing; `0` admits up to the
+/// limit exactly.
+pub fn buffered_destination_limit(
+    limit_canonical: CanonicalAtomic,
+    buffer_bps: u64,
+) -> CanonicalAtomic {
+    let keep = BPS_DENOMINATOR.saturating_sub(buffer_bps);
+    let scaled = u128::from(limit_canonical.0) * u128::from(keep) / u128::from(BPS_DENOMINATOR);
+    // keep ≤ BPS_DENOMINATOR, so the product / denominator ≤ the input.
+    CanonicalAtomic(scaled as u64)
+}
+
+/// **The one canonical maximum.** The largest source amount (canonical
+/// units, the figure a depositor sends) whose quoted destination net —
+/// derived by [`quoted_breakdown`], the SAME integer arithmetic every
+/// quote, lock and settlement verification uses — does not exceed
+/// [`buffered_destination_limit`]`(limit_canonical, buffer_bps)`.
+///
+/// `limit_canonical` is the destination chain's per-transfer limit
+/// already converted to canonical units by the caller (the Solana
+/// program's `per_transfer_limit` widened from the mint's decimals; the
+/// Robinhood contract's `outboundMax` floored from 18 dp). The
+/// destination precision floor (J-7) is applied through
+/// `destination_scale` exactly as the quote applies it.
+///
+/// Found by binary search over the monotone (non-decreasing) integer
+/// function `gross_in ↦ net_out`, never by rearranging the formula —
+/// so the two can never disagree by a rounding unit. Pinned by
+/// `tests::max_source_is_the_exact_boundary`: `net_out(max) ≤ buffered`
+/// and `net_out(max + 1) > buffered` whenever `max > 0`.
+///
+/// Returns `0` when no deliverable source amount fits (a buffer of
+/// 100 %, a fee of 100 %, a zero limit, or a buffered limit below one
+/// destination unit — the net would floor to nothing). Otherwise the
+/// net at the maximum is at least one destination unit.
+pub fn max_source_for_destination_limit(
+    limit_canonical: CanonicalAtomic,
+    prices: RailPrices,
+    fee_bps: u64,
+    destination_scale: u64,
+    buffer_bps: u64,
+) -> Result<CanonicalAtomic, ConversionError> {
+    if destination_scale == 0 {
+        return Err(ConversionError::InvalidDestinationScale);
+    }
+    if fee_bps > BPS_DENOMINATOR {
+        return Err(ConversionError::FeeBpsOutOfRange {
+            fee_bps,
+            max: BPS_DENOMINATOR,
+        });
+    }
+    if prices.source_price_e12 == 0 || prices.destination_price_e12 == 0 {
+        return Err(ConversionError::InvalidBridgePrice {
+            source_price_e12: prices.source_price_e12,
+            destination_price_e12: prices.destination_price_e12,
+        });
+    }
+    let buffered = buffered_destination_limit(limit_canonical, buffer_bps);
+    // Below one destination unit nothing DELIVERABLE fits: a gross that
+    // nets to zero after the floor would technically "fit" a limit of
+    // 0..scale-1, and no bridge admits a transfer that pays nothing.
+    if buffered.0 < destination_scale || fee_bps == BPS_DENOMINATOR {
+        return Ok(CanonicalAtomic(0));
+    }
+    // `net_out` is non-decreasing in `gross_in` (every step is a floor of
+    // a non-decreasing function), and an overflow while computing it can
+    // only happen above any admissible amount — so "fits" is a monotone
+    // predicate and a binary search is exact.
+    let fits = |gross_in: u64| -> bool {
+        match quoted_breakdown(
+            CanonicalAtomic(gross_in),
+            prices.source_price_e12,
+            prices.destination_price_e12,
+            fee_bps,
+            destination_scale,
+        ) {
+            Ok(qb) => qb.net_out.0 <= buffered.0,
+            Err(_) => false,
+        }
+    };
+    let (mut lo, mut hi) = (0u64, u64::MAX);
+    if fits(hi) {
+        return Ok(CanonicalAtomic(hi));
+    }
+    // Invariant: fits(lo), !fits(hi).
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(CanonicalAtomic(lo))
 }
 
 #[cfg(test)]

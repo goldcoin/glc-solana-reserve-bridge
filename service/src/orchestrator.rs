@@ -572,6 +572,17 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         self
     }
 
+    /// Wires the Robinhood contract reader the `SolToRhn` fold checks
+    /// its payout against — see
+    /// [`SolanaIndexer::with_robinhood_destination_limits`].
+    pub fn with_robinhood_destination_limits(
+        mut self,
+        limits: Option<crate::solana::indexer::RobinhoodDestinationLimits>,
+    ) -> Self {
+        self.solana_indexer.set_robinhood_destination_limits(limits);
+        self
+    }
+
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
     }
