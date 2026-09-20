@@ -1470,6 +1470,14 @@ impl Ledger {
         &self.conn
     }
 
+    /// A `Ledger` over an already-migrated connection, for the schema
+    /// module's migration tests to exercise the public API on the exact
+    /// rows a migration produced. Test-only: not compiled into the binary.
+    #[cfg(test)]
+    pub(crate) fn from_connection_for_tests(conn: rusqlite::Connection) -> Self {
+        Ledger { conn }
+    }
+
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
         // Same setting as [`Ledger::open`], so an in-memory ledger and a
