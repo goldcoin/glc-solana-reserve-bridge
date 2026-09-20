@@ -350,3 +350,58 @@ async fn uninitialized_bridge_config_is_a_hard_error_not_treated_as_zero_obligat
     let result = idx.tick().await;
     assert!(matches!(result, Err(SolanaIndexerError::NotInitialized(_))));
 }
+
+/// The SOURCE transfer maximum at the Solana fold: a `SolToGlc` deposit
+/// the program accepted above 50 000 GLC (`min_transfer::
+/// SOURCE_MAXIMUM_CANONICAL`) folds PARKED with an explicit reason and
+/// holds no capacity; one at exactly the maximum folds payable. Mint units
+/// (6 dp) are canonical / 100.
+#[tokio::test]
+async fn a_deposit_above_the_source_maximum_is_parked_at_the_fold() {
+    let max_mint_units = crate::min_transfer::SOURCE_MAXIMUM_CANONICAL.0 / 100;
+    for (amount, parked) in [(max_mint_units, false), (max_mint_units + 1, true)] {
+        let rpc = MockRpc::new();
+        rpc.set_account(accounts::bridge_config_pda(), fake_bridge_config(1));
+        rpc.set_account(
+            accounts::withdrawal_obligation_pda(0),
+            fake_obligation(0, amount, b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef"),
+        );
+        rpc.set_account(
+            Pubkey::new_from_array([7u8; 32]),
+            fake_mint_bytes(TEST_SOLANA_DECIMALS),
+        );
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                100_000_000_000_000,
+                0,
+                50_000_000_000_000,
+                20_000_000_000_000,
+                10_000_000_000_000,
+                0,
+            )
+            .unwrap();
+        let mut idx = SolanaIndexer::new(rpc, ledger, crate::amount_conversion::BRIDGE_FEE_BPS)
+            .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
+        assert_eq!(
+            idx.tick().await.unwrap(),
+            SolanaTickOutcome::Folded { count: 1 }
+        );
+        let state = if parked {
+            crate::ledger::RequestState::ManualReview
+        } else {
+            crate::ledger::RequestState::SourceFinalized
+        };
+        let reqs = idx
+            .ledger()
+            .requests_by_state(crate::ledger::Direction::SolToGlc, state)
+            .unwrap();
+        assert_eq!(reqs.len(), 1, "amount {amount}: expected {state:?}");
+        assert_eq!(reqs[0].gross_amount_atomic, amount * 100);
+        if parked {
+            let note = reqs[0].manual_review_note.as_deref().unwrap();
+            assert!(note.starts_with("above source maximum"), "{note}");
+        }
+    }
+}

@@ -413,6 +413,19 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             )
             .err()
             .map(|e| format!("below source minimum: {e}"))
+            // The source-side ceiling (`min_transfer::SOURCE_MAXIMUM_CANONICAL`,
+            // the user transfer limit): a deposit above it the program
+            // accepted anyway is parked for the same reason a sub-minimum
+            // one is — the policy is on what was SENT, and the deposit is
+            // already final. Recoverable by an operator.
+            .or_else(|| {
+                crate::min_transfer::enforce_source_maximum(
+                    crate::routes::Route::SolToGlc,
+                    gross_canonical,
+                )
+                .err()
+                .map(|e| format!("above source maximum: {e}"))
+            })
             // The bridge-rate park (band breach, or a refused quote)
             // ranks after the source-side floor: a deposit under the
             // minimum is reported for the minimum, which is the fact a
@@ -513,7 +526,15 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             self.source_minimum,
         )
         .err()
-        .map(|e| format!("below source minimum: {e}"));
+        .map(|e| format!("below source minimum: {e}"))
+        .or_else(|| {
+            crate::min_transfer::enforce_source_maximum(
+                crate::routes::Route::SolToRhn,
+                gross_canonical,
+            )
+            .err()
+            .map(|e| format!("above source maximum: {e}"))
+        });
         // The destination-bound check at the fold's own locked prices
         // (docs/40-destination-bound-admission.md): the SAME derivation
         // `POST /transfers` admits a Goldcoin deposit with, so a
@@ -525,14 +546,14 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
         // A refused rate carries no quote and is parked for the refusal
         // (`pricing.park`); there is then no price to check a bound at.
         let over_destination_bound = robinhood_limits.zip(pricing.quote.as_ref()).and_then(
-            |((limits, buffer_bps), quote)| match crate::api::max_transfer_from(
+            |((limits, buffer_bps), quote)| match crate::api::destination_admissible_from(
                 crate::routes::Route::SolToRhn,
                 limits,
                 Some(fee_bps),
                 Some(quote.rail_prices()),
                 *buffer_bps,
             ) {
-                crate::api::MaxTransfer::Known(max) if gross_canonical.0 > max.0 => {
+                crate::api::DestinationAdmissible::Known(max) if gross_canonical.0 > max.0 => {
                     tracing::warn!(
                         obligation_index = index,
                         gross_canonical = gross_canonical.0,

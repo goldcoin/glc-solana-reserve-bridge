@@ -314,3 +314,37 @@ mod fold_parking {
         assert!(request.manual_review_note.is_none());
     }
 }
+
+// ------------------------------------------------ the source MAXIMUM --
+
+#[test]
+fn the_source_maximum_is_fifty_thousand_glc_on_every_route_inclusive() {
+    assert_eq!(SOURCE_MAXIMUM_CANONICAL.0, 50_000 * 100_000_000);
+    for route in Route::ALL {
+        assert_eq!(source_maximum(route), SOURCE_MAXIMUM_CANONICAL);
+        assert!(enforce_source_maximum(route, SOURCE_MAXIMUM_CANONICAL).is_ok());
+        assert!(enforce_source_maximum(route, CanonicalAtomic(1)).is_ok());
+        let err = enforce_source_maximum(route, CanonicalAtomic(SOURCE_MAXIMUM_CANONICAL.0 + 1))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MaxTransferError::AboveSourceMaximum {
+                route: route.as_str(),
+                gross: SOURCE_MAXIMUM_CANONICAL.0 + 1,
+                maximum: SOURCE_MAXIMUM_CANONICAL.0,
+            }
+        );
+        assert!(err.to_string().contains("amount SENT"));
+    }
+    // The explicit-ceiling form is the same comparison.
+    assert!(
+        enforce_source_maximum_at(Route::GlcToSol, CanonicalAtomic(10), CanonicalAtomic(10))
+            .is_ok()
+    );
+    assert!(
+        enforce_source_maximum_at(Route::GlcToSol, CanonicalAtomic(11), CanonicalAtomic(10))
+            .is_err()
+    );
+    // Minimum and maximum bracket a real range.
+    const { assert!(SOURCE_MINIMUM_CANONICAL.0 < SOURCE_MAXIMUM_CANONICAL.0) };
+}
