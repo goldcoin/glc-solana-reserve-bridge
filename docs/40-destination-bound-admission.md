@@ -3,6 +3,20 @@
 **Hotfix, 2026-09-20.** No schema change. Branch
 `fix/destination-bound-admission`.
 
+**What this is, and is not.** Large elastic payouts are INTENDED: at a live
+rate of ~17 Solana units per Goldcoin unit, 50 000 GLC (L1) paying out
+~830 000 GLC (Solana) is correct bridge economics. This document adds a
+*guard*, not an economic cap: the bridge refuses — before a deposit address
+exists — only what the destination chain literally cannot pay in one
+release, and it publishes that figure so a UI can cap its entry at it. The
+figure is derived from the destination's LIVE per-transfer limit, so it is
+whatever the operators make it: the Solana program's `per_transfer_limit`
+is admin-gated-immediate (`glc-admin set-limit --field per-transfer`, no
+redeploy), the Robinhood contract's `outboundMax` is a 2-of-3 `setLimits`.
+The 2026-09-18 incident was a LIMIT sized for a unit rate (50 000) meeting
+an elastic one; the remedy is to size the limit for the intended payouts,
+and then this guard only fires on a rate spike beyond that sizing.
+
 This document is the canonical cross-reference target
 ("docs/40-destination-bound-admission.md") named in
 `service/src/bridge_rate.rs`, `service/src/api.rs`,
@@ -115,6 +129,12 @@ of_inbound_max_and_the_program_limit`).
 
 ## The buffer, and why it is sufficient
 
+The buffer shaves the admitted maximum to `(1 − b)` of the limit-derived
+figure. With a limit sized for the intended payouts this is the intended
+headroom against a rate move between admission and lock; if the founder
+wants the full limit admissible, size L with the `1/(1 − b)` factor above
+or lower `destination_limit_buffer_bps` — no code change either way.
+
 `[bridge_rate] destination_limit_buffer_bps` (default: `rate_band_pct ×
 100`, i.e. 2 500 = the established band; validated ≤ 10 000; honoured in
 both rate modes). Admission stays this far below the destination limit.
@@ -161,15 +181,51 @@ settlement park exists for, and it is why the park stays.
   `GlcToSol`.
 - Existing fields, `min_transfer_atomic` included, are unchanged.
 
+## The limit is the economic knob
+
+The published maximum scales linearly with the destination limit, with no
+code or config change (`api::tests::destination_bound::raising_per_
+transfer_limit_raises_the_maximum_without_a_code_change`). At the
+2026-09-20 live rate (Goldcoin 758 565 116 e12, Solana 44 009 955 e12,
+i.e. 17.24; 300 bps; 25 % buffer):
+
+| `per_transfer_limit` (GLC on Solana) | max source (GLC L1) |
+|---|---|
+| 50 000 (today) | 2 242.94 |
+| 1 000 000 | 44 858.79 |
+| 2 000 000 | 89 717.59 |
+
+Sizing rule for an intended maximum source S, a rate ceiling R to plan
+for, fee f and buffer b: `L ≥ S · R · (1 − f) / (1 − b)`. Nothing here
+decides L; `glc-admin set-limit` does, and docs/09-runbook.md's
+per-transfer-limit section owns the operational consequences (deposit
+direction, UTXO chunk target, per-transaction blast radius).
+
+## Availability probe
+
+`SolToGlc`'s public availability is probed at a "normal large deposit"
+(docs/09-runbook.md, 2026-09-12). Before this change the probe WAS the
+program's `per_transfer_limit`, which was right while the limit was a
+normal size. A limit sized for elastic payouts (millions of Solana units)
+would make the probe ask whether the Goldcoin reserve could fund the
+largest deposit the program permits — and its "no" would close the
+route's advertisement while every real deposit still admits. The probe is
+now `min(per_transfer_limit, [service] sol_to_glc_probe_gross_atomic)`
+(canonical units; default 5 000 000 000 000 = 50 000 GLC, today's limit —
+so today's behaviour is bit-identical). The liquidity gates still decide
+every deposit at its own size; the probe only decides what "available"
+claims.
+
 ## Operator notes
 
-- The reported maxima at the 2026-09-18 live rate (Goldcoin 731 245 672
-  e12, Solana 43 669 983 e12, 300 bps, limit 50 000 GLC): **2 308.76243559
-  GLC** with the 25 % buffer (3 078.34991410 GLC unbuffered). Both are
-  pinned in `bridge_rate::tests`; neither appears anywhere but a test.
 - `glc-admin set-limit` and a Robinhood `setLimits` move the maxima
   immediately (the limits are read live on every listing, quote and
-  create; the fold reads once per tick).
+  create; the fold reads once per tick). Nothing about today's 50 000 is
+  assumed anywhere but in tests that reproduce the incident.
 - A `GlcToSol`/`GlcToRhn` route reading `destination_limit_unavailable`
   means the program config, the mint's decimals, the contract or the
   rate could not be read — the same reads a create would fail on.
+- Requests 4438 / 4483 (locked nets 947 017.34 and 828 816.01 GLC on
+  Solana) pay at any limit ≥ 947 018; pinned in `bridge_rate::tests::
+  requests_4438_and_4483_against_candidate_per_transfer_limits` for
+  1 000 000 and 2 000 000, settlement and admission verdicts separately.

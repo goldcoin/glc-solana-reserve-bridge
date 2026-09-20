@@ -1248,21 +1248,39 @@ pub struct RouteProbes {
     pub sol_to_glc: Option<AdmissionProbe>,
 }
 
-/// The `SolToGlc` probe — the Solana program's `per_transfer_limit`
-/// netted through the route fee — from inputs the caller already read.
-/// Pure, so `GET /chains` and the admin API's `GET /routes` strike the
-/// SAME probe from the same config and cannot disagree about what "a
-/// normal transfer" is. `None` fails closed (no probe → `SolToGlc` is
-/// reported unavailable with `AVAILABILITY_REASON_PROBE_UNAVAILABLE`).
+/// The size `SolToGlc` availability is probed at when nothing narrower is
+/// configured: 50_000 GLC (canonical), the program's `per_transfer_limit`
+/// the probe was designed against on 2026-09-12. `[service]
+/// sol_to_glc_probe_gross_atomic` overrides it.
+pub const DEFAULT_SOL_TO_GLC_PROBE_GROSS: CanonicalAtomic = CanonicalAtomic(5_000_000_000_000);
+
+/// The `SolToGlc` probe — a "normal large deposit" netted through the
+/// route fee — from inputs the caller already read. Pure, so `GET
+/// /chains` and the admin API's `GET /routes` strike the SAME probe from
+/// the same config and cannot disagree about what "a normal transfer"
+/// is. `None` fails closed (no probe → `SolToGlc` is reported unavailable
+/// with `AVAILABILITY_REASON_PROBE_UNAVAILABLE`).
+///
+/// The probe gross is `min(per_transfer_limit, probe_gross)`: never above
+/// what the program accepts (a larger deposit cannot exist), and never
+/// above the configured normal size. Before docs/40 the probe WAS the
+/// program limit; with that limit sized for elastic payouts (millions of
+/// Solana units) a probe at the limit would ask whether the Goldcoin
+/// reserve could fund the largest deposit the program permits — a
+/// question whose "no" would close the route's advertisement while every
+/// real deposit still admits. Availability is a statement about normal
+/// traffic; the liquidity gates still decide every deposit at its own
+/// size, and a deposit above the probe is still parked, never paid short.
 pub(crate) fn sol_to_glc_probe_from(
     config: &accounts::BridgeConfigSnapshot,
     decimals: u8,
     route_fees: &crate::fees::RouteFees,
     rate_book: Option<&crate::bridge_rate::RateBook>,
+    probe_gross: CanonicalAtomic,
     now: i64,
 ) -> Option<AdmissionProbe> {
     let route = crate::routes::Route::SolToGlc;
-    let gross = match crate::amount_conversion::SolanaAtomic(config.per_transfer_limit)
+    let limit = match crate::amount_conversion::SolanaAtomic(config.per_transfer_limit)
         .to_canonical(decimals)
     {
         Ok(g) => g,
@@ -1275,6 +1293,7 @@ pub(crate) fn sol_to_glc_probe_from(
             return None;
         }
     };
+    let gross = CanonicalAtomic(limit.0.min(probe_gross.0));
     let fee_bps = match route_fees.fee_bps(route) {
         Ok(bps) => bps,
         Err(e) => {
@@ -3169,6 +3188,10 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// default one rate band). See
     /// [`crate::bridge_rate::buffered_destination_limit`].
     destination_limit_buffer_bps: u64,
+    /// The gross `SolToGlc` availability is probed at (`[service]
+    /// sol_to_glc_probe_gross_atomic`, canonical) — see
+    /// [`sol_to_glc_probe_from`].
+    sol_to_glc_probe_gross: CanonicalAtomic,
     /// The source-side gross floor this instance admits against.
     ///
     /// Always [`crate::min_transfer::SOURCE_MINIMUM_CANONICAL`] in
@@ -3228,6 +3251,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             program_compat: crate::solana::program_compat::ProgramCompatCache::new(),
             robinhood_contract: None,
             destination_limit_buffer_bps: crate::bridge_rate::DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+            sol_to_glc_probe_gross: DEFAULT_SOL_TO_GLC_PROBE_GROSS,
             // The policy, applied by construction. Not read from config,
             // not defaulted from a chain, and not optional: every
             // production `BridgeApi` in existence admits against exactly
@@ -3240,6 +3264,13 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
     /// (`[bridge_rate] destination_limit_buffer_bps`).
     pub fn with_destination_limit_buffer_bps(mut self, buffer_bps: u64) -> Self {
         self.destination_limit_buffer_bps = buffer_bps;
+        self
+    }
+
+    /// The gross `SolToGlc` availability is probed at (`[service]
+    /// sol_to_glc_probe_gross_atomic`) — see [`sol_to_glc_probe_from`].
+    pub fn with_sol_to_glc_probe_gross(mut self, gross: CanonicalAtomic) -> Self {
+        self.sol_to_glc_probe_gross = gross;
         self
     }
 
@@ -3693,6 +3724,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             decimals,
             &self.route_fees,
             Some(&self.rate_book),
+            self.sol_to_glc_probe_gross,
             now_unix(),
         )
     }
@@ -3784,6 +3816,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
                             d,
                             &self.route_fees,
                             Some(&self.rate_book),
+                            self.sol_to_glc_probe_gross,
                             now_unix(),
                         )
                     }),

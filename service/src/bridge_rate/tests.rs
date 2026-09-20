@@ -786,3 +786,84 @@ fn max_source_is_the_exact_boundary() {
         assert_exact_boundary(limit, prices(PRICE_SCALE, PRICE_SCALE), 600, 1, 2_500);
     }
 }
+
+// ---------------------------------------------------------------------
+// The two parked requests (4438, 4483) against candidate program limits.
+// ---------------------------------------------------------------------
+
+/// Requests 4438 and 4483 as the ledger holds them (locked quotes read
+/// from `GET /transfers/{id}` on 2026-09-20): 50_000 GLC gross, 300 bps,
+/// locked rail prices, and the nets the settlement path must pay. Both
+/// were parked `destination_payout_out_of_bounds` against a 50_000 GLC
+/// (Solana) `per_transfer_limit`. This pins, for each candidate limit,
+/// (a) the SETTLEMENT verdict — `Orchestrator::release_out_of_bounds`
+/// compares the locked net in mint units to the raw limit, no buffer —
+/// and (b) the ADMISSION verdict a NEW identical request would get from
+/// docs/40's buffered check. The quote arithmetic is reproduced from the
+/// locked prices bit for bit, so the ledger figures are the oracle.
+#[test]
+fn requests_4438_and_4483_against_candidate_per_transfer_limits() {
+    let fee_bps = 300;
+    let gross = CanonicalAtomic(50_000 * GLC);
+    let cases = [
+        (
+            4438u32,
+            prices(983_906_422, 50_389_216),
+            94_701_734_329_400u64,
+        ),
+        (4483, prices(772_204_750, 45_187_267), 82_881_601_082_400),
+    ];
+    for (id, p, locked_net) in cases {
+        let q = quoted_breakdown(
+            gross,
+            p.source_price_e12,
+            p.destination_price_e12,
+            fee_bps,
+            SOLANA_SCALE,
+        )
+        .unwrap();
+        assert_eq!(
+            q.net_out.0, locked_net,
+            "request {id}: the locked quote reproduces"
+        );
+        let net_mint_units = locked_net / SOLANA_SCALE;
+        // (a) settlement: pays iff net ≤ per_transfer_limit (mint units).
+        for (limit_mint_units, pays) in [
+            (50_000_000_000u64, false), // today: parked (the incident)
+            (1_000_000_000_000, true),  // 1_000_000 GLC (Solana)
+            (2_000_000_000_000, true),  // 2_000_000 GLC (Solana)
+        ] {
+            assert_eq!(
+                net_mint_units <= limit_mint_units,
+                pays,
+                "request {id}: settlement at limit {limit_mint_units}"
+            );
+        }
+        // (b) admission of a NEW identical request under docs/40, at the
+        // established 25 % buffer and with no buffer.
+        for (limit_mint_units, buffer_bps, admitted) in [
+            (1_000_000_000_000u64, 2_500u64, false), // 947k / 829k > 750k
+            (1_000_000_000_000, 0, true),            // both ≤ 1_000_000
+            (2_000_000_000_000, 2_500, true),        // both ≤ 1_500_000
+            (2_000_000_000_000, 0, true),
+        ] {
+            let max = max_source_for_destination_limit(
+                CanonicalAtomic(limit_mint_units * SOLANA_SCALE),
+                p,
+                fee_bps,
+                SOLANA_SCALE,
+                buffer_bps,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(
+                gross.0 <= max,
+                admitted,
+                "request {id}: admission at limit {limit_mint_units} buffer {buffer_bps} (max {max})"
+            );
+        }
+    }
+    // The exact nets, in mint units, beside the candidates.
+    assert_eq!(94_701_734_329_400 / SOLANA_SCALE, 947_017_343_294);
+    assert_eq!(82_881_601_082_400 / SOLANA_SCALE, 828_816_010_824);
+}

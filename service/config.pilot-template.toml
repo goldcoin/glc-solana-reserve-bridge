@@ -326,6 +326,9 @@ tick_interval_ms = 5000
 health_bind_addr = "127.0.0.1:9100"
 api_bind_addr = "127.0.0.1:9101"
 reservation_ttl_secs = 3600
+# sol_to_glc_probe_gross_atomic = 5000000000000  # SolToGlc availability probe size, canonical
+#                                                # (default 50,000 GLC; capped at per_transfer_limit;
+#                                                # docs/40-destination-bound-admission.md)
 
 # The authenticated admin control plane (docs/27-admin-control-plane.md).
 # Omit admin_bind_addr to not start it at all. Bind PRIVATELY (localhost

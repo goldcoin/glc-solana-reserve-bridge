@@ -986,6 +986,18 @@ struct RawService {
     /// when omitted rather than requiring every deployment to set it.
     #[serde(default = "default_signer_timeout_ms")]
     signer_timeout_ms: u64,
+    /// The gross a `SolToGlc` deposit is assumed to have when the route's
+    /// public availability is probed (canonical 8-decimal units of GLC on
+    /// Solana). The probe is capped at the program's `per_transfer_limit`,
+    /// so this only matters once that limit is raised above it — see
+    /// docs/40-destination-bound-admission.md, "Availability probe".
+    /// Default: 50_000 GLC, the limit the probe was designed against.
+    #[serde(default = "default_sol_to_glc_probe_gross_atomic")]
+    sol_to_glc_probe_gross_atomic: u64,
+}
+
+fn default_sol_to_glc_probe_gross_atomic() -> u64 {
+    5_000_000_000_000
 }
 
 fn default_alert_poll_interval_secs() -> u64 {
@@ -1148,6 +1160,8 @@ pub struct ServiceConfig {
     pub alert_webhook_url: Option<String>,
     pub alert_poll_interval_secs: u64,
     pub signer_timeout_ms: u64,
+    /// See `RawService::sol_to_glc_probe_gross_atomic`.
+    pub sol_to_glc_probe_gross_atomic: u64,
 }
 
 /// The resolved `[bridge_rate]` section (docs/38-elastic-bridge-rate.md).
@@ -2025,6 +2039,13 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             field: "service.admin_bind_addr",
             detail: e.to_string(),
         })?;
+    if raw.service.sol_to_glc_probe_gross_atomic == 0 {
+        return Err(ConfigError::Invalid {
+            field: "service.sol_to_glc_probe_gross_atomic",
+            detail: "must be > 0 (canonical units; the size SolToGlc availability is probed at)"
+                .to_string(),
+        });
+    }
     let admin_operators = if admin_bind_addr.is_some() {
         if raw.service.admin_operators.is_empty() {
             return Err(ConfigError::Invalid {
@@ -2387,6 +2408,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             alert_webhook_url,
             alert_poll_interval_secs: raw.service.alert_poll_interval_secs,
             signer_timeout_ms: raw.service.signer_timeout_ms,
+            sol_to_glc_probe_gross_atomic: raw.service.sol_to_glc_probe_gross_atomic,
         },
         routes,
         robinhood_indexer,

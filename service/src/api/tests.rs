@@ -10293,6 +10293,149 @@ mod destination_bound {
         assert!(half < INCIDENT_MAX_BUFFERED);
     }
 
+    // --------------------------------- the limit is the elastic knob --
+
+    /// docs/40 is a guard, not an economic cap: the source maximum is a
+    /// function of the program's LIVE `per_transfer_limit`, so raising
+    /// that limit (`glc-admin set-limit`, no redeploy) raises the maximum
+    /// with no code or config change. Pinned at the 2026-09-20 live rate
+    /// (17.24 Solana units per Goldcoin unit) for today's 50_000 and the
+    /// two candidate limits, with the same `BridgeApi` builder, the same
+    /// book and the same default buffer throughout — only the fake
+    /// chain's `bridge_config` differs. `SolToGlc`'s availability probe
+    /// no longer rides on the limit either: it stays advertised at every
+    /// limit, probed at `min(limit, sol_to_glc_probe_gross)`.
+    #[tokio::test]
+    async fn raising_per_transfer_limit_raises_the_maximum_without_a_code_change() {
+        const LIVE_GOLDCOIN_E12: u64 = 758_565_116;
+        const LIVE_SOLANA_E12: u64 = 44_009_955;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_deep(dir.path());
+        let live = RailPrices {
+            source_price_e12: LIVE_GOLDCOIN_E12,
+            destination_price_e12: LIVE_SOLANA_E12,
+            source_feed_at: 0,
+            destination_feed_at: 0,
+        };
+        let mut seen = Vec::new();
+        for (limit_mint_units, label) in [
+            (50_000_000_000u64, "today: 50_000 GLC (Solana)"),
+            (1_000_000_000_000, "candidate: 1_000_000"),
+            (2_000_000_000_000, "proposed: 2_000_000"),
+        ] {
+            let api = build_with(
+                &db_path,
+                fake_rpc(0, limit_mint_units),
+                crate::routes::RouteGate::legacy_only(),
+            )
+            .with_rate_book(book_at(LIVE_GOLDCOIN_E12, LIVE_SOLANA_E12, PRICE_SCALE));
+            let chains = api.chains().await.unwrap();
+            let r = route(&chains, "GlcToSol");
+            assert!(r.available, "{label}: {:?}", r.availability_reason);
+            let max = r.max_transfer_atomic.unwrap().0;
+            let expected = max_source_for_destination_limit(
+                CanonicalAtomic(limit_mint_units * 100),
+                live,
+                300,
+                100,
+                DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(max, expected, "{label}");
+            // The quote refuses one unit above and accepts the maximum.
+            api.quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(max),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                api.quote(QuoteInput {
+                    direction: "GlcToSol".to_string(),
+                    gross_amount: AtomicU64(max + 1),
+                })
+                .await
+                .unwrap_err(),
+                ApiError::DestinationOutOfBounds { .. }
+            ));
+            // SolToGlc stays advertised: the probe is capped at the
+            // configured normal size, never the raised limit.
+            let s = route(&chains, "SolToGlc");
+            assert!(s.available, "{label}: SolToGlc {:?}", s.availability_reason);
+            assert_eq!(
+                s.capacity.as_ref().unwrap().probe_gross_atomic.0,
+                (limit_mint_units * 100).min(DEFAULT_SOL_TO_GLC_PROBE_GROSS.0),
+                "{label}: probe gross"
+            );
+            seen.push((label, max));
+        }
+        // Exact figures at the 2026-09-20 live rate, 300 bps, 25 % buffer.
+        assert_eq!(seen[0].1, 224_293_966_363, "2_242.93966363 GLC");
+        assert_eq!(seen[1].1, 4_485_879_327_160, "44_858.79327160 GLC");
+        assert_eq!(seen[2].1, 8_971_758_654_314, "89_717.58654314 GLC");
+        // Linear in the limit (to the floors' rounding, a few hundred
+        // canonical units = a few millionths of a GLC): 20× and 40× today's.
+        assert!(
+            (seen[1].1 as i128 - 20 * seen[0].1 as i128).abs() < 400,
+            "{seen:?}"
+        );
+        assert!(
+            (seen[2].1 as i128 - 2 * seen[1].1 as i128).abs() < 400,
+            "{seen:?}"
+        );
+        // 50_000 GLC — the incident amount — is admitted at the proposed
+        // limit with the buffer, and refused at 1_000_000 with it.
+        assert!(50_000 * GLC > seen[1].1);
+        assert!(50_000 * GLC <= seen[2].1);
+    }
+
+    /// `[service] sol_to_glc_probe_gross_atomic` is the probe size: a
+    /// narrower value narrows the probe below the limit; the limit still
+    /// caps it from above (a deposit above the limit cannot exist).
+    #[tokio::test]
+    async fn the_sol_to_glc_probe_follows_the_configured_size_capped_by_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        // Tight fixture limit (0.05 GLC): the limit caps the default probe.
+        let chains = build(&db_path, 0).chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "SolToGlc")
+                .capacity
+                .as_ref()
+                .unwrap()
+                .probe_gross_atomic
+                .0,
+            5_000_000
+        );
+        // Wide limit, narrow configured probe: the probe is the config.
+        let api = build_with(
+            &db_path,
+            fake_rpc(0, TEST_WIDE_PER_TRANSFER_LIMIT),
+            crate::routes::RouteGate::legacy_only(),
+        )
+        .with_sol_to_glc_probe_gross(CanonicalAtomic(7_000_000));
+        let chains = api.chains().await.unwrap();
+        let s = route(&chains, "SolToGlc");
+        assert_eq!(s.capacity.as_ref().unwrap().probe_gross_atomic.0, 7_000_000);
+        assert!(s.available);
+        // Wide limit, default probe (50_000 GLC) against the fixture's
+        // 0.1 GLC headroom: the probe cannot be funded, so the route reads
+        // closed for the buffer — the behaviour the probe exists for.
+        let api = build_with(
+            &db_path,
+            fake_rpc(0, TEST_WIDE_PER_TRANSFER_LIMIT),
+            crate::routes::RouteGate::legacy_only(),
+        );
+        let chains = api.chains().await.unwrap();
+        let s = route(&chains, "SolToGlc");
+        assert_eq!(
+            s.capacity.as_ref().unwrap().probe_gross_atomic.0,
+            DEFAULT_SOL_TO_GLC_PROBE_GROSS.0
+        );
+        assert!(!s.available);
+    }
+
     // ------------------------------------------------------------- F --
 
     /// The buffer is what keeps an admitted order payable: an order

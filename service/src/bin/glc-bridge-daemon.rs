@@ -1031,6 +1031,11 @@ async fn main() {
             )
             .with_rate_book(rate_book.clone())
             .with_destination_limit_buffer_bps(config.bridge_rate.destination_limit_buffer_bps)
+            .with_sol_to_glc_probe_gross(
+                glc_reserve_bridge_service::amount_conversion::CanonicalAtomic(
+                    config.service.sol_to_glc_probe_gross_atomic,
+                ),
+            )
             .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract)
             .with_robinhood_deployment_verified(robinhood_deployment_verified)
             .with_program_compat(Arc::clone(&program_compat)),
@@ -1078,6 +1083,11 @@ async fn main() {
         )
         .with_refund_executor(refund_executor)
         .with_route_fees(config.route_fees.clone())
+        .with_sol_to_glc_probe_gross(
+            glc_reserve_bridge_service::amount_conversion::CanonicalAtomic(
+                config.service.sol_to_glc_probe_gross_atomic,
+            ),
+        )
         .with_rate_book(rate_book.clone())
         .with_program_compat(Arc::clone(&program_compat))
         .with_route_gate(Arc::clone(&route_gate))

@@ -1628,6 +1628,8 @@ pub struct AdminApi<SR: SolanaRpc> {
     /// until `with_rate_book`, which reports the endpoint as not
     /// configured.
     rate_book: Option<crate::bridge_rate::RateBook>,
+    /// See `api::sol_to_glc_probe_from`; `[service] sol_to_glc_probe_gross_atomic`.
+    sol_to_glc_probe_gross: crate::amount_conversion::CanonicalAtomic,
     /// The daemon's route gate, for `GET /routes`' enablement column.
     /// Defaults to [`crate::routes::RouteGate::legacy_only`] — the
     /// resolved state of a deployment with no Robinhood section — until
@@ -1844,6 +1846,7 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             // never told the rates, and is not a rate anything could
             // mistake for a real one.
             route_fees: crate::fees::RouteFees::new(),
+            sol_to_glc_probe_gross: crate::api::DEFAULT_SOL_TO_GLC_PROBE_GROSS,
             rate_book: None,
             route_gate: Arc::new(crate::routes::RouteGate::legacy_only()),
             robinhood_reader: None,
@@ -1890,6 +1893,16 @@ impl<SR: SolanaRpc> AdminApi<SR> {
     /// optional contexts here: this API prices nothing and moves nothing,
     /// so an absent table degrades one read-only endpoint rather than
     /// risking a wrong number anywhere.
+    /// The gross `SolToGlc` availability is probed at — the same value the
+    /// public API is built with, so `GET /routes` and `GET /chains` agree.
+    pub fn with_sol_to_glc_probe_gross(
+        mut self,
+        gross: crate::amount_conversion::CanonicalAtomic,
+    ) -> Self {
+        self.sol_to_glc_probe_gross = gross;
+        self
+    }
+
     pub fn with_route_fees(mut self, route_fees: crate::fees::RouteFees) -> Self {
         self.route_fees = route_fees;
         self
@@ -3929,6 +3942,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                                 d,
                                 &self.route_fees,
                                 self.rate_book.as_ref(),
+                                self.sol_to_glc_probe_gross,
                                 now,
                             )
                         }),

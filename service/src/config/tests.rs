@@ -390,6 +390,57 @@ fn a_valid_alert_webhook_url_is_accepted() {
     );
 }
 
+/// `[service] sol_to_glc_probe_gross_atomic` (docs/40-destination-bound-
+/// admission.md, "Availability probe"): defaults to 50_000 GLC canonical,
+/// takes an explicit value, refuses zero.
+#[test]
+fn the_sol_to_glc_probe_size_defaults_to_fifty_thousand_glc_and_refuses_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.service.sol_to_glc_probe_gross_atomic,
+        5_000_000_000_000
+    );
+    assert_eq!(
+        config.service.sol_to_glc_probe_gross_atomic,
+        crate::api::DEFAULT_SOL_TO_GLC_PROBE_GROSS.0
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace(
+            "reservation_ttl_secs = 3600",
+            "reservation_ttl_secs = 3600\nsol_to_glc_probe_gross_atomic = 1000000000000",
+        ),
+    )
+    .unwrap();
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.service.sol_to_glc_probe_gross_atomic,
+        1_000_000_000_000
+    );
+    std::fs::write(
+        &path,
+        text.replace(
+            "reservation_ttl_secs = 3600",
+            "reservation_ttl_secs = 3600\nsol_to_glc_probe_gross_atomic = 0",
+        ),
+    )
+    .unwrap();
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "service.sol_to_glc_probe_gross_atomic",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
 #[test]
 fn a_malformed_alert_webhook_url_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
