@@ -316,6 +316,9 @@ mode = "fixed_unit"
 # price_staleness_secs = 120   # live: a newest sample older than this halts the rail
 # rate_band_pct        = 25    # live: movement vs one window ago that parks new deposits
 # poll_interval_secs   = 20    # live: must not exceed price_staleness_secs
+# destination_limit_buffer_bps = 2500  # both modes: admission stays this far below a
+#                                      # destination's per-transfer limit (docs/40-
+#                                      # destination-bound-admission.md); default: one band
 
 [service]
 db_path = "<REPLACE_WITH_PRODUCTION_LEDGER_DB_PATH>"

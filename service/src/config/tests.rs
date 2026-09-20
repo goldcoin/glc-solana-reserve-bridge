@@ -2363,6 +2363,13 @@ fn fixed_unit_mode_quotes_at_one_with_the_documented_defaults() {
     assert_eq!(config.bridge_rate.price_window_secs, 360);
     assert_eq!(config.bridge_rate.price_staleness_secs, 120);
     assert_eq!(config.bridge_rate.rate_band_bps, 2_500);
+    // The destination-limit buffer defaults to the band (docs/39-
+    // destination-bound-admission.md).
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 2_500);
+    assert_eq!(
+        config.bridge_rate.destination_limit_buffer_bps,
+        crate::bridge_rate::DEFAULT_DESTINATION_LIMIT_BUFFER_BPS
+    );
     assert_eq!(config.bridge_rate.poll_interval_secs, 20);
     assert!(config.bridge_rate.feeds.is_none());
     let book = config.bridge_rate.rate_book();
@@ -2390,6 +2397,49 @@ fn fixed_unit_mode_quotes_at_one_with_the_documented_defaults() {
             err,
             ConfigError::Invalid {
                 field: "bridge_rate.feeds",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// `[bridge_rate] destination_limit_buffer_bps` (docs/40-destination-
+/// bound-admission.md): follows `rate_band_pct` when absent, is its own
+/// figure when set (in either mode), and is refused above 100 %.
+#[test]
+fn the_destination_limit_buffer_follows_the_band_unless_set_and_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        &format!("mode = \"live\"\nrate_band_pct = 20\n{LIVE_FEEDS}"),
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.rate_band_bps, 2_000);
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 2_000);
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        &format!("mode = \"live\"\nrate_band_pct = 20\ndestination_limit_buffer_bps = 3000\n{LIVE_FEEDS}"),
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.rate_band_bps, 2_000);
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 3_000);
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "mode = \"fixed_unit\"\ndestination_limit_buffer_bps = 0",
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.destination_limit_buffer_bps, 0);
+    let err = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "mode = \"fixed_unit\"\ndestination_limit_buffer_bps = 10001",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "bridge_rate.destination_limit_buffer_bps",
                 ..
             }
         ),

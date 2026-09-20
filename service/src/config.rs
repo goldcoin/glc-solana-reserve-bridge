@@ -251,6 +251,7 @@ struct RawConfig {
 /// price_window_secs = 360       # smoothing window and band reference distance
 /// quote_lifetime_secs = 60      # how long a bridge quote is presented as current
 /// rate_band_pct = 25            # movement vs one window ago that parks new deposits
+/// destination_limit_buffer_bps = 2500   # admission stays this far below a destination's per-transfer limit (default: one band)
 /// price_staleness_secs = 120    # a newest sample older than this halts the rail
 /// poll_interval_secs = 20       # feed poll cadence
 ///
@@ -293,6 +294,8 @@ struct RawBridgeRate {
     price_staleness_secs: Option<i64>,
     #[serde(default)]
     poll_interval_secs: Option<i64>,
+    #[serde(default)]
+    destination_limit_buffer_bps: Option<u64>,
     #[serde(default)]
     feeds: Option<RawBridgeRateFeeds>,
 }
@@ -1159,6 +1162,12 @@ pub struct BridgeRateConfig {
     /// The band in basis points (`rate_band_pct × 100`).
     pub rate_band_bps: u64,
     pub poll_interval_secs: i64,
+    /// The safety buffer admission keeps below a destination chain's
+    /// per-transfer limit (`crate::bridge_rate::buffered_destination_limit`),
+    /// in basis points. Defaults to `rate_band_bps` — one band, the most
+    /// the rate may move between the quote and a lock inside the next
+    /// price window. `10000` admits nothing bounded; never above that.
+    pub destination_limit_buffer_bps: u64,
     /// Present exactly when `mode` is `Live`.
     pub feeds: Option<BridgeRateFeeds>,
 }
@@ -2447,6 +2456,18 @@ fn resolve_bridge_rate(raw: Option<RawBridgeRate>) -> Result<BridgeRateConfig, C
             format!("must be at most one day (got {price_window_secs})"),
         ));
     }
+    let destination_limit_buffer_bps = raw
+        .destination_limit_buffer_bps
+        .unwrap_or(rate_band_pct * 100);
+    if destination_limit_buffer_bps > crate::amount_conversion::BPS_DENOMINATOR {
+        return Err(invalid(
+            "bridge_rate.destination_limit_buffer_bps",
+            format!(
+                "must be at most {} (got {destination_limit_buffer_bps})",
+                crate::amount_conversion::BPS_DENOMINATOR
+            ),
+        ));
+    }
     if poll_interval_secs > price_staleness_secs {
         return Err(invalid(
             "bridge_rate.poll_interval_secs",
@@ -2482,6 +2503,7 @@ fn resolve_bridge_rate(raw: Option<RawBridgeRate>) -> Result<BridgeRateConfig, C
         price_staleness_secs,
         rate_band_bps: rate_band_pct * 100,
         poll_interval_secs,
+        destination_limit_buffer_bps,
         feeds,
     })
 }
