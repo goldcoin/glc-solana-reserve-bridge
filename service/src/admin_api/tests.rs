@@ -3680,3 +3680,185 @@ async fn contract_flags_fold_into_the_route_view_and_unread_closes_nothing() {
     assert!(r.warnings.contains(&"contract_unread".to_string()));
     assert!(!r.blockers.iter().any(|b| b.starts_with("contract_")));
 }
+
+// ---------------------- auto-resume policy over the admin API (2026-09-19) --
+
+/// With the switch turned ON over the API, an operator-held row and a
+/// rapid-burst (bot) row stay ineligible and report their own block
+/// reason on `GET /manual-review`; only the ordinary technical row's
+/// verdict changes. The setting itself round-trips through a server
+/// restart (a fresh `AdminApi` over the same ledger), and both flips
+/// are audited old -> new. Nothing here re-implements a rule: every
+/// verdict is the daemon's own.
+#[tokio::test]
+async fn held_and_bot_rows_stay_ineligible_over_the_api_with_the_switch_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let now = now_unix();
+    // An ordinary technical park, an operator-held park, and a
+    // bot-detected (rapid-burst) park: the second deposit of one pair.
+    let technical = park_request(&db_path, 1, 10, now - 300);
+    let held = park_request(&db_path, 2, 11, now - 290);
+    let bot = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_manual_review_hold(held, None, "suspicious", "cli:ops", now - 200)
+            .unwrap();
+        ledger
+            .set_rapid_burst_policy(
+                &crate::ledger::RapidBurstPolicy {
+                    enabled: true,
+                    window_secs: 600,
+                    max_per_source_wallet: 2,
+                    max_per_destination_wallet: 2,
+                    max_per_pair: 1,
+                    minimum_review_hold_secs: 72 * 3600,
+                    cap_sized_min_atomic: 0,
+                    max_cap_sized_per_window: 0,
+                },
+                now - 200,
+            )
+            .unwrap();
+        drop(ledger);
+        // First of the pair is an ordinary park; the second is HELD by
+        // the rule (it outranks every other fold reason).
+        let _first = park_request(&db_path, 3, 12, now - 100);
+        let second = park_request(&db_path, 4, 12, now - 90);
+        let row = Ledger::open(&db_path)
+            .unwrap()
+            .get_request(second)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.manual_review_disposition,
+            crate::ledger::ManualReviewDisposition::RapidBurstHold
+        );
+        second
+    };
+    let (base, tx) = spawn_admin_server(&db_path).await;
+    let list = |base: String| async move {
+        client()
+            .get(format!("{base}/manual-review"))
+            .bearer_auth(ALICE_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let row_of = |v: &serde_json::Value, id: i64| -> serde_json::Value {
+        v["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("request {id} missing from /manual-review"))
+    };
+
+    // OFF (default): everything ineligible, each for its own reason.
+    let v = list(base.clone()).await;
+    assert_eq!(v["auto_resume_enabled"], false);
+    assert_eq!(
+        row_of(&v, technical)["auto_resume_block_reason"],
+        "global_disabled"
+    );
+    assert_eq!(
+        row_of(&v, held)["auto_resume_block_reason"],
+        "operator_hold"
+    );
+    assert_eq!(row_of(&v, bot)["auto_resume_block_reason"], "abuse_hold");
+    assert_eq!(row_of(&v, bot)["manual_review_class"], "abuse_hold");
+    assert_eq!(row_of(&v, bot)["held"], true);
+
+    // ON, through the audited PUT.
+    let resp = client()
+        .put(format!("{base}/settings/manual-review-auto-resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"enabled":true,"note":"policy test: enable"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = list(base.clone()).await;
+    assert_eq!(v["auto_resume_enabled"], true);
+    // The held and bot rows: unchanged verdict, unchanged row.
+    assert_eq!(row_of(&v, held)["auto_resume_eligible"], false);
+    assert_eq!(
+        row_of(&v, held)["auto_resume_block_reason"],
+        "operator_hold"
+    );
+    assert_eq!(row_of(&v, bot)["auto_resume_eligible"], false);
+    assert_eq!(row_of(&v, bot)["auto_resume_block_reason"], "abuse_hold");
+    // The technical row parked on `reserve_paused_at_fold` is NOT on the
+    // allowlist either: the switch widens nothing by itself.
+    assert_eq!(row_of(&v, technical)["auto_resume_eligible"], false);
+    assert_eq!(
+        row_of(&v, technical)["auto_resume_block_reason"],
+        "unsupported_reason"
+    );
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        for id in [technical, held, bot] {
+            let row = ledger.get_request(id).unwrap().unwrap();
+            assert_eq!(row.state, RequestState::ManualReview, "{id}");
+            assert!(row.operator_decision.is_none(), "{id}");
+        }
+        assert!(ledger.get_request(held).unwrap().unwrap().is_held());
+        assert!(ledger.get_request(bot).unwrap().unwrap().is_held());
+    }
+
+    // "Restart": a fresh server over the same ledger still reads ON.
+    let _ = tx.send(true);
+    let (base2, _tx2) = spawn_admin_server(&db_path).await;
+    let v: serde_json::Value = client()
+        .get(format!("{base2}/settings/manual-review-auto-resume"))
+        .bearer_auth(BOB_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["updated_by"], "alice");
+    assert_eq!(
+        v["eligible_reasons"],
+        serde_json::json!([
+            "utxo_liquidity_low_at_fold",
+            "liquidity_buffer_low_at_fold",
+            "wallet_source_24h_limit",
+            "wallet_destination_24h_limit"
+        ])
+    );
+
+    // OFF again, by another operator; the trail carries both flips.
+    let resp = client()
+        .put(format!("{base2}/settings/manual-review-auto-resume"))
+        .bearer_auth(BOB_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"enabled":false,"note":"policy test: freeze"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(!ledger.manual_review_auto_resume_enabled().unwrap());
+    let flips: Vec<(String, String, String)> = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.action == "manual_review_auto_resume")
+        .map(|r| (r.actor, r.old_value.unwrap(), r.new_value.unwrap()))
+        .collect();
+    assert_eq!(
+        flips,
+        vec![
+            ("bob".into(), "true".into(), "false".into()),
+            ("alice".into(), "false".into(), "true".into()),
+        ]
+    );
+}

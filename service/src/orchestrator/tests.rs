@@ -6542,3 +6542,403 @@ async fn a_quoted_release_outside_the_programs_bounds_is_parked_before_any_signe
     assert_eq!(report.releases_parked_out_of_bounds, 0);
     assert_eq!(report.errors, Vec::<String>::new());
 }
+
+// ---------------------------------------------------------------------
+// The auto-resume POLICY MATRIX (2026-09-19) — one fixture, every case
+// the operator switch must get right, so a regression in any one of the
+// three server-side layers (the switch gate in the pass, the candidate
+// filter, the held refusal inside the resume) fails here by name.
+//
+//   A. OFF + liquidity restored           -> stays ManualReview (global_disabled)
+//   B. ON  + approved reason + restored   -> may resume (SourceFinalized)
+//   C. ON  + rapid-burst (bot) hold       -> stays ManualReview (abuse_hold)
+//   D. ON  + operator hold                -> stays ManualReview (operator_hold)
+//   E. ON  + non-approved reason          -> stays ManualReview (unsupported_reason)
+//   F. the setting survives a ledger reopen in both positions
+//
+// Nothing in production is changed to satisfy this; it pins what already
+// holds.
+// ---------------------------------------------------------------------
+
+/// The five parked rows the matrix is evaluated on, all folded while
+/// liquidity was LOW, and then liquidity restored — the exact situation
+/// the automatic pass exists for.
+struct PolicyMatrixFixture {
+    _dir: tempfile::TempDir,
+    db_path: std::path::PathBuf,
+    goldcoin_rpc: Arc<MockGoldcoinRpc>,
+    /// A/B: two ordinary `utxo_liquidity_low_at_fold` parks.
+    liquidity: Vec<i64>,
+    /// C: a `rapid_burst_hold` (bot-detected) row.
+    bot_held: i64,
+    /// D: an ordinary liquidity park an operator placed a hold on.
+    operator_held: i64,
+    /// E: a `route_admission_closed_at_fold` park whose route has since
+    /// been reopened — its condition has cleared, but the reason is not
+    /// on the allowlist.
+    unsupported: i64,
+}
+
+fn policy_matrix_fixture() -> PolicyMatrixFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, _) = vault_and_signers();
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            5 * 100_000_000_000,
+            0,
+            5 * 100_000_000_000,
+            5 * 100_000_000_000,
+            5 * 100_000_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, 5, 10)
+        .unwrap();
+    seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+    // A/B/D: three ordinary liquidity parks.
+    let parks = park_utxo_liquidity_requests(&mut ledger, 0, 3);
+    // C: the rapid-burst rule holds the second deposit of one pair.
+    ledger
+        .set_rapid_burst_policy(
+            &crate::ledger::RapidBurstPolicy {
+                enabled: true,
+                window_secs: 600,
+                max_per_source_wallet: 2,
+                max_per_destination_wallet: 2,
+                max_per_pair: 1,
+                minimum_review_hold_secs: 72 * 3600,
+                cap_sized_min_atomic: 0,
+                max_cap_sized_per_window: 0,
+            },
+            0,
+        )
+        .unwrap();
+    let burst_wallet = distinct_test_wallet(900);
+    let burst_recipient = distinct_test_recipient(900);
+    let mut burst = Vec::new();
+    for (index, at) in [(100u64, 100i64), (101, 110)] {
+        let outcome = ledger
+            .fold_sol_deposit(
+                index,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                burst_wallet,
+                &burst_recipient,
+                None,
+                at,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+            panic!("{outcome:?}")
+        };
+        burst.push(request_id);
+    }
+    let bot_held = burst[1];
+    assert_eq!(
+        ledger
+            .get_request(bot_held)
+            .unwrap()
+            .unwrap()
+            .manual_review_disposition,
+        crate::ledger::ManualReviewDisposition::RapidBurstHold
+    );
+    // E: close ONE route's own admission, park a deposit on it, reopen.
+    ledger
+        .set_route_admission(crate::routes::Route::SolToGlc, true, Some("matrix"))
+        .unwrap();
+    let outcome = ledger
+        .fold_sol_deposit(
+            200,
+            sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+            distinct_test_wallet(200),
+            &distinct_test_recipient(200),
+            None,
+            120,
+        )
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview {
+        request_id: unsupported,
+    } = outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(
+        ledger
+            .get_request(unsupported)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some(Ledger::MANUAL_REVIEW_REASON_ROUTE_ADMISSION_CLOSED)
+    );
+    ledger
+        .set_route_admission(crate::routes::Route::SolToGlc, false, None)
+        .unwrap();
+    // D: an operator hold on the third liquidity park.
+    let operator_held = parks[2];
+    ledger
+        .set_manual_review_hold(
+            operator_held,
+            None,
+            "suspicious: manual review requested",
+            "admin:a",
+            130,
+        )
+        .unwrap();
+    // Every blocking CONDITION now clears: liquidity is restored and the
+    // route is open. The switch is still at its production default.
+    seed_mature_vault_utxos(&mut ledger, &vault, 30, 100_000_000_000);
+    assert!(!ledger.manual_review_auto_resume_enabled().unwrap());
+    drop(ledger);
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    PolicyMatrixFixture {
+        _dir: dir,
+        db_path,
+        goldcoin_rpc,
+        liquidity: vec![parks[0], parks[1], burst[0]],
+        bot_held,
+        operator_held,
+        unsupported,
+    }
+}
+
+fn block_reason_of(
+    db_path: &std::path::Path,
+    id: i64,
+    global_enabled: bool,
+) -> Option<crate::ledger::AutoResumeBlockReason> {
+    let ledger = Ledger::open(db_path).unwrap();
+    let liquidity_open = !ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    ledger
+        .get_request(id)
+        .unwrap()
+        .unwrap()
+        .auto_resume_block_reason(global_enabled, liquidity_open)
+}
+
+#[tokio::test]
+async fn auto_resume_policy_matrix() {
+    use crate::ledger::AutoResumeBlockReason as Block;
+    let f = policy_matrix_fixture();
+    let every_row: Vec<i64> = f
+        .liquidity
+        .iter()
+        .copied()
+        .chain([f.bot_held, f.operator_held, f.unsupported])
+        .collect();
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = bare_orchestrator_with_max_auto_resumes(
+        &f.db_path,
+        Arc::clone(&f.goldcoin_rpc),
+        vault,
+        vault_signers,
+        20,
+    );
+
+    // ---- A. OFF + every condition restored: nothing moves, ever ----
+    for at in [200, 3_600, 86_400, 30 * 86_400] {
+        let report = orchestrator.tick(at).await;
+        let pass = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+        assert_eq!(pass.attempted, 0, "A at {at}: {:?}", report.errors);
+        assert_eq!(pass.resumed, 0);
+        assert_eq!(
+            pass.stopped_reason.as_deref(),
+            Some(super::AUTO_RESUME_DISABLED_REASON)
+        );
+        for id in &every_row {
+            assert_eq!(
+                ledger_state(&orchestrator, *id),
+                RequestState::ManualReview,
+                "A: row {id} at {at}"
+            );
+        }
+    }
+    for id in &f.liquidity {
+        assert_eq!(
+            block_reason_of(&f.db_path, *id, false),
+            Some(Block::GlobalDisabled)
+        );
+    }
+    assert_eq!(
+        block_reason_of(&f.db_path, f.unsupported, false),
+        Some(Block::GlobalDisabled)
+    );
+    // Holds report their own reason even while the switch is off — the
+    // operator sees WHY a row will never move, not merely that it is off.
+    assert_eq!(
+        block_reason_of(&f.db_path, f.bot_held, false),
+        Some(Block::AbuseHold)
+    );
+    assert_eq!(
+        block_reason_of(&f.db_path, f.operator_held, false),
+        Some(Block::OperatorHold)
+    );
+
+    // ---- flip ON through the ONE audited path the API and CLI share ----
+    {
+        let mut ledger = Ledger::open(&f.db_path).unwrap();
+        let receipt = crate::admin_api::audited_set_manual_review_auto_resume(
+            &mut ledger,
+            true,
+            "matrix: enable",
+            "admin:a",
+        )
+        .unwrap();
+        assert_eq!(receipt.old_value.as_deref(), Some("false"));
+        assert_eq!(receipt.new_value.as_deref(), Some("true"));
+    }
+    // Per-row verdicts BEFORE the pass runs: exactly what the console renders.
+    for id in &f.liquidity {
+        assert_eq!(
+            block_reason_of(&f.db_path, *id, true),
+            None,
+            "B candidate {id}"
+        );
+    }
+    assert_eq!(
+        block_reason_of(&f.db_path, f.bot_held, true),
+        Some(Block::AbuseHold)
+    );
+    assert_eq!(
+        block_reason_of(&f.db_path, f.operator_held, true),
+        Some(Block::OperatorHold)
+    );
+    assert_eq!(
+        block_reason_of(&f.db_path, f.unsupported, true),
+        Some(Block::UnsupportedReason)
+    );
+
+    // ---- B/C/D/E in one pass ----
+    let report = orchestrator.tick(400_000).await;
+    let pass = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(
+        pass.attempted,
+        f.liquidity.len() as u32,
+        "only the approved-reason, unheld rows are ever attempted"
+    );
+    assert_eq!(pass.resumed, f.liquidity.len() as u32);
+    for id in &f.liquidity {
+        assert_eq!(
+            ledger_state(&orchestrator, *id),
+            RequestState::SourceFinalized,
+            "B: row {id} resumes once its condition cleared"
+        );
+    }
+    for (label, id) in [
+        ("C bot hold", f.bot_held),
+        ("D operator hold", f.operator_held),
+        ("E unsupported reason", f.unsupported),
+    ] {
+        assert_eq!(
+            ledger_state(&orchestrator, id),
+            RequestState::ManualReview,
+            "{label}"
+        );
+    }
+    // ...and they stay put across further ticks, however long.
+    for at in [500_000, 400_000 + 30 * 86_400, 400_000 + 365 * 86_400] {
+        let report = orchestrator.tick(at).await;
+        let pass = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+        assert_eq!(pass.attempted, 0, "at {at}: nothing left to attempt");
+        for id in [f.bot_held, f.operator_held, f.unsupported] {
+            assert_eq!(
+                ledger_state(&orchestrator, id),
+                RequestState::ManualReview,
+                "{id} at {at}"
+            );
+        }
+    }
+    {
+        let ledger = Ledger::open(&f.db_path).unwrap();
+        for id in [f.bot_held, f.operator_held, f.unsupported] {
+            let row = ledger.get_request(id).unwrap().unwrap();
+            assert_eq!(row.state, RequestState::ManualReview);
+            assert!(
+                row.operator_decision.is_none(),
+                "{id}: no decision was invented"
+            );
+            let log = ledger.state_log(id).unwrap();
+            assert!(
+                log.iter().all(|t| t.1 == RequestState::ManualReview),
+                "{id}: never left ManualReview: {log:?}"
+            );
+        }
+        // The two holds still carry their markers; the resume path's own
+        // refusal (the third layer) still stands for them.
+        assert!(ledger.get_request(f.bot_held).unwrap().unwrap().is_held());
+        assert!(ledger
+            .get_request(f.operator_held)
+            .unwrap()
+            .unwrap()
+            .is_held());
+    }
+    {
+        let mut ledger = Ledger::open(&f.db_path).unwrap();
+        for id in [f.bot_held, f.operator_held] {
+            assert!(
+                ledger
+                    .resume_manual_review_sol_to_glc(id, "try", "admin:b", 900_000)
+                    .is_err(),
+                "{id}: a held row is refused inside the resume itself"
+            );
+        }
+    }
+
+    // ---- F. the setting survives a reopen in both positions ----
+    assert!(Ledger::open(&f.db_path)
+        .unwrap()
+        .manual_review_auto_resume_enabled()
+        .unwrap());
+    {
+        let mut ledger = Ledger::open(&f.db_path).unwrap();
+        crate::admin_api::audited_set_manual_review_auto_resume(
+            &mut ledger,
+            false,
+            "matrix: freeze again",
+            "admin:a",
+        )
+        .unwrap();
+    }
+    let reopened = Ledger::open(&f.db_path).unwrap();
+    assert!(!reopened.manual_review_auto_resume_enabled().unwrap());
+    let setting = reopened
+        .manual_review_auto_resume_setting()
+        .unwrap()
+        .unwrap();
+    assert_eq!(setting.value, "false");
+    assert_eq!(setting.updated_by, "admin:a");
+    // Both flips are on the audit trail, old -> new.
+    let audit = reopened
+        .list_admin_audit(&crate::ledger::AdminAuditFilter::default())
+        .unwrap();
+    let flips: Vec<(String, String)> = audit
+        .iter()
+        .filter(|r| r.action == "manual_review_auto_resume")
+        .map(|r| (r.old_value.clone().unwrap(), r.new_value.clone().unwrap()))
+        .collect();
+    assert_eq!(
+        flips,
+        vec![
+            ("true".into(), "false".into()),
+            ("false".into(), "true".into())
+        ]
+    );
+}
