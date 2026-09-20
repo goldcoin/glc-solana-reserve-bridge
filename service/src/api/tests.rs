@@ -150,6 +150,29 @@ const TEST_DEFAULT_ROLLING_VOLUME_LIMIT: u64 = 1_000_000_000_000;
 /// module's `liquidity_buffer_probe` tests pin closed.
 const TEST_PER_TRANSFER_LIMIT: u64 = 50_000;
 
+/// A `per_transfer_limit` (reserve-mint units, 6 decimals) no test amount
+/// reaches — 1_000_000 GLC — for fixtures whose subject is something
+/// other than the destination bound (docs/40-destination-bound-
+/// admission.md). Since that bound is enforced at admission, a quote or
+/// create of 10 GLC against [`TEST_PER_TRANSFER_LIMIT`]'s 0.05 GLC is
+/// refused `destination_payout_out_of_bounds` — correctly — so a test
+/// about fees, decimals or liquidity says explicitly that its limit is
+/// not the thing under test. `SolToGlc`'s availability probe is struck
+/// at this size too and no fixture reserve admits it, so a test that
+/// asserts `SolToGlc` available keeps the tight limit.
+const TEST_WIDE_PER_TRANSFER_LIMIT: u64 = 1_000_000_000_000;
+
+/// The default fake node: fresh rolling windows, `min_transfer` 100 units.
+fn fake_rpc(obligation_count: u64, per_transfer_limit: u64) -> FakeSolanaRpc {
+    FakeSolanaRpc {
+        bridge_config: fake_bridge_config_bytes(obligation_count, 100, per_transfer_limit),
+        rolling_volume_windows: (
+            fake_rolling_volume_window_bytes(0, 0, 0),
+            fake_rolling_volume_window_bytes(1, 0, 0),
+        ),
+    }
+}
+
 fn fake_bridge_config_bytes(
     obligation_count: u64,
     min_transfer: u64,
@@ -1208,7 +1231,14 @@ async fn create_transfer_rejects_a_zero_amount() {
 async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
-    let api = build(&db_path, 0);
+    // 20 GLC exceeds the fixture's 0.05 GLC `per_transfer_limit` and the
+    // destination-bound refusal runs first (also without a row); the
+    // liquidity refusal is the subject, so the limit is wide.
+    let api = build_with(
+        &db_path,
+        fake_rpc(0, TEST_WIDE_PER_TRANSFER_LIMIT),
+        crate::routes::RouteGate::legacy_only(),
+    );
 
     let err = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
@@ -2488,6 +2518,8 @@ impl ApiSource for StubSource {
                         // exercising `handle`'s routing should see.
                         available: r.default_enabled(),
                         bridge_rate: None,
+                        max_transfer_atomic: None,
+                        max_transfer_display: None,
                         min_transfer_atomic: AtomicU64(crate::min_transfer::source_minimum(*r).0),
                         unavailable_reason: (!r.default_enabled()).then(|| {
                             crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
@@ -2534,6 +2566,8 @@ impl ApiSource for StubSource {
                 min_transfer_amount: AtomicU64(1),
                 per_transfer_limit: AtomicU64(2),
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                max_transfer_atomic: None,
+                max_transfer_display: None,
             })
         })
     }
@@ -2842,6 +2876,8 @@ impl ApiSource for StubSource {
                     15_000,
                     485_000,
                 ),
+                max_transfer_atomic: None,
+                max_transfer_display: None,
                 source_decimals: 8,
                 destination_decimals: 6,
                 source_asset: "GLC (Goldcoin)".to_string(),
@@ -3538,6 +3574,8 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 min_transfer_amount: AtomicU64(100_000_000),
                 per_transfer_limit: AtomicU64(9_408_405_829_927_559),
                 bridge_fee_bps: 300,
+                max_transfer_atomic: None,
+                max_transfer_display: None,
             })
             .unwrap(),
         ),
@@ -3635,6 +3673,8 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                     282_252_174_897_826,
                     9_126_153_655_029_733,
                 ),
+                max_transfer_atomic: None,
+                max_transfer_display: None,
                 source_decimals: 8,
                 destination_decimals: 6,
                 source_asset: "GLC (Goldcoin)".to_string(),
@@ -4742,15 +4782,18 @@ fn test_verified_deployment() -> crate::robinhood::preflight::VerifiedDeployment
 /// `post_transfers_refuses_both_robinhood_routes_and_writes_nothing`
 /// above pins against the production fixture.
 fn build_with_open_glc_to_rhn(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+    build_with_open_glc_to_rhn_at_limit(db_path, TEST_PER_TRANSFER_LIMIT)
+}
+
+/// [`build_with_open_glc_to_rhn`] at an explicit Solana `per_transfer_limit`
+/// — see [`TEST_WIDE_PER_TRANSFER_LIMIT`].
+fn build_with_open_glc_to_rhn_at_limit(
+    db_path: &std::path::Path,
+    per_transfer_limit: u64,
+) -> BridgeApi<FakeSolanaRpc> {
     opt_down(BridgeApi::new(
         db_path.to_path_buf(),
-        FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
-            rolling_volume_windows: (
-                fake_rolling_volume_window_bytes(0, 0, 0),
-                fake_rolling_volume_window_bytes(1, 0, 0),
-            ),
-        },
+        fake_rpc(0, per_transfer_limit),
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
         test_root_vault(),
         crate::goldcoin::address::Network::Testnet,
@@ -6617,7 +6660,9 @@ async fn an_unrecognised_route_is_still_a_400() {
 async fn a_quote_uses_the_selected_routes_own_fee() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure_with_robinhood_reserve(dir.path());
-    let api = build_with_open_glc_to_rhn(&db_path);
+    // 10 GLC against a 0.05 GLC destination limit would be refused at
+    // admission; the fee is the subject here, so the limit is wide.
+    let api = build_with_open_glc_to_rhn_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT);
 
     let gross = 1_000_000_000u64; // 10 GLC
 
@@ -6721,7 +6766,9 @@ async fn a_created_glc_to_sol_transfer_keeps_the_solana_rate() {
     // priced differently may move the Solana route's economics.
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure_with_robinhood_reserve(dir.path());
-    let api = build_with_open_glc_to_rhn(&db_path);
+    // 10 GLC against a 0.05 GLC destination limit would be refused at
+    // admission; the fee is the subject here, so the limit is wide.
+    let api = build_with_open_glc_to_rhn_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT);
 
     let created = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
@@ -7541,6 +7588,15 @@ async fn listing_routes_never_moves_the_liquidity_admission_gate() {
 /// (SolToRhn at 450, RhnToSol at 500 — deliberately different from every
 /// other route), so a quote's rate can only have come from its own entry.
 fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+    build_with_open_cross_routes_at_limit(db_path, TEST_PER_TRANSFER_LIMIT)
+}
+
+/// [`build_with_open_cross_routes`] at an explicit Solana
+/// `per_transfer_limit` — see [`TEST_WIDE_PER_TRANSFER_LIMIT`].
+fn build_with_open_cross_routes_at_limit(
+    db_path: &std::path::Path,
+    per_transfer_limit: u64,
+) -> BridgeApi<FakeSolanaRpc> {
     {
         let mut ledger = Ledger::open(db_path).unwrap();
         for route in [
@@ -7555,13 +7611,7 @@ fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSola
     fees.insert(crate::routes::Route::RhnToSol, 500).unwrap();
     opt_down(BridgeApi::new(
         db_path.to_path_buf(),
-        FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
-            rolling_volume_windows: (
-                fake_rolling_volume_window_bytes(0, 0, 0),
-                fake_rolling_volume_window_bytes(1, 0, 0),
-            ),
-        },
+        fake_rpc(0, per_transfer_limit),
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
         test_root_vault(),
         crate::goldcoin::address::Network::Testnet,
@@ -7581,7 +7631,10 @@ fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSola
 async fn cross_route_quotes_price_at_their_own_rate_and_name_the_right_units() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure_with_robinhood_reserve(dir.path());
-    let api = build_with_open_cross_routes(&db_path);
+    // 10 GLC each way; the Solana program's limit bounds both cross
+    // routes (as destination for RhnToSol, as source for SolToRhn) and is
+    // not the subject here, so it is wide.
+    let api = build_with_open_cross_routes_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT);
 
     let sol_to_rhn = api
         .quote(QuoteInput {
@@ -7621,7 +7674,9 @@ async fn an_rhn_to_sol_quote_floors_a_net_the_mint_cannot_spell() {
     // residual reported — exactly as GlcToSol floors the same shape.
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure_with_robinhood_reserve(dir.path());
-    let api = build_with_open_cross_routes(&db_path);
+    // The destination bound is not the subject (1 GLC would exceed the
+    // fixture's 0.05 GLC limit); the mint's precision is.
+    let api = build_with_open_cross_routes_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT);
     let quote = api
         .quote(QuoteInput {
             direction: "RhnToSol".to_string(),
@@ -7717,15 +7772,12 @@ fn build_at_production_minimum(db_path: &std::path::Path) -> BridgeApi<FakeSolan
     let mut fees = test_route_fees();
     fees.insert(crate::routes::Route::SolToRhn, 450).unwrap();
     fees.insert(crate::routes::Route::RhnToSol, 500).unwrap();
+    // The production floor is 100 GLC and every amount here is at or
+    // around it, so the fixture's 0.05 GLC `per_transfer_limit` cannot
+    // be the subject: the wide limit keeps the minimum the only bound.
     BridgeApi::new(
         db_path.to_path_buf(),
-        FakeSolanaRpc {
-            bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
-            rolling_volume_windows: (
-                fake_rolling_volume_window_bytes(0, 0, 0),
-                fake_rolling_volume_window_bytes(1, 0, 0),
-            ),
-        },
+        fake_rpc(0, TEST_WIDE_PER_TRANSFER_LIMIT),
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
         test_root_vault(),
         crate::goldcoin::address::Network::Testnet,
@@ -9195,10 +9247,18 @@ async fn an_unbuildable_probe_fails_sol_to_glc_closed_and_nothing_else() {
         Some(AVAILABILITY_REASON_PROBE_UNAVAILABLE)
     );
     assert_eq!(r.capacity, None);
-    assert!(
-        route(&chains, "GlcToSol").available,
-        "GlcToSol needs no probe"
+    // `GlcToSol` needs no probe, but the same unreadable decimals leave
+    // its destination-bound maximum underivable (docs/40-destination-
+    // bound-admission.md) — and `POST /transfers` on it fails on the same
+    // read — so it too fails closed, under its own reason, with no
+    // maximum published.
+    let glc_to_sol = route(&chains, "GlcToSol");
+    assert!(!glc_to_sol.available);
+    assert_eq!(
+        glc_to_sol.availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_DESTINATION_LIMIT_UNAVAILABLE)
     );
+    assert_eq!(glc_to_sol.max_transfer_atomic, None);
     let status = api.status().await.unwrap();
     assert!(!status.sol_to_glc_available);
     assert_eq!(
@@ -9891,5 +9951,662 @@ mod live_bridge_rate {
             "bridge_rate_feed_unavailable",
             "the rate's own state is still reported alongside"
         );
+    }
+}
+
+// ------------------------------------------ destination-bound admission --
+
+mod destination_bound {
+    //! docs/40-destination-bound-admission.md at the public API: the
+    //! maximum a bounded route publishes is the exact boundary, `POST
+    //! /quote` and `POST /transfers` refuse above it BEFORE any row or
+    //! deposit address exists, the figure moves with the rate, the buffer
+    //! keeps an admitted order payable through the allowed rate movement,
+    //! the Robinhood-bound and Robinhood-sourced routes are bounded by the
+    //! contract's own limits, and unbounded routes are untouched.
+
+    use super::*;
+    use crate::bridge_rate::live::{LiveBook, LiveRateConfig};
+    use crate::bridge_rate::smoothing::Sample;
+    use crate::bridge_rate::{
+        max_source_for_destination_limit, quoted_breakdown, RailPrices, RateBook,
+        DEFAULT_DESTINATION_LIMIT_BUFFER_BPS, PRICE_SCALE,
+    };
+    use crate::routes::Chain;
+
+    const W: i64 = 360;
+    const GLC: u64 = 100_000_000;
+    /// The 2026-09-18 live prices (see `bridge_rate::tests`): ~16.7
+    /// Solana units per Goldcoin unit.
+    const INCIDENT_GOLDCOIN_E12: u64 = 731_245_672;
+    const INCIDENT_SOLANA_E12: u64 = 43_669_983;
+    /// The program's live `per_transfer_limit`: 50_000 GLC in mint units.
+    const INCIDENT_PER_TRANSFER_LIMIT: u64 = 50_000_000_000;
+    /// The reported maxima at those inputs, 300 bps, scale 100.
+    const INCIDENT_MAX_BUFFERED: u64 = 230_876_243_559;
+    const INCIDENT_MAX_UNBUFFERED: u64 = 307_834_991_410;
+
+    fn feed_constant(live: &LiveBook, chain: Chain, price_e12: u64) {
+        let now = now_unix();
+        let mut t = now - 2 * W - 30;
+        while t <= now {
+            live.record_sample(
+                chain,
+                Sample {
+                    feed_at: t,
+                    observed_at: t,
+                    price_e12,
+                },
+            );
+            t += 30;
+        }
+    }
+
+    /// A warm live book at constant prices on every rail.
+    fn book_at(goldcoin_e12: u64, solana_e12: u64, robinhood_e12: u64) -> RateBook {
+        let live = Arc::new(LiveBook::new(LiveRateConfig {
+            price_window_secs: W,
+            price_staleness_secs: 120,
+            rate_band_bps: 2_500,
+        }));
+        feed_constant(&live, Chain::Goldcoin, goldcoin_e12);
+        feed_constant(&live, Chain::Solana, solana_e12);
+        feed_constant(&live, Chain::Robinhood, robinhood_e12);
+        RateBook::live(60, live)
+    }
+
+    /// Reserves deep enough that liquidity is never the binding gate.
+    fn configure_deep(dir: &std::path::Path) -> std::path::PathBuf {
+        let db_path = dir.join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for direction in [
+            ReserveDirection::GoldcoinReserve,
+            ReserveDirection::SolanaReserve,
+        ] {
+            let balance = 1_000_000_000_000_000u64;
+            ledger
+                .configure_reserve(
+                    direction,
+                    balance,
+                    0,
+                    balance / 2,
+                    balance / 5,
+                    balance / 10,
+                    0,
+                )
+                .unwrap();
+        }
+        db_path
+    }
+
+    /// `GlcToSol` at the incident's rate and limit.
+    fn incident_api(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+        build_with(
+            db_path,
+            fake_rpc(0, INCIDENT_PER_TRANSFER_LIMIT),
+            crate::routes::RouteGate::legacy_only(),
+        )
+        .with_rate_book(book_at(
+            INCIDENT_GOLDCOIN_E12,
+            INCIDENT_SOLANA_E12,
+            PRICE_SCALE,
+        ))
+    }
+
+    fn route<'a>(chains: &'a ChainsView, id: &str) -> &'a RouteView {
+        chains.routes.iter().find(|r| r.id == id).unwrap()
+    }
+
+    fn glc_to_sol_input(amount: u64) -> CreateTransferInput {
+        CreateTransferInput {
+            amount_atomic: AtomicU64(amount),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("GlcToSol".to_string()),
+            source_address: None,
+        }
+    }
+
+    fn row_count(db_path: &std::path::Path) -> usize {
+        Ledger::open(db_path)
+            .unwrap()
+            .transfers_page(None, None, None, 100)
+            .unwrap()
+            .len()
+    }
+
+    async fn error_body(err: ApiError) -> serde_json::Value {
+        serde_json::from_slice(
+            &http_body_util::BodyExt::collect(error_response(err).into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap()
+    }
+
+    // ---------------------------------------------------- A, B, C, D --
+
+    /// A + B + C: the published `GlcToSol` maximum is the exact boundary
+    /// against the program's limit — its net fits the buffered limit and
+    /// one more source unit does not — a quote at exactly it succeeds,
+    /// and a quote one unit above is refused with the maximum in the
+    /// error, BEFORE any row or deposit address exists.
+    #[tokio::test]
+    async fn glc_to_sol_publishes_the_exact_boundary_and_refuses_one_unit_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_deep(dir.path());
+        let api = incident_api(&db_path);
+
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "GlcToSol");
+        assert!(r.available, "{:?}", r.availability_reason);
+        let max = r
+            .max_transfer_atomic
+            .expect("a bounded route publishes its maximum")
+            .0;
+        assert_eq!(max, INCIDENT_MAX_BUFFERED);
+        assert_eq!(r.max_transfer_display.as_deref(), Some("2308.76243559"));
+        // A: the boundary, in the settlement check's own terms —
+        // `Orchestrator::release_out_of_bounds` compares the net in mint
+        // units against `per_transfer_limit`.
+        let limit_canonical = INCIDENT_PER_TRANSFER_LIMIT * 100;
+        let buffered = limit_canonical * 3 / 4;
+        let net = |gross: u64| {
+            quoted_breakdown(
+                CanonicalAtomic(gross),
+                INCIDENT_GOLDCOIN_E12,
+                INCIDENT_SOLANA_E12,
+                300,
+                100,
+            )
+            .unwrap()
+            .net_out
+            .0
+        };
+        assert!(net(max) <= buffered);
+        assert!(net(max) <= limit_canonical);
+        assert!(net(max + 1) > buffered);
+        // `GET /limits` publishes the same figure beside the program's own.
+        let limits = api.limits().await.unwrap();
+        assert_eq!(limits.per_transfer_limit.0, INCIDENT_PER_TRANSFER_LIMIT);
+        assert_eq!(limits.max_transfer_atomic.map(|m| m.0), Some(max));
+
+        // B: exactly the maximum quotes, and the quote carries it.
+        let quote = api
+            .quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(max),
+            })
+            .await
+            .unwrap();
+        assert_eq!(quote.gross_amount.0, max);
+        assert_eq!(quote.max_transfer_atomic.map(|m| m.0), Some(max));
+        assert!(quote.bridge_quote.net_out_amount.0 <= buffered);
+
+        // C: one unit above is refused with the maximum, and nothing was
+        // written.
+        let err = api
+            .quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(max + 1),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::DestinationOutOfBounds { max_transfer_atomic, .. } if max_transfer_atomic == max),
+            "{err:?}"
+        );
+        let err = api
+            .create_goldcoin_deposit_transfer(glc_to_sol_input(max + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.reason(),
+            Some(Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS)
+        );
+        let body = error_body(err).await;
+        assert_eq!(body["reason"], "destination_payout_out_of_bounds");
+        assert_eq!(body["max_transfer_atomic"], max.to_string());
+        assert_eq!(body["max_transfer_display"], "2308.76243559");
+        assert_eq!(row_count(&db_path), 0, "no row, no deposit address");
+        // And exactly the maximum is created normally.
+        let created = api
+            .create_goldcoin_deposit_transfer(glc_to_sol_input(max))
+            .await
+            .unwrap();
+        assert!(!created.deposit_address.is_empty());
+        assert_eq!(row_count(&db_path), 1);
+    }
+
+    /// D: the incident amount — 50_000 GLC, what 4438 and 4483 sent —
+    /// is refused at the reproduced rate before any address is issued.
+    #[tokio::test]
+    async fn fifty_thousand_glc_to_sol_is_refused_at_the_incident_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_deep(dir.path());
+        let api = incident_api(&db_path);
+        let err = api
+            .create_goldcoin_deposit_transfer(glc_to_sol_input(50_000 * GLC))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApiError::DestinationOutOfBounds {
+                    max_transfer_atomic: INCIDENT_MAX_BUFFERED,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(row_count(&db_path), 0);
+        let err = api
+            .quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(50_000 * GLC),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::DestinationOutOfBounds { .. }));
+    }
+
+    // ------------------------------------------------------------- E --
+
+    /// The maximum is a function of the rate: at a Goldcoin price half
+    /// as high the same limit admits twice the gross, and at a unit rate
+    /// it is the fee rule inverted — each time exactly the canonical
+    /// derivation at that book's prices, never a stored figure.
+    #[tokio::test]
+    async fn the_maximum_moves_with_the_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_deep(dir.path());
+        let limit_canonical = CanonicalAtomic(INCIDENT_PER_TRANSFER_LIMIT * 100);
+        let mut seen = Vec::new();
+        for (goldcoin, solana) in [
+            (INCIDENT_GOLDCOIN_E12, INCIDENT_SOLANA_E12),
+            (INCIDENT_GOLDCOIN_E12 / 2, INCIDENT_SOLANA_E12),
+            (PRICE_SCALE, PRICE_SCALE),
+        ] {
+            let api = build_with(
+                &db_path,
+                fake_rpc(0, INCIDENT_PER_TRANSFER_LIMIT),
+                crate::routes::RouteGate::legacy_only(),
+            )
+            .with_rate_book(book_at(goldcoin, solana, PRICE_SCALE));
+            let chains = api.chains().await.unwrap();
+            let max = route(&chains, "GlcToSol").max_transfer_atomic.unwrap().0;
+            let expected = max_source_for_destination_limit(
+                limit_canonical,
+                RailPrices {
+                    source_price_e12: goldcoin,
+                    destination_price_e12: solana,
+                    source_feed_at: 0,
+                    destination_feed_at: 0,
+                },
+                300,
+                100,
+                DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(max, expected);
+            seen.push(max);
+        }
+        assert_eq!(seen[0], INCIDENT_MAX_BUFFERED);
+        // Half the source price: (almost exactly) twice the maximum.
+        assert!(
+            seen[1] > seen[0] * 2 - 4 && seen[1] < seen[0] * 2 + 4,
+            "{seen:?}"
+        );
+        // Unit rate, 300 bps, 25 % buffer: the fee rule inverted.
+        assert!(seen[2] > seen[1]);
+        assert_eq!(
+            seen[2],
+            max_source_for_destination_limit(
+                limit_canonical,
+                RailPrices::unit(0),
+                300,
+                100,
+                DEFAULT_DESTINATION_LIMIT_BUFFER_BPS
+            )
+            .unwrap()
+            .0
+        );
+    }
+
+    /// A different buffer is a different maximum — the config key is what
+    /// the figure moves with, not a constant.
+    #[tokio::test]
+    async fn the_configured_buffer_moves_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_deep(dir.path());
+        let api = incident_api(&db_path).with_destination_limit_buffer_bps(0);
+        let chains = api.chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "GlcToSol").max_transfer_atomic.unwrap().0,
+            INCIDENT_MAX_UNBUFFERED
+        );
+        let api = incident_api(&db_path).with_destination_limit_buffer_bps(5_000);
+        let chains = api.chains().await.unwrap();
+        let half = route(&chains, "GlcToSol").max_transfer_atomic.unwrap().0;
+        assert!(half < INCIDENT_MAX_BUFFERED);
+    }
+
+    // ------------------------------------------------------------- F --
+
+    /// The buffer is what keeps an admitted order payable: an order
+    /// created at exactly the buffered maximum still nets under the
+    /// program's limit after the rate moves the whole allowed band
+    /// (2_500 bps) against it — while the same order admitted with no
+    /// buffer would net ABOVE the limit after that move and park at
+    /// settlement as 4438 and 4483 did.
+    #[tokio::test]
+    async fn the_buffer_keeps_an_admitted_order_payable_through_the_allowed_band() {
+        let limit_canonical = INCIDENT_PER_TRANSFER_LIMIT * 100;
+        // The allowed movement, applied against the order: the
+        // destination asset falls by the whole band, so each source unit
+        // buys more destination units.
+        let moved = RailPrices {
+            source_price_e12: INCIDENT_GOLDCOIN_E12,
+            destination_price_e12: INCIDENT_SOLANA_E12 * 10_000 / 12_500,
+            source_feed_at: 0,
+            destination_feed_at: 0,
+        };
+        assert_eq!(
+            crate::bridge_rate::live::movement_bps(
+                moved.source_price_e12,
+                moved.destination_price_e12,
+                INCIDENT_GOLDCOIN_E12,
+                INCIDENT_SOLANA_E12
+            ),
+            2_500,
+            "the move is exactly the band"
+        );
+        let net_after = |gross: u64| {
+            quoted_breakdown(
+                CanonicalAtomic(gross),
+                moved.source_price_e12,
+                moved.destination_price_e12,
+                300,
+                100,
+            )
+            .unwrap()
+            .net_out
+            .0
+        };
+        // Admitted at the buffered maximum: still payable.
+        assert!(net_after(INCIDENT_MAX_BUFFERED) <= limit_canonical);
+        // Admitted at the unbuffered maximum: now unpayable — the
+        // settlement park the buffer exists to prevent.
+        assert!(net_after(INCIDENT_MAX_UNBUFFERED) > limit_canonical);
+    }
+
+    // ------------------------------------------------------------- G --
+
+    /// `GlcToRhn`: the contract's `outboundMax` bounds the route exactly
+    /// as the program's limit bounds `GlcToSol` — the published maximum
+    /// is the boundary, the quote and the create refuse one unit above
+    /// it before any row exists, and `GET /robinhood/reserve` carries the
+    /// same figure.
+    #[tokio::test]
+    async fn glc_to_rhn_is_bounded_by_the_contracts_outbound_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        // 0.06 GLC outboundMax (18 dp) so the fixture reserve (0.1 GLC)
+        // can fund an order at the maximum.
+        let node = crate::robinhood::testkit::MockNode::new(crate::robinhood::testkit::BRIDGE);
+        node.with(|s| {
+            s.contract.limits.outbound_max = crate::evm::EvmU256::from_u128(60_000_000_000_000_000)
+        });
+        let source: Arc<dyn crate::robinhood::public::RobinhoodContractSource> =
+            Arc::new(crate::robinhood::public::LiveRobinhoodContractSource::new(
+                node.clone(),
+                crate::robinhood::testkit::BRIDGE,
+            ));
+        let api = build_with_robinhood_reads(&db_path, Some(source));
+        let expected = max_source_for_destination_limit(
+            CanonicalAtomic(6_000_000),
+            RailPrices::unit(0),
+            600,
+            1,
+            DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+        )
+        .unwrap()
+        .0;
+        // 600 bps, 25 % buffer: net(g) = g − ⌊0.06 g⌋ ≤ 4_500_000.
+        assert_eq!(expected, 4_787_234);
+
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "GlcToRhn");
+        assert!(r.available, "{:?}", r.availability_reason);
+        assert_eq!(r.max_transfer_atomic.map(|m| m.0), Some(expected));
+        assert_eq!(r.max_transfer_display.as_deref(), Some("0.04787234"));
+        let reserve = api.robinhood_reserve().await.unwrap();
+        let rr = reserve.routes.iter().find(|r| r.id == "GlcToRhn").unwrap();
+        assert_eq!(rr.max_transfer_atomic.map(|m| m.0), Some(expected));
+
+        let quote = api
+            .quote(QuoteInput {
+                direction: "GlcToRhn".to_string(),
+                gross_amount: AtomicU64(expected),
+            })
+            .await
+            .unwrap();
+        assert!(quote.net_amount.0 <= 4_500_000);
+        assert_eq!(quote.max_transfer_atomic.map(|m| m.0), Some(expected));
+        let err = api
+            .quote(QuoteInput {
+                direction: "GlcToRhn".to_string(),
+                gross_amount: AtomicU64(expected + 1),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::DestinationOutOfBounds { max_transfer_atomic, .. } if max_transfer_atomic == expected)
+        );
+        let input = |amount: u64| CreateTransferInput {
+            amount_atomic: AtomicU64(amount),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToRhn".to_string()),
+            source_address: None,
+        };
+        let err = api
+            .create_goldcoin_deposit_transfer(input(expected + 1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::DestinationOutOfBounds { .. }),
+            "{err:?}"
+        );
+        assert_eq!(row_count(&db_path), 0);
+        api.create_goldcoin_deposit_transfer(input(expected))
+            .await
+            .unwrap();
+        assert_eq!(row_count(&db_path), 1);
+
+        // A contract that cannot be read fails CLOSED: no maximum, not
+        // advertised, and a create is refused rather than admitted on a
+        // guess. The Solana routes are untouched by it.
+        node.fail_calls("node down");
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "GlcToRhn");
+        assert!(!r.available);
+        assert_eq!(
+            r.availability_reason.as_deref(),
+            Some(AVAILABILITY_REASON_DESTINATION_LIMIT_UNAVAILABLE)
+        );
+        assert_eq!(r.max_transfer_atomic, None);
+        assert!(route(&chains, "GlcToSol").available);
+        let err = api
+            .create_goldcoin_deposit_transfer(input(1_000_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Upstream(_)), "{err:?}");
+        assert_eq!(row_count(&db_path), 1, "nothing new");
+    }
+
+    // ------------------------------------------------------------- H --
+
+    /// `SolToRhn`: the same `outboundMax`-derived maximum is published
+    /// for the Solana-sourced route (a UI caps the deposit at it) and a
+    /// quote above it is refused; the fold-time park is pinned in
+    /// `orchestrator::tests::cross_route`.
+    #[tokio::test]
+    async fn sol_to_rhn_publishes_and_quotes_against_the_outbound_max_derived_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        let api = build_with_open_cross_routes_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT)
+            .with_robinhood(
+                crate::robinhood::RobinhoodHealth::unconfigured(),
+                Some(mock_contract_source()),
+            );
+        // The mock contract: outboundMax 10_000 GLC; 450 bps; unit rate.
+        let expected = max_source_for_destination_limit(
+            CanonicalAtomic(10_000 * GLC),
+            RailPrices::unit(0),
+            450,
+            1,
+            DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+        )
+        .unwrap()
+        .0;
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "SolToRhn");
+        assert_eq!(r.max_transfer_atomic.map(|m| m.0), Some(expected));
+        // The wide program limit (1_000_000 GLC) is the source bound and
+        // is not the smaller of the two here.
+        assert!(expected < 1_000_000 * GLC);
+        api.quote(QuoteInput {
+            direction: "SolToRhn".to_string(),
+            gross_amount: AtomicU64(expected),
+        })
+        .await
+        .unwrap();
+        let err = api
+            .quote(QuoteInput {
+                direction: "SolToRhn".to_string(),
+                gross_amount: AtomicU64(expected + 1),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::DestinationOutOfBounds { .. }),
+            "{err:?}"
+        );
+        // With the tight program limit (0.05 GLC) the SOURCE bound is the
+        // smaller: the program itself refuses a larger deposit.
+        let api = build_with_open_cross_routes(&db_path).with_robinhood(
+            crate::robinhood::RobinhoodHealth::unconfigured(),
+            Some(mock_contract_source()),
+        );
+        let chains = api.chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "SolToRhn").max_transfer_atomic.map(|m| m.0),
+            Some(5_000_000)
+        );
+    }
+
+    // ------------------------------------------------------------- J --
+
+    /// `RhnToSol` is bounded on both ends: the contract's `inboundMax`
+    /// on the deposit and the program's `per_transfer_limit` on the
+    /// payout. The published maximum is the smaller, so the contract's
+    /// own refusal keeps protecting the program's limit whenever it is
+    /// the tighter one, and the program's limit takes over when it is.
+    #[tokio::test]
+    async fn rhn_to_sol_is_bounded_by_the_smaller_of_inbound_max_and_the_program_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        // Wide program limit: inboundMax (10_000 GLC) is the bound.
+        let api = build_with_open_cross_routes_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT)
+            .with_robinhood(
+                crate::robinhood::RobinhoodHealth::unconfigured(),
+                Some(mock_contract_source()),
+            );
+        let chains = api.chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "RhnToSol").max_transfer_atomic.map(|m| m.0),
+            Some(10_000 * GLC)
+        );
+        let err = api
+            .quote(QuoteInput {
+                direction: "RhnToSol".to_string(),
+                gross_amount: AtomicU64(10_000 * GLC + 1),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::DestinationOutOfBounds { max_transfer_atomic, .. } if max_transfer_atomic == 10_000 * GLC)
+        );
+        // Tight program limit (0.05 GLC, 500 bps, unit rate): the
+        // program-derived figure is the bound.
+        let api = build_with_open_cross_routes(&db_path).with_robinhood(
+            crate::robinhood::RobinhoodHealth::unconfigured(),
+            Some(mock_contract_source()),
+        );
+        let expected = max_source_for_destination_limit(
+            CanonicalAtomic(5_000_000),
+            RailPrices::unit(0),
+            500,
+            100,
+            DEFAULT_DESTINATION_LIMIT_BUFFER_BPS,
+        )
+        .unwrap()
+        .0;
+        let chains = api.chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "RhnToSol").max_transfer_atomic.map(|m| m.0),
+            Some(expected)
+        );
+        assert!(expected < 10_000 * GLC);
+    }
+
+    // ------------------------------------------------------------- K --
+
+    /// The Goldcoin-destination routes have no destination bound: no
+    /// maximum beyond the source chain's own ceiling, and a large quote
+    /// on them is untouched by any of this. Without a Robinhood contract
+    /// configured, the Robinhood-bound routes keep their pre-existing
+    /// (unbounded) behaviour too.
+    #[tokio::test]
+    async fn goldcoin_destination_routes_and_unconfigured_contracts_are_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        let api = build_with_open_cross_routes_at_limit(&db_path, TEST_WIDE_PER_TRANSFER_LIMIT);
+        let chains = api.chains().await.unwrap();
+        // SolToGlc: only the program's own deposit ceiling, widened.
+        assert_eq!(
+            route(&chains, "SolToGlc").max_transfer_atomic.map(|m| m.0),
+            Some(TEST_WIDE_PER_TRANSFER_LIMIT * 100)
+        );
+        // RhnToGlc: no contract configured, nothing to publish.
+        assert_eq!(route(&chains, "RhnToGlc").max_transfer_atomic, None);
+        assert_eq!(route(&chains, "GlcToRhn").max_transfer_atomic, None);
+        // SolToRhn: no contract, so only the program's deposit ceiling.
+        assert_eq!(
+            route(&chains, "SolToRhn").max_transfer_atomic.map(|m| m.0),
+            Some(TEST_WIDE_PER_TRANSFER_LIMIT * 100)
+        );
+        for (id, gross) in [
+            ("SolToGlc", 100_000 * GLC),
+            ("RhnToGlc", 5_000_000 * GLC),
+            ("GlcToRhn", 5_000_000 * GLC),
+        ] {
+            api.quote(QuoteInput {
+                direction: id.to_string(),
+                gross_amount: AtomicU64(gross),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        }
+        let err = api
+            .quote(QuoteInput {
+                direction: "SolToGlc".to_string(),
+                gross_amount: AtomicU64(TEST_WIDE_PER_TRANSFER_LIMIT * 100 + 1),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::DestinationOutOfBounds { .. }));
     }
 }
