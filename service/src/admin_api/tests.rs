@@ -2561,7 +2561,7 @@ fn a_refused_route_write_is_audited_and_changes_nothing() {
 /// The approved Robinhood policy, at the documented production figures
 /// (docs/robinhood/mainnet-deployment.md's limits table). Canonical 8dp.
 fn approved_policy() -> crate::chain_policy::ChainPolicy {
-    crate::chain_policy::ChainPolicy::new(
+    crate::chain_policy::ChainPolicy::new_symmetric(
         crate::routes::Chain::Robinhood,
         600,                                    // 6.00%
         CanonicalAtomic(2_000_000_000_000),     // 20,000 GLC per transfer

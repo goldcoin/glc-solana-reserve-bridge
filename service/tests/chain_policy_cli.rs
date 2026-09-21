@@ -280,7 +280,7 @@ fn the_script_builds_its_menu_from_that_list() {
 fn selecting_a_network_shows_the_current_policy_first() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_with_policy(dir.path());
-    let out = script(&config, "2\n7\n");
+    let out = script(&config, "2\n8\n");
     let text = out.all();
 
     let policy_at = text
@@ -297,10 +297,11 @@ fn selecting_a_network_shows_the_current_policy_first() {
     assert!(text.contains("40,000 GLC"), "{text}");
     for entry in [
         "1. Change fee",
-        "2. Change per-transfer limit",
-        "3. Change 24h rolling limit",
-        "4. Change all",
-        "5. Show policy only",
+        "2. Change INBOUND per-transfer limit",
+        "3. Change OUTBOUND per-transfer limit",
+        "4. Change 24h rolling limit",
+        "5. Change all",
+        "6. Show policy only",
     ] {
         assert!(text.contains(entry), "missing {entry}:\n{text}");
     }
@@ -576,6 +577,8 @@ fn a_robinhood_change_does_not_touch_the_solana_configuration() {
                 let t = l.trim_start();
                 !(t.starts_with("fee_bps")
                     || t.starts_with("per_transfer_limit")
+                    || t.starts_with("inbound_per_transfer_limit")
+                    || t.starts_with("outbound_per_transfer_limit")
                     || t.starts_with("rolling_daily_limit"))
             })
             .cloned()
@@ -714,8 +717,13 @@ fn applying_backs_up_the_original_and_installs_the_new_policy() {
 
     // The new values are in force, and the operator comment survived.
     assert_eq!(policy_field(&config, "fee_bps").as_deref(), Some("600"));
+    // The legacy one-figure flag installs the directional pair.
     assert_eq!(
-        policy_field(&config, "per_transfer_limit").as_deref(),
+        policy_field(&config, "inbound_per_transfer_limit").as_deref(),
+        Some("2000000000000")
+    );
+    assert_eq!(
+        policy_field(&config, "outbound_per_transfer_limit").as_deref(),
         Some("2000000000000")
     );
     assert_eq!(
@@ -811,8 +819,9 @@ fn the_script_aborts_without_the_confirmation_word() {
     let config = config_with_policy(dir.path());
     let before = std::fs::read(&config).unwrap();
 
-    // network 2 (robinhood) -> 4 (change all) -> values -> note -> "no"
-    let out = script(&config, "2\n4\n6\n20000\n10000000\nlaunch\nno\n7\n");
+    // network 2 (robinhood) -> 5 (change all) -> fee, inbound, outbound,
+    // rolling -> note -> "no"
+    let out = script(&config, "2\n5\n6\n20000\n20000\n10000000\nlaunch\nno\n8\n");
     let text = out.all();
 
     assert!(text.contains("Step 1/3"), "{text}");
@@ -832,7 +841,7 @@ fn the_script_applies_the_launch_policy_after_confirmation() {
 
     let out = script(
         &config,
-        "2\n4\n6\n20000\n10000000\nRobinhood mainnet launch\nAPPLY\n7\n",
+        "2\n5\n6\n20000\n20000\n10000000\nRobinhood mainnet launch\nAPPLY\n8\n",
     );
     let text = out.all();
 
@@ -842,8 +851,13 @@ fn the_script_applies_the_launch_policy_after_confirmation() {
     );
     assert!(text.contains("APPLIED."), "{text}");
     assert_eq!(policy_field(&config, "fee_bps").as_deref(), Some("600"));
+    // The legacy one-figure flag installs the directional pair.
     assert_eq!(
-        policy_field(&config, "per_transfer_limit").as_deref(),
+        policy_field(&config, "inbound_per_transfer_limit").as_deref(),
+        Some("2000000000000")
+    );
+    assert_eq!(
+        policy_field(&config, "outbound_per_transfer_limit").as_deref(),
         Some("2000000000000")
     );
     assert_eq!(
@@ -860,14 +874,19 @@ fn changing_one_field_leaves_the_others_exactly_as_they_were() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_with_policy(dir.path());
 
-    let out = script(&config, "2\n1\n6\nfee only\nAPPLY\n7\n");
+    let out = script(&config, "2\n1\n6\nfee only\nAPPLY\n8\n");
     assert!(out.all().contains("APPLIED."), "{}", out.all());
 
     assert_eq!(policy_field(&config, "fee_bps").as_deref(), Some("600"));
     assert_eq!(
-        policy_field(&config, "per_transfer_limit").as_deref(),
+        policy_field(&config, "inbound_per_transfer_limit").as_deref(),
         Some("1000000000000"),
-        "the per-transfer limit must be unchanged"
+        "the inbound per-transfer limit must be unchanged"
+    );
+    assert_eq!(
+        policy_field(&config, "outbound_per_transfer_limit").as_deref(),
+        Some("1000000000000"),
+        "the outbound per-transfer limit must be unchanged"
     );
     assert_eq!(
         policy_field(&config, "rolling_daily_limit").as_deref(),
@@ -969,7 +988,8 @@ fn check_config_previews_the_policy_a_fragment_states() {
     );
     assert!(
         text.contains("--fee-bps 600")
-            && text.contains("--per-transfer-limit 2000000000000")
+            && text.contains("--inbound-per-transfer-limit 2000000000000")
+            && text.contains("--outbound-per-transfer-limit 2000000000000")
             && text.contains("--rolling-daily-limit 1000000000000000"),
         "the flags that would install it must be printed: {text}"
     );
@@ -1006,7 +1026,8 @@ fn check_config_porcelain_is_a_stable_contract() {
         "missing_section\tsolana",
         "fragment_network\trobinhood",
         "fragment_fee_bps\t600",
-        "fragment_per_transfer_limit\t2000000000000",
+        "fragment_inbound_per_transfer_limit\t2000000000000",
+        "fragment_outbound_per_transfer_limit\t2000000000000",
         "fragment_rolling_daily_limit\t1000000000000000",
     ] {
         assert!(

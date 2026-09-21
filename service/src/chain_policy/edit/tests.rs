@@ -7,7 +7,7 @@ use crate::config::tests::valid_config;
 const ONE_GLC: u64 = 100_000_000;
 
 fn approved() -> ChainPolicy {
-    ChainPolicy::new(
+    ChainPolicy::new_symmetric(
         Chain::Robinhood,
         600,
         CanonicalAtomic(20_000 * ONE_GLC),
@@ -226,7 +226,7 @@ fn solana_can_never_be_written_to_a_config_file() {
     // `ChainPolicy::new` already refuses Solana, so a Solana policy value
     // cannot even be constructed — assert that, then assert the edit
     // layer refuses the chain independently of it.
-    assert!(ChainPolicy::new(
+    assert!(ChainPolicy::new_symmetric(
         Chain::Solana,
         600,
         CanonicalAtomic(ONE_GLC),
@@ -378,7 +378,7 @@ fn successive_applies_keep_every_backup() {
         1_757_404_800,
     )
     .unwrap();
-    let stricter = ChainPolicy::new(
+    let stricter = ChainPolicy::new_symmetric(
         Chain::Robinhood,
         600,
         CanonicalAtomic(20_000 * ONE_GLC),

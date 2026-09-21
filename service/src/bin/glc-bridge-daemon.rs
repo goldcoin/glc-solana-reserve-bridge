@@ -700,7 +700,9 @@ async fn main() {
                     let mismatches = binding.compare(&limits);
                     tracing::info!(
                         fee_bps = policy.fee_bps(),
-                        per_transfer_limit_canonical = policy.per_transfer_limit().0,
+                        inbound_per_transfer_limit_canonical = policy.inbound_per_transfer_limit().0,
+                        outbound_per_transfer_limit_canonical =
+                            policy.outbound_per_transfer_limit().0,
                         rolling_daily_limit_canonical = policy.rolling_daily_limit().0,
                         expected_onchain_rolling_limit_canonical =
                             binding.expected_onchain_rolling_limit_canonical().0,

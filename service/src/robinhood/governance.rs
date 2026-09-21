@@ -439,20 +439,23 @@ pub fn limits_from_policy(
     current: &BridgeLimits,
     overrides: MinimumOverrides,
 ) -> Result<BridgeLimits, GovernanceError> {
-    let max = binding.per_transfer_limit().to_u256();
+    // Two SEPARATE maxima (docs/40, "SOURCE TRANSFER LIMIT vs DESTINATION
+    // PAYOUT CAP"): `inboundMax` is the user-facing deposit ceiling,
+    // `outboundMax` the destination settlement capacity. One bucket for
+    // both rolling windows, already proven to cover the larger maximum.
     let rolling = binding.expected_onchain_rolling_limit().to_u256();
     let proposed = BridgeLimits {
         inbound_min: overrides
             .inbound_min
             .map(RobinhoodAtomic::to_u256)
             .unwrap_or(current.inbound_min),
-        inbound_max: max,
+        inbound_max: binding.inbound_max().to_u256(),
         inbound_rolling_limit: rolling,
         outbound_min: overrides
             .outbound_min
             .map(RobinhoodAtomic::to_u256)
             .unwrap_or(current.outbound_min),
-        outbound_max: max,
+        outbound_max: binding.outbound_max().to_u256(),
         outbound_rolling_limit: rolling,
         protected_min_reserve: overrides
             .protected_min_reserve

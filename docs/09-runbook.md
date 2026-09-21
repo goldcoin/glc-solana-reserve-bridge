@@ -3166,7 +3166,8 @@ transaction is built, and the governance nonce is not consumed.
 
 | field | source |
 | --- | --- |
-| `inboundMax`, `outboundMax` | `[robinhood.policy].per_transfer_limit` |
+| `inboundMax` | `[robinhood.policy].inbound_per_transfer_limit` — the user's deposit ceiling on `RhnToGlc`/`RhnToSol` (20 000 GLC; `min_transfer::SOURCE_MAXIMUM_ROBINHOOD_CANONICAL` is the same figure) |
+| `outboundMax` | `[robinhood.policy].outbound_per_transfer_limit` — destination settlement capacity for `GlcToRhn`/`SolToRhn` payouts, sized for the elastic payouts a ≤ 50 000 GLC transfer can produce (docs/40); NOT a user limit. The legacy single `per_transfer_limit` key still sets both and cannot be combined with the pair (2026-09-21) |
 | `inboundRollingLimit`, `outboundRollingLimit` | **half** of `[robinhood.policy].rolling_daily_limit` |
 | `inboundMin`, `outboundMin`, `protectedMinReserve` | **preserved** from current on-chain state |
 

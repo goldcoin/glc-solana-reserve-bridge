@@ -1,7 +1,7 @@
 use super::*;
 
 fn policy(fee_bps: u64, per_transfer: u64, rolling: u64) -> Result<ChainPolicy, ChainPolicyError> {
-    ChainPolicy::new(
+    ChainPolicy::new_symmetric(
         Chain::Robinhood,
         fee_bps,
         CanonicalAtomic(per_transfer),
@@ -16,14 +16,22 @@ fn robinhood_launch_policy_is_accepted_exactly_as_specified() {
     let p = policy(600, 2_000_000_000_000, 1_000_000_000_000_000).expect("the approved policy");
     assert_eq!(p.chain(), Chain::Robinhood);
     assert_eq!(p.fee_bps(), 600);
-    assert_eq!(p.per_transfer_limit(), CanonicalAtomic(2_000_000_000_000));
+    assert_eq!(
+        p.inbound_per_transfer_limit(),
+        CanonicalAtomic(2_000_000_000_000)
+    );
+    assert_eq!(
+        p.outbound_per_transfer_limit(),
+        CanonicalAtomic(2_000_000_000_000)
+    );
+    assert!(p.is_symmetric());
     assert_eq!(
         p.rolling_daily_limit(),
         CanonicalAtomic(1_000_000_000_000_000)
     );
     // Sanity on the human figures the runbook states, so a typo in the
     // atomic values cannot pass review.
-    assert_eq!(p.per_transfer_limit().0 / 100_000_000, 20_000);
+    assert_eq!(p.inbound_per_transfer_limit().0 / 100_000_000, 20_000);
     assert_eq!(p.rolling_daily_limit().0 / 100_000_000, 10_000_000);
 }
 
@@ -35,7 +43,7 @@ fn solana_can_never_be_given_a_configured_policy() {
     assert!(!POLICY_GOVERNED_CHAINS.contains(&Chain::Goldcoin));
     for chain in [Chain::Solana, Chain::Goldcoin] {
         assert!(matches!(
-            ChainPolicy::new(
+            ChainPolicy::new_symmetric(
                 chain,
                 600,
                 CanonicalAtomic(2_000_000_000_000),
@@ -175,10 +183,14 @@ fn every_error_message_names_the_chain() {
             chain: "robinhood",
             fee_bps: 10_000,
         },
-        ChainPolicyError::ZeroPerTransferLimit { chain: "robinhood" },
+        ChainPolicyError::ZeroPerTransferLimit {
+            chain: "robinhood",
+            field: "inbound_per_transfer_limit",
+        },
         ChainPolicyError::ZeroRollingDailyLimit { chain: "robinhood" },
         ChainPolicyError::RollingBelowPerTransfer {
             chain: "robinhood",
+            field: "outbound_per_transfer_limit",
             per_transfer: 2,
             rolling: 1,
         },
@@ -190,4 +202,98 @@ fn every_error_message_names_the_chain() {
             "error does not name its chain: {text}"
         );
     }
+}
+
+// ------------------------------------ inbound vs outbound (2026-09-21) --
+
+/// The two per-transfer limits are separate figures: the legacy
+/// one-figure form is exactly the symmetric case, an asymmetric policy
+/// keeps both, and the strict daily ceiling must cover the LARGER one —
+/// the error names the direction it fails for.
+#[test]
+fn inbound_and_outbound_limits_are_separate_and_the_daily_ceiling_covers_the_larger() {
+    let asymmetric = ChainPolicy::new(
+        Chain::Robinhood,
+        600,
+        CanonicalAtomic(2_000_000_000_000),   // 20_000 GLC in
+        CanonicalAtomic(200_000_000_000_000), // 2_000_000 GLC out
+        CanonicalAtomic(1_000_000_000_000_000),
+    )
+    .unwrap();
+    assert!(!asymmetric.is_symmetric());
+    assert_eq!(asymmetric.inbound_per_transfer_limit().0, 2_000_000_000_000);
+    assert_eq!(
+        asymmetric.outbound_per_transfer_limit().0,
+        200_000_000_000_000
+    );
+    assert_eq!(
+        asymmetric.per_transfer_limit(TransferDirection::Inbound),
+        asymmetric.inbound_per_transfer_limit()
+    );
+    assert_eq!(
+        asymmetric.per_transfer_limit(TransferDirection::Outbound),
+        asymmetric.outbound_per_transfer_limit()
+    );
+    let symmetric = ChainPolicy::new_symmetric(
+        Chain::Robinhood,
+        600,
+        CanonicalAtomic(2_000_000_000_000),
+        CanonicalAtomic(1_000_000_000_000_000),
+    )
+    .unwrap();
+    assert!(symmetric.is_symmetric());
+    assert_eq!(
+        symmetric,
+        ChainPolicy::new(
+            Chain::Robinhood,
+            600,
+            CanonicalAtomic(2_000_000_000_000),
+            CanonicalAtomic(2_000_000_000_000),
+            CanonicalAtomic(1_000_000_000_000_000),
+        )
+        .unwrap()
+    );
+    // Zero in either direction is refused and named.
+    for (inbound, outbound, field) in [
+        (0, 1, "inbound_per_transfer_limit"),
+        (1, 0, "outbound_per_transfer_limit"),
+    ] {
+        assert_eq!(
+            ChainPolicy::new(
+                Chain::Robinhood,
+                600,
+                CanonicalAtomic(inbound),
+                CanonicalAtomic(outbound),
+                CanonicalAtomic(10),
+            ),
+            Err(ChainPolicyError::ZeroPerTransferLimit {
+                chain: "robinhood",
+                field
+            })
+        );
+    }
+    // A daily ceiling below the OUTBOUND limit is refused for outbound.
+    assert_eq!(
+        ChainPolicy::new(
+            Chain::Robinhood,
+            600,
+            CanonicalAtomic(2_000_000_000_000),
+            CanonicalAtomic(200_000_000_000_000),
+            CanonicalAtomic(100_000_000_000_000),
+        ),
+        Err(ChainPolicyError::RollingBelowPerTransfer {
+            chain: "robinhood",
+            field: "outbound_per_transfer_limit",
+            per_transfer: 200_000_000_000_000,
+            rolling: 100_000_000_000_000,
+        })
+    );
+    assert_eq!(
+        TransferDirection::Inbound.field(),
+        "inbound_per_transfer_limit"
+    );
+    assert_eq!(
+        TransferDirection::Outbound.field(),
+        "outbound_per_transfer_limit"
+    );
 }

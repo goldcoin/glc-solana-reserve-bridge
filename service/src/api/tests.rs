@@ -10798,3 +10798,205 @@ mod destination_bound {
         assert!(!s.available);
     }
 }
+
+// ------------------------------- Robinhood: source limits vs outboundMax --
+
+mod robinhood_source_limits {
+    //! 2026-09-21: the Robinhood-sourced routes' user maximum is 20_000
+    //! GLC (`min_transfer::SOURCE_MAXIMUM_ROBINHOOD_CANONICAL`), the
+    //! Goldcoin/Solana-sourced ones' is 50_000, and the contract's
+    //! `outboundMax` is destination settlement capacity ONLY: raising it
+    //! changes what a `GlcToRhn`/`SolToRhn` payout may be, never what any
+    //! user may send.
+
+    use super::*;
+    use crate::bridge_rate::live::{LiveBook, LiveRateConfig};
+    use crate::bridge_rate::smoothing::Sample;
+    use crate::bridge_rate::{RateBook, PRICE_SCALE};
+    use crate::routes::Chain;
+
+    const GLC: u64 = 100_000_000;
+    const W: i64 = 360;
+
+    fn feed_constant(live: &LiveBook, chain: Chain, price_e12: u64) {
+        let now = now_unix();
+        let mut t = now - 2 * W - 30;
+        while t <= now {
+            live.record_sample(
+                chain,
+                Sample {
+                    feed_at: t,
+                    observed_at: t,
+                    price_e12,
+                },
+            );
+            t += 30;
+        }
+    }
+
+    /// A warm book at a Goldcoin/Robinhood rate of 20 (Solana at unit).
+    fn book_rate_20() -> RateBook {
+        let live = Arc::new(LiveBook::new(LiveRateConfig {
+            price_window_secs: W,
+            price_staleness_secs: 120,
+            rate_band_bps: 2_500,
+        }));
+        feed_constant(&live, Chain::Goldcoin, 20 * PRICE_SCALE);
+        feed_constant(&live, Chain::Solana, 20 * PRICE_SCALE);
+        feed_constant(&live, Chain::Robinhood, PRICE_SCALE);
+        RateBook::live(60, live)
+    }
+
+    /// The mock contract with inboundMax 20_000 GLC and the given
+    /// outboundMax (whole GLC).
+    fn contract(outbound_max_glc: u128) -> crate::robinhood::testkit::MockNode {
+        let node = crate::robinhood::testkit::MockNode::new(crate::robinhood::testkit::BRIDGE);
+        node.with(|s| {
+            s.contract.limits.inbound_max = crate::evm::EvmU256::from_u128(20_000 * 10u128.pow(18));
+            s.contract.limits.outbound_max =
+                crate::evm::EvmU256::from_u128(outbound_max_glc * 10u128.pow(18));
+            s.contract.limits.outbound_rolling_limit =
+                crate::evm::EvmU256::from_u128(10_000_000 * 10u128.pow(18));
+        });
+        node
+    }
+
+    fn api_with(
+        db_path: &std::path::Path,
+        node: &crate::robinhood::testkit::MockNode,
+        book: RateBook,
+    ) -> BridgeApi<FakeSolanaRpc> {
+        let source: Arc<dyn crate::robinhood::public::RobinhoodContractSource> =
+            Arc::new(crate::robinhood::public::LiveRobinhoodContractSource::new(
+                node.clone(),
+                crate::robinhood::testkit::BRIDGE,
+            ));
+        build_with_open_cross_routes_at_limit(db_path, TEST_WIDE_PER_TRANSFER_LIMIT)
+            .with_robinhood(
+                crate::robinhood::RobinhoodHealth::unconfigured(),
+                Some(source),
+            )
+            .with_rate_book(book)
+    }
+
+    fn route<'a>(chains: &'a ChainsView, id: &str) -> &'a RouteView {
+        chains.routes.iter().find(|r| r.id == id).unwrap()
+    }
+
+    async fn quote(
+        api: &BridgeApi<FakeSolanaRpc>,
+        route: &str,
+        gross: u64,
+    ) -> Result<QuoteOutput, ApiError> {
+        api.quote(QuoteInput {
+            direction: route.to_string(),
+            gross_amount: AtomicU64(gross),
+        })
+        .await
+    }
+
+    /// Raising `outboundMax` from 20_000 to 5_000_000 GLC: the Robinhood-
+    /// sourced routes stay capped at 20_000 (source policy + inboundMax),
+    /// the Robinhood-bound routes stay capped at 50_000 at the source, and
+    /// only the destination capacity of the Robinhood-bound routes moves.
+    #[tokio::test]
+    async fn raising_outbound_max_moves_destination_capacity_and_no_source_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        let mut seen = Vec::new();
+        for outbound_max in [20_000u128, 5_000_000] {
+            let node = contract(outbound_max);
+            let api = api_with(&db_path, &node, book_rate_20());
+            let chains = api.chains().await.unwrap();
+            for (id, source_max) in [
+                ("RhnToGlc", 20_000 * GLC),
+                ("RhnToSol", 20_000 * GLC),
+                ("GlcToRhn", 50_000 * GLC),
+                ("SolToRhn", 50_000 * GLC),
+                ("GlcToSol", 50_000 * GLC),
+                ("SolToGlc", 50_000 * GLC),
+            ] {
+                assert_eq!(
+                    route(&chains, id).max_transfer_atomic.map(|m| m.0),
+                    Some(source_max),
+                    "{id} at outboundMax {outbound_max}"
+                );
+            }
+            // The Robinhood-sourced routes have NO destination capacity
+            // tied to outboundMax (their payouts leave Goldcoin/Solana).
+            assert_eq!(
+                route(&chains, "RhnToGlc").destination_admissible_atomic,
+                None
+            );
+            let g = route(&chains, "GlcToRhn");
+            seen.push(g.destination_admissible_atomic.unwrap().0);
+        }
+        // Capacity at rate 20, 600 bps, 25 % buffer: outboundMax 20_000 →
+        // a few hundred GLC; 5_000_000 → ~199_468 GLC, so 50_000 fits.
+        assert!(seen[0] < 50_000 * GLC && seen[1] > 50_000 * GLC, "{seen:?}");
+        assert!(seen[1] > seen[0] * 200, "{seen:?}");
+    }
+
+    /// The source limits are enforced as stated, inclusive, on every
+    /// Robinhood route, whatever outboundMax is.
+    #[tokio::test]
+    async fn source_maxima_are_twenty_thousand_from_robinhood_and_fifty_thousand_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        let node = contract(5_000_000);
+        let api = api_with(&db_path, &node, book_rate_20());
+        for (id, source_max) in [
+            ("RhnToGlc", 20_000 * GLC),
+            ("RhnToSol", 20_000 * GLC),
+            ("GlcToRhn", 50_000 * GLC),
+            ("SolToRhn", 50_000 * GLC),
+        ] {
+            quote(&api, id, source_max)
+                .await
+                .unwrap_or_else(|e| panic!("{id} at exactly {source_max}: {e:?}"));
+            let err = quote(&api, id, source_max + 1).await.unwrap_err();
+            assert!(
+                matches!(err, ApiError::AboveSourceMaximum { max_transfer_atomic, .. } if max_transfer_atomic == source_max),
+                "{id}: {err:?}"
+            );
+        }
+    }
+
+    /// The elastic destination payout may — and does — exceed the source
+    /// maximum: 50_000 GLC into Robinhood at rate 20 pays out 940_000 GLC,
+    /// admitted when outboundMax covers it; and an outboundMax that does
+    /// not (the old symmetric 20_000) refuses the same transfer for the
+    /// DESTINATION, with the user limit unchanged in the error. The
+    /// settlement-time refusal of an over-outboundMax payout is pinned
+    /// separately in `robinhood::settlement::tests::
+    /// a_quoted_payout_outside_the_contracts_bounds_is_parked_before_any_signer_is_asked`.
+    #[tokio::test]
+    async fn the_elastic_payout_exceeds_the_source_maximum_when_outbound_max_permits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        let node = contract(5_000_000);
+        let api = api_with(&db_path, &node, book_rate_20());
+        let q = quote(&api, "GlcToRhn", 50_000 * GLC).await.unwrap();
+        // 50_000 × 20 = 1_000_000 gross out, 600 bps → 940_000 net out.
+        assert_eq!(q.bridge_quote.net_out_amount.0, 940_000 * GLC);
+        assert!(q.bridge_quote.net_out_amount.0 > 50_000 * GLC);
+        assert_eq!(q.max_transfer_atomic.map(|m| m.0), Some(50_000 * GLC));
+        assert!(q.destination_admissible_atomic.unwrap().0 >= 50_000 * GLC);
+
+        let node = contract(20_000);
+        let api = api_with(&db_path, &node, book_rate_20());
+        let err = quote(&api, "GlcToRhn", 50_000 * GLC).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApiError::DestinationOutOfBounds { max_transfer_atomic, destination_admissible_atomic, .. }
+                    if max_transfer_atomic == 50_000 * GLC && destination_admissible_atomic < 50_000 * GLC
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.reason(),
+            Some(Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS)
+        );
+    }
+}

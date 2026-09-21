@@ -1821,7 +1821,13 @@ mod cross_route;
 /// the constant, not the caller's (test-tunable) floor.
 #[test]
 fn a_deposit_above_the_source_maximum_is_parked_and_one_at_it_is_payable() {
-    let max = crate::min_transfer::SOURCE_MAXIMUM_CANONICAL.0;
+    // The Robinhood-sourced maximum (20 000 GLC), not the 50 000 GLC of
+    // the Goldcoin/Solana-sourced routes.
+    let max = crate::min_transfer::source_maximum(Route::RhnToGlc).0;
+    assert_eq!(
+        max,
+        crate::min_transfer::SOURCE_MAXIMUM_ROBINHOOD_CANONICAL.0
+    );
     for (canonical, parked) in [(max, false), (max + 1, true)] {
         let mut ledger = Ledger::open_in_memory().expect("an in-memory ledger");
         // Deep enough that liquidity is not the reason.

@@ -228,14 +228,20 @@ current_field() {
         | awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' 
 }
 
-# Collects the three values, prompting only for the ones being changed and
-# carrying the rest across unchanged.
+# Collects the four values, prompting only for the ones being changed and
+# carrying the rest across unchanged. The two per-transfer limits are
+# separate on purpose (backend docs/40-destination-bound-admission.md):
+# INBOUND is the user's deposit ceiling into the contract (inboundMax),
+# OUTBOUND is how much one settlement may pay out of it (outboundMax) —
+# destination capacity, sized for the elastic payouts a source-side
+# maximum can produce, never a user limit.
 collect_values() {
     local which="$1"
     FEE_ARGS=() PER_ARGS=() ROLL_ARGS=()
-    local cur_fee cur_per cur_roll answer
+    local cur_fee cur_in cur_out cur_roll answer
     cur_fee="$(current_field fee_bps)"
-    cur_per="$(current_field per_transfer_limit)"
+    cur_in="$(current_field inbound_per_transfer_limit)"
+    cur_out="$(current_field outbound_per_transfer_limit)"
     cur_roll="$(current_field rolling_daily_limit)"
 
     if [ "$which" = fee ] || [ "$which" = all ]; then
@@ -246,12 +252,20 @@ collect_values() {
         FEE_ARGS=(--fee-bps "$cur_fee")
     fi
 
-    if [ "$which" = per ] || [ "$which" = all ]; then
-        ask "New per-transfer limit, in GLC (e.g. 20000): " answer || return 1
-        PER_ARGS=(--per-transfer-glc "$answer")
+    if [ "$which" = inbound ] || [ "$which" = all ]; then
+        ask "New INBOUND per-transfer limit (user deposit ceiling, inboundMax), in GLC (e.g. 20000): " answer || return 1
+        PER_ARGS+=(--inbound-per-transfer-glc "$answer")
     else
-        [ -n "$cur_per" ] || { echo "no per-transfer limit is configured yet — choose 'Change all'" >&2; return 1; }
-        PER_ARGS=(--per-transfer-limit "$cur_per")
+        [ -n "$cur_in" ] || { echo "no inbound per-transfer limit is configured yet — choose 'Change all'" >&2; return 1; }
+        PER_ARGS+=(--inbound-per-transfer-limit "$cur_in")
+    fi
+
+    if [ "$which" = outbound ] || [ "$which" = all ]; then
+        ask "New OUTBOUND per-transfer limit (destination settlement capacity, outboundMax), in GLC (e.g. 2000000): " answer || return 1
+        PER_ARGS+=(--outbound-per-transfer-glc "$answer")
+    else
+        [ -n "$cur_out" ] || { echo "no outbound per-transfer limit is configured yet — choose 'Change all'" >&2; return 1; }
+        PER_ARGS+=(--outbound-per-transfer-limit "$cur_out")
     fi
 
     if [ "$which" = roll ] || [ "$which" = all ]; then
@@ -330,22 +344,24 @@ action_menu() {
         show_policy
         echo
         echo "1. Change fee"
-        echo "2. Change per-transfer limit"
-        echo "3. Change 24h rolling limit"
-        echo "4. Change all"
-        echo "5. Show policy only"
-        echo "6. Back to network selection"
-        echo "7. Exit"
+        echo "2. Change INBOUND per-transfer limit  (user deposit ceiling — inboundMax)"
+        echo "3. Change OUTBOUND per-transfer limit (destination settlement capacity — outboundMax)"
+        echo "4. Change 24h rolling limit"
+        echo "5. Change all"
+        echo "6. Show policy only"
+        echo "7. Back to network selection"
+        echo "8. Exit"
         echo
         ask "Choice: " choice || exit 0
         case "$choice" in
             1) change_policy fee || true ;;
-            2) change_policy per || true ;;
-            3) change_policy roll || true ;;
-            4) change_policy all || true ;;
-            5) show_policy ;;
-            6) return 0 ;;
-            7) exit 0 ;;
+            2) change_policy inbound || true ;;
+            3) change_policy outbound || true ;;
+            4) change_policy roll || true ;;
+            5) change_policy all || true ;;
+            6) show_policy ;;
+            7) return 0 ;;
+            8) exit 0 ;;
             *) echo "not a valid choice: $choice" >&2 ;;
         esac
     done

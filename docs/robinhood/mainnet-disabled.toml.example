@@ -61,7 +61,9 @@
 # HALF of `rolling_daily_limit`.
 #
 # fee_bps = 600                        # 6.00%
-# per_transfer_limit = 2000000000000   # 20,000 GLC
+# inbound_per_transfer_limit  = 2000000000000   # 20,000 GLC — user deposit ceiling (inboundMax)
+# outbound_per_transfer_limit = 2000000000000   # payout capacity (outboundMax); size for elastic payouts, see launch-policy.toml.example
+# (legacy: per_transfer_limit = N sets both; not combinable with the pair)
 # rolling_daily_limit = 1000000000000000  # 10,000,000 GLC strict / 24h
 #                                      # -> on chain: 500000000000000 (5,000,000 GLC)
 

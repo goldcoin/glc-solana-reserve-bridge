@@ -185,6 +185,35 @@ settlement park exists for, and it is why the park stays.
   `GlcToSol`.
 - Existing fields, `min_transfer_atomic` included, are unchanged.
 
+## Robinhood: `inboundMax` is a source limit, `outboundMax` is capacity (2026-09-21)
+
+The custody contract stores the two per-transfer maxima as separate
+fields (`Limits.inboundMax`, `Limits.outboundMax`; `setLimits` replaces
+the whole struct; `_validateLimits` checks each rolling limit against its
+own maximum). They mean different things and are configured separately:
+
+| | `inboundMax` | `outboundMax` |
+|---|---|---|
+| bounds | a user's DEPOSIT into the contract (`RhnToGlc`, `RhnToSol`) | one PAYOUT out of the contract (`GlcToRhn`, `SolToRhn`) |
+| nature | source transfer limit — **20 000 GLC** (`min_transfer::SOURCE_MAXIMUM_ROBINHOOD_CANONICAL`) | destination settlement capacity, sized for the elastic payouts a ≤ 50 000 GLC transfer can produce |
+| config | `[robinhood.policy].inbound_per_transfer_limit` | `[robinhood.policy].outbound_per_transfer_limit` |
+| published | `max_transfer_atomic` on the Robinhood-sourced routes (= min(20 000, inboundMax)) | `destination_admissible_atomic` on the Robinhood-bound routes |
+
+Source maxima by source chain: Goldcoin L1 and Solana **50 000 GLC**,
+Robinhood Chain **20 000 GLC**. Raising `outboundMax` changes only what
+a `GlcToRhn`/`SolToRhn` payout may be — never any user's maximum
+(`api::tests::robinhood_source_limits`). The legacy one-figure
+`per_transfer_limit` key is still accepted and means "both"; it cannot be
+combined with the pair. `glc-admin robinhood-governance-set-limits`
+reconciles each field from its own key (2-of-3 governance, dry run by
+default, minimums and `protectedMinReserve` preserved, one rolling bucket
+= half the strict daily policy, which must cover the larger maximum).
+
+Sizing `outboundMax` for a 50 000 GLC `GlcToRhn` transfer at fee f and
+buffer b: `outbound ≥ 50 000 · R · (1 − f) / (1 − b)` for the planned
+Goldcoin→Robinhood rate ceiling R (the `SolToRhn` rate is ~17× smaller
+and is covered by the same figure).
+
 ## Sizing the destination cap
 
 The destination capacity scales linearly with the cap, with no code or

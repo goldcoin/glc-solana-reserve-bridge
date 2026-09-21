@@ -570,6 +570,15 @@ pub struct RobinhoodRouteView {
     /// `null` when no `[robinhood.policy]` section is configured — never
     /// zero, which would say the route accepts nothing.
     pub per_transfer_limit_atomic: Option<u64>,
+    /// The policy's per-transfer limit for the OTHER end of the contract
+    /// on this route: for a Robinhood-SOURCED route this is the
+    /// `outboundMax` capacity (what is not relevant to the user's deposit
+    /// but bounds nothing on this route), for a Robinhood-BOUND route the
+    /// `inboundMax` the contract enforces on deposits. Informational —
+    /// `per_transfer_limit_atomic` above is the figure that applies to
+    /// THIS route's Robinhood leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_direction_per_transfer_limit_atomic: Option<u64>,
     /// The smallest SINGLE transfer this route accepts, canonical 8dp —
     /// the source-side GROSS floor, and the counterpart to
     /// `per_transfer_limit_atomic` above.
@@ -3578,9 +3587,24 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     effective_available: status.effective_available,
                     disabled_reason: status.disabled_reason,
                     health_reason: status.health_reason,
-                    per_transfer_limit_atomic: context
-                        .policy
-                        .map(|policy| policy.per_transfer_limit().0),
+                    // The limit that applies to THIS route's Robinhood
+                    // leg: a Robinhood-SOURCED route deposits into the
+                    // contract (`inboundMax`), a Robinhood-BOUND route is
+                    // paid out of it (`outboundMax`, settlement capacity).
+                    per_transfer_limit_atomic: context.policy.map(|policy| {
+                        if status.source_chain == crate::routes::Chain::Robinhood.as_str() {
+                            policy.inbound_per_transfer_limit().0
+                        } else {
+                            policy.outbound_per_transfer_limit().0
+                        }
+                    }),
+                    other_direction_per_transfer_limit_atomic: context.policy.map(|policy| {
+                        if status.source_chain == crate::routes::Chain::Robinhood.as_str() {
+                            policy.outbound_per_transfer_limit().0
+                        } else {
+                            policy.inbound_per_transfer_limit().0
+                        }
+                    }),
                     // `status.route` is `Route::as_str()`'s own output, so
                     // it round-trips; the fallback is the same policy
                     // constant `source_minimum` would return anyway, so a

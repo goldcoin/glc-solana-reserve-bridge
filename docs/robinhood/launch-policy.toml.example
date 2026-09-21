@@ -38,12 +38,31 @@
 # price a request that could never settle.
 fee_bps = 600
 
-# 20,000 GLC — the largest single transfer.
+# The two per-transfer limits are SEPARATE (docs/40-destination-bound-
+# admission.md, "SOURCE TRANSFER LIMIT vs DESTINATION PAYOUT CAP"):
 #
-# The contract enforces this, not this file. `inboundMax` and
-# `outboundMax` must BOTH equal 2000000000000 canonical
-# (= 20000000000000000000000 at 18dp), and preflight FAILS if they do not.
-per_transfer_limit = 2000000000000
+# INBOUND — 20,000 GLC: the largest single DEPOSIT into the contract, the
+# user-facing source ceiling on RhnToGlc/RhnToSol (the service's own
+# `min_transfer::SOURCE_MAXIMUM_ROBINHOOD_CANONICAL` is the same figure).
+# The contract enforces it as `inboundMax` (= 20000000000000000000000 at
+# 18dp), and preflight FAILS if the chain holds something else.
+inbound_per_transfer_limit = 2000000000000
+
+# OUTBOUND — the largest single PAYOUT out of the contract: destination
+# settlement capacity for GlcToRhn/SolToRhn, enforced as `outboundMax`.
+# NOT a user limit. Under the elastic bridge rate a 50,000 GLC source
+# transfer pays out 50,000 × rate × 0.97 GLC on Robinhood Chain, and the
+# admission guard keeps a 25 % buffer, so size it as
+#   outbound ≥ 50,000 × R × 0.97 / 0.75   for the rate ceiling R you plan for
+# (R = 25 → 1,616,667 GLC; R = 30 → 1,940,000; R = 40 → 2,586,667).
+# The figure below is the LEGACY symmetric value and is far too small for
+# elastic payouts; it is kept only so this fragment still states the
+# pre-2026-09-21 policy. `rolling_daily_limit` / 2 must be at least this.
+outbound_per_transfer_limit = 2000000000000
+
+# The legacy single `per_transfer_limit = N` key is still accepted and
+# means "N for both directions"; it cannot be combined with the two keys
+# above.
 
 # 10,000,000 GLC — the STRICT 24-hour ceiling: the most that may move in
 # any 86,400-second span.

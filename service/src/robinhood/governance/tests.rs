@@ -168,7 +168,7 @@ const ONE_GLC: u64 = 100_000_000;
 /// this module must contain no figure of its own, so a test that used a
 /// compiled-in number would be testing the wrong thing.
 fn policy(fee_bps: u64, per_transfer_glc: u64, rolling_glc: u64) -> RobinhoodPolicyBinding {
-    let policy = ChainPolicy::new(
+    let policy = ChainPolicy::new_symmetric(
         Chain::Robinhood,
         fee_bps,
         CanonicalAtomic(per_transfer_glc * ONE_GLC),
@@ -454,11 +454,8 @@ fn the_proposal_comes_from_configured_policy_and_preserves_the_minimums() {
 
     let proposed = limits_from_policy(&binding, &current, MinimumOverrides::default()).unwrap();
 
-    assert_eq!(proposed.inbound_max, binding.per_transfer_limit().to_u256());
-    assert_eq!(
-        proposed.outbound_max,
-        binding.per_transfer_limit().to_u256()
-    );
+    assert_eq!(proposed.inbound_max, binding.inbound_max().to_u256());
+    assert_eq!(proposed.outbound_max, binding.outbound_max().to_u256());
     assert_eq!(
         proposed.inbound_rolling_limit,
         binding.expected_onchain_rolling_limit().to_u256()
@@ -505,7 +502,7 @@ fn the_on_chain_bucket_is_always_half_the_configured_strict_policy() {
 /// remainder later.
 #[test]
 fn an_unhalvable_strict_policy_is_refused_before_any_proposal_exists() {
-    let policy = ChainPolicy::new(
+    let policy = ChainPolicy::new_symmetric(
         Chain::Robinhood,
         600,
         CanonicalAtomic(2),
@@ -1172,4 +1169,53 @@ fn the_three_golden_governance_digests_are_distinct() {
     assert_ne!(digests[0], digests[1]);
     assert_ne!(digests[1], digests[2]);
     assert_ne!(digests[0], digests[2]);
+}
+
+/// `setLimits` reconciles the two maxima SEPARATELY: `inboundMax` from
+/// the inbound limit (the user's deposit ceiling, unchanged at 20_000),
+/// `outboundMax` from the outbound one (destination settlement capacity),
+/// with the minimums and the protected reserve preserved and one rolling
+/// bucket covering the larger maximum — and the proposal passes the
+/// contract's own `_validateLimits` rules.
+#[test]
+fn the_proposal_reconciles_inbound_and_outbound_maxima_separately() {
+    let policy = ChainPolicy::new(
+        Chain::Robinhood,
+        600,
+        CanonicalAtomic(20_000 * ONE_GLC),
+        CanonicalAtomic(2_000_000 * ONE_GLC),
+        CanonicalAtomic(10_000_000 * ONE_GLC),
+    )
+    .unwrap();
+    let binding = RobinhoodPolicyBinding::new(policy).unwrap();
+    let current = limits(
+        20_000 * u128::from(ONE_GLC) * 10_000_000_000,
+        5_000_000 * u128::from(ONE_GLC) * 10_000_000_000,
+        u128::from(ONE_GLC) * 10_000_000_000,
+        1_000 * u128::from(ONE_GLC) * 10_000_000_000,
+    );
+    let proposed = limits_from_policy(&binding, &current, MinimumOverrides::default()).unwrap();
+    assert_eq!(
+        proposed.inbound_max,
+        EvmU256::from_u128(20_000 * 10u128.pow(18))
+    );
+    assert_eq!(
+        proposed.outbound_max,
+        EvmU256::from_u128(2_000_000 * 10u128.pow(18))
+    );
+    assert_eq!(
+        proposed.inbound_rolling_limit,
+        EvmU256::from_u128(5_000_000 * 10u128.pow(18))
+    );
+    assert_eq!(
+        proposed.outbound_rolling_limit,
+        EvmU256::from_u128(5_000_000 * 10u128.pow(18))
+    );
+    assert_eq!(proposed.inbound_min, current.inbound_min);
+    assert_eq!(proposed.outbound_min, current.outbound_min);
+    assert_eq!(
+        proposed.protected_min_reserve,
+        current.protected_min_reserve
+    );
+    assert!(validate_limits(&proposed).is_ok());
 }

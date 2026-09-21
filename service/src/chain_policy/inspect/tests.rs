@@ -46,7 +46,11 @@ fn the_shipped_launch_policy_example_is_a_fragment_with_a_readable_policy() {
     let policy = policies[0].policy.as_ref().expect("the approved policy");
     assert_eq!(policy.fee_bps(), 600);
     assert_eq!(
-        policy.per_transfer_limit(),
+        policy.inbound_per_transfer_limit(),
+        CanonicalAtomic(2_000_000_000_000)
+    );
+    assert_eq!(
+        policy.outbound_per_transfer_limit(),
         CanonicalAtomic(2_000_000_000_000)
     );
     assert_eq!(

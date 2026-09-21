@@ -171,24 +171,56 @@ pub enum ChainPolicyError {
     )]
     FeeBpsOutOfRange { chain: &'static str, fee_bps: u64 },
     #[error(
-        "{chain}: per_transfer_limit must not be zero — a zero ceiling closes the chain silently, \
+        "{chain}: {field} must not be zero — a zero ceiling closes the direction silently, \
          and closing a route is what the route flags and the pause gates are for"
     )]
-    ZeroPerTransferLimit { chain: &'static str },
+    ZeroPerTransferLimit {
+        chain: &'static str,
+        field: &'static str,
+    },
     #[error(
-        "{chain}: rolling_daily_limit must not be zero, for the same reason as per_transfer_limit"
+        "{chain}: rolling_daily_limit must not be zero, for the same reason as a per-transfer limit"
     )]
     ZeroRollingDailyLimit { chain: &'static str },
     #[error(
-        "{chain}: rolling_daily_limit {rolling} is below per_transfer_limit {per_transfer} \
+        "{chain}: rolling_daily_limit {rolling} is below {field} {per_transfer} \
          (canonical 8dp) — a single legal transfer could not fit in a whole day's budget, so the \
          per-transfer ceiling would be unreachable and the stated policy self-contradictory"
     )]
     RollingBelowPerTransfer {
         chain: &'static str,
+        field: &'static str,
         per_transfer: u64,
         rolling: u64,
     },
+}
+
+/// The two per-transfer limits a policy states, by the direction of the
+/// transfer relative to the chain (docs/40-destination-bound-admission.md,
+/// "SOURCE TRANSFER LIMIT vs DESTINATION PAYOUT CAP"): the INBOUND limit
+/// bounds what a user may deposit INTO the chain's custody contract (a
+/// source-side, user-facing ceiling), the OUTBOUND limit bounds what one
+/// settlement may pay OUT of it (destination settlement capacity, sized
+/// for the elastic payouts a source-side maximum can produce). They are
+/// separate figures on the contract (`inboundMax` / `outboundMax`) and
+/// separate figures here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Inbound,
+    Outbound,
+}
+
+impl TransferDirection {
+    pub const ALL: [TransferDirection; 2] =
+        [TransferDirection::Inbound, TransferDirection::Outbound];
+
+    /// The config key.
+    pub fn field(self) -> &'static str {
+        match self {
+            TransferDirection::Inbound => "inbound_per_transfer_limit",
+            TransferDirection::Outbound => "outbound_per_transfer_limit",
+        }
+    }
 }
 
 /// One chain's approved launch policy, validated at construction.
@@ -206,7 +238,8 @@ pub enum ChainPolicyError {
 pub struct ChainPolicy {
     chain: Chain,
     fee_bps: u64,
-    per_transfer_limit: CanonicalAtomic,
+    inbound_per_transfer_limit: CanonicalAtomic,
+    outbound_per_transfer_limit: CanonicalAtomic,
     rolling_daily_limit: CanonicalAtomic,
 }
 
@@ -223,10 +256,16 @@ impl ChainPolicy {
     /// Robinhood routes for a config with no `[fees]` section (the
     /// documented migration fallback), so it is held to exactly the same
     /// range rule as a per-route fee — one rule, in one place, reused.
+    ///
+    /// The two per-transfer limits are stated separately
+    /// ([`TransferDirection`]); the ONE strict daily ceiling must cover
+    /// the larger of them. [`ChainPolicy::new_symmetric`] is the legacy
+    /// one-figure form.
     pub fn new(
         chain: Chain,
         fee_bps: u64,
-        per_transfer_limit: CanonicalAtomic,
+        inbound_per_transfer_limit: CanonicalAtomic,
+        outbound_per_transfer_limit: CanonicalAtomic,
         rolling_daily_limit: CanonicalAtomic,
     ) -> Result<ChainPolicy, ChainPolicyError> {
         let name = chain.as_str();
@@ -239,25 +278,57 @@ impl ChainPolicy {
                 fee_bps,
             });
         }
-        if per_transfer_limit.0 == 0 {
-            return Err(ChainPolicyError::ZeroPerTransferLimit { chain: name });
+        for (direction, limit) in [
+            (TransferDirection::Inbound, inbound_per_transfer_limit),
+            (TransferDirection::Outbound, outbound_per_transfer_limit),
+        ] {
+            if limit.0 == 0 {
+                return Err(ChainPolicyError::ZeroPerTransferLimit {
+                    chain: name,
+                    field: direction.field(),
+                });
+            }
         }
         if rolling_daily_limit.0 == 0 {
             return Err(ChainPolicyError::ZeroRollingDailyLimit { chain: name });
         }
-        if rolling_daily_limit.0 < per_transfer_limit.0 {
-            return Err(ChainPolicyError::RollingBelowPerTransfer {
-                chain: name,
-                per_transfer: per_transfer_limit.0,
-                rolling: rolling_daily_limit.0,
-            });
+        for (direction, limit) in [
+            (TransferDirection::Inbound, inbound_per_transfer_limit),
+            (TransferDirection::Outbound, outbound_per_transfer_limit),
+        ] {
+            if rolling_daily_limit.0 < limit.0 {
+                return Err(ChainPolicyError::RollingBelowPerTransfer {
+                    chain: name,
+                    field: direction.field(),
+                    per_transfer: limit.0,
+                    rolling: rolling_daily_limit.0,
+                });
+            }
         }
         Ok(ChainPolicy {
             chain,
             fee_bps,
-            per_transfer_limit,
+            inbound_per_transfer_limit,
+            outbound_per_transfer_limit,
             rolling_daily_limit,
         })
+    }
+
+    /// The legacy one-figure form: the same limit in both directions —
+    /// what a config carrying only `per_transfer_limit` states.
+    pub fn new_symmetric(
+        chain: Chain,
+        fee_bps: u64,
+        per_transfer_limit: CanonicalAtomic,
+        rolling_daily_limit: CanonicalAtomic,
+    ) -> Result<ChainPolicy, ChainPolicyError> {
+        ChainPolicy::new(
+            chain,
+            fee_bps,
+            per_transfer_limit,
+            per_transfer_limit,
+            rolling_daily_limit,
+        )
     }
 
     pub fn chain(&self) -> Chain {
@@ -272,9 +343,33 @@ impl ChainPolicy {
         self.fee_bps
     }
 
-    /// The largest single transfer this policy approves, canonical 8dp.
-    pub fn per_transfer_limit(&self) -> CanonicalAtomic {
-        self.per_transfer_limit
+    /// The largest single deposit INTO the chain this policy approves,
+    /// canonical 8dp — the user-facing, source-side ceiling
+    /// (`inboundMax` on the contract).
+    pub fn inbound_per_transfer_limit(&self) -> CanonicalAtomic {
+        self.inbound_per_transfer_limit
+    }
+
+    /// The largest single payout OUT of the chain this policy approves,
+    /// canonical 8dp — destination settlement capacity (`outboundMax` on
+    /// the contract), sized for the elastic payouts a source-side maximum
+    /// can produce; never a user limit.
+    pub fn outbound_per_transfer_limit(&self) -> CanonicalAtomic {
+        self.outbound_per_transfer_limit
+    }
+
+    /// The per-transfer limit for `direction`.
+    pub fn per_transfer_limit(&self, direction: TransferDirection) -> CanonicalAtomic {
+        match direction {
+            TransferDirection::Inbound => self.inbound_per_transfer_limit,
+            TransferDirection::Outbound => self.outbound_per_transfer_limit,
+        }
+    }
+
+    /// Whether the two per-transfer limits are one figure (the legacy
+    /// symmetric policy).
+    pub fn is_symmetric(&self) -> bool {
+        self.inbound_per_transfer_limit == self.outbound_per_transfer_limit
     }
 
     /// The STRICT 24-hour ceiling this policy approves, canonical 8dp.

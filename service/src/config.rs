@@ -501,11 +501,25 @@ struct RawChainPolicy {
     /// migration fallback); once `[fees]` exists, that table is what
     /// prices every route.
     fee_bps: u64,
-    /// The largest single transfer, canonical 8dp. Checked against the
-    /// deployed contract's own `inboundMax`/`outboundMax` at preflight —
-    /// the contract is the enforcement layer, this is the statement of
-    /// what it is believed to hold.
-    per_transfer_limit: u64,
+    /// LEGACY one-figure form: the same per-transfer limit in both
+    /// directions. Accepted only when neither directional key below is
+    /// present; a config that states both forms is refused.
+    #[serde(default)]
+    per_transfer_limit: Option<u64>,
+    /// The largest single deposit INTO the contract, canonical 8dp — the
+    /// user-facing, source-side ceiling on `RhnToGlc`/`RhnToSol`
+    /// (`inboundMax`). Checked against the deployed contract at
+    /// preflight — the contract is the enforcement layer, this is the
+    /// statement of what it is believed to hold.
+    #[serde(default)]
+    inbound_per_transfer_limit: Option<u64>,
+    /// The largest single payout OUT of the contract, canonical 8dp —
+    /// destination settlement capacity for `GlcToRhn`/`SolToRhn`
+    /// (`outboundMax`), sized for the elastic payouts a ≤ source-maximum
+    /// transfer can produce (docs/40-destination-bound-admission.md).
+    /// Never a user limit. Both directional keys must be given together.
+    #[serde(default)]
+    outbound_per_transfer_limit: Option<u64>,
     /// The STRICT 24-hour ceiling, canonical 8dp: the most that may move
     /// in any 86,400-second span. This is NOT the number that goes on
     /// chain — `GlcRobinhoodBridge`'s rolling window is a fixed bucket,
@@ -2879,10 +2893,49 @@ fn resolve_chain_policies(
         return Ok(policies);
     };
 
+    // Two forms, never mixed: the legacy `per_transfer_limit` (one figure
+    // for both directions) or the directional pair. A partial pair is
+    // refused rather than defaulted — a defaulted outbound limit would be
+    // a payout cap nobody stated.
+    let (inbound, outbound) = match (
+        raw.per_transfer_limit,
+        raw.inbound_per_transfer_limit,
+        raw.outbound_per_transfer_limit,
+    ) {
+        (Some(both), None, None) => (both, both),
+        (None, Some(inbound), Some(outbound)) => (inbound, outbound),
+        (None, None, None) => {
+            return Err(ConfigError::Invalid {
+                field: "robinhood.policy",
+                detail: "state either `per_transfer_limit` (legacy, one figure for both \
+                         directions) or BOTH `inbound_per_transfer_limit` and \
+                         `outbound_per_transfer_limit`"
+                    .to_string(),
+            })
+        }
+        (Some(_), _, _) => {
+            return Err(ConfigError::Invalid {
+                field: "robinhood.policy",
+                detail: "`per_transfer_limit` (legacy) cannot be combined with \
+                         `inbound_per_transfer_limit` / `outbound_per_transfer_limit` — \
+                         remove the legacy key"
+                    .to_string(),
+            })
+        }
+        (None, _, _) => {
+            return Err(ConfigError::Invalid {
+                field: "robinhood.policy",
+                detail: "`inbound_per_transfer_limit` and `outbound_per_transfer_limit` must \
+                         be stated together"
+                    .to_string(),
+            })
+        }
+    };
     let policy = ChainPolicy::new(
         crate::routes::Chain::Robinhood,
         raw.fee_bps,
-        CanonicalAtomic(raw.per_transfer_limit),
+        CanonicalAtomic(inbound),
+        CanonicalAtomic(outbound),
         CanonicalAtomic(raw.rolling_daily_limit),
     )
     .map_err(|e| ConfigError::Invalid {
