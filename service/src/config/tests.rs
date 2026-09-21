@@ -1790,7 +1790,8 @@ fn the_robinhood_launch_policy_loads_from_config() {
         .get(crate::routes::Chain::Robinhood)
         .expect("a Robinhood policy");
     assert_eq!(policy.fee_bps(), 600);
-    assert_eq!(policy.per_transfer_limit().0, 2_000_000_000_000);
+    assert_eq!(policy.inbound_per_transfer_limit().0, 2_000_000_000_000);
+    assert_eq!(policy.outbound_per_transfer_limit().0, 2_000_000_000_000);
     assert_eq!(policy.rolling_daily_limit().0, 1_000_000_000_000_000);
 
     // And the on-chain figure it implies is HALF the strict policy.
@@ -1804,6 +1805,67 @@ fn the_robinhood_launch_policy_loads_from_config() {
 
 /// The other half of requirement "do not change Goldcoin<->Solana": a
 /// configured Robinhood policy must not move the Solana fee.
+/// The directional pair (2026-09-21): `inbound_per_transfer_limit` is the
+/// user's deposit ceiling, `outbound_per_transfer_limit` the destination
+/// settlement capacity, each its own figure; the legacy single key still
+/// means both; the two forms cannot be mixed; and a partial pair is
+/// refused rather than defaulted.
+#[test]
+fn the_robinhood_policy_states_inbound_and_outbound_limits_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string(valid_config(dir.path())).unwrap();
+    let load = |section: &str| {
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, format!("{base}\n[robinhood.policy]\n{section}\n")).unwrap();
+        Config::load(&path)
+    };
+    let config = load(
+        "fee_bps = 600\ninbound_per_transfer_limit = 2000000000000\n\
+         outbound_per_transfer_limit = 200000000000000\nrolling_daily_limit = 1000000000000000",
+    )
+    .expect("the directional pair loads");
+    let policy = config
+        .chain_policies
+        .get(crate::routes::Chain::Robinhood)
+        .unwrap();
+    assert_eq!(policy.inbound_per_transfer_limit().0, 2_000_000_000_000);
+    assert_eq!(policy.outbound_per_transfer_limit().0, 200_000_000_000_000);
+    assert!(!policy.is_symmetric());
+    for (section, why) in [
+        (
+            "fee_bps = 600\nper_transfer_limit = 2000000000000\n\
+             outbound_per_transfer_limit = 200000000000000\nrolling_daily_limit = 1000000000000000",
+            "legacy mixed with a directional key",
+        ),
+        (
+            "fee_bps = 600\ninbound_per_transfer_limit = 2000000000000\n\
+             rolling_daily_limit = 1000000000000000",
+            "a partial pair",
+        ),
+        (
+            "fee_bps = 600\nrolling_daily_limit = 1000000000000000",
+            "no per-transfer limit at all",
+        ),
+        (
+            "fee_bps = 600\ninbound_per_transfer_limit = 2000000000000\n\
+             outbound_per_transfer_limit = 200000000000000\nrolling_daily_limit = 100000000000000",
+            "a daily ceiling below the outbound limit",
+        ),
+    ] {
+        let err = load(section).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    field: "robinhood.policy",
+                    ..
+                }
+            ),
+            "{why}: {err}"
+        );
+    }
+}
+
 #[test]
 fn a_robinhood_policy_leaves_the_solana_fee_untouched() {
     let dir = tempfile::tempdir().unwrap();

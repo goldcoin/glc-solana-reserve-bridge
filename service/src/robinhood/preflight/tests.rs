@@ -547,7 +547,7 @@ fn glc_18dp(glc: u128) -> crate::evm::EvmU256 {
 /// The approved Robinhood launch policy: 6.00%, 20,000 GLC per transfer,
 /// 10,000,000 GLC strict per 24h.
 fn approved_policy() -> ChainPolicy {
-    ChainPolicy::new(
+    ChainPolicy::new_symmetric(
         crate::routes::Chain::Robinhood,
         600,
         crate::amount_conversion::CanonicalAtomic(20_000 * ONE_GLC_CANONICAL),

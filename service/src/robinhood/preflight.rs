@@ -1013,10 +1013,13 @@ async fn push_policy_checks<R>(
         },
         if per_transfer.is_empty() {
             format!(
-                "configured per_transfer_limit {} canonical 8dp ({} at 18dp) equals the \
-                 contract's inboundMax and outboundMax",
-                policy.per_transfer_limit().0,
-                binding.per_transfer_limit().get()
+                "configured inbound_per_transfer_limit {} canonical 8dp ({} at 18dp) equals \
+                 the contract's inboundMax and outbound_per_transfer_limit {} ({} at 18dp) \
+                 equals its outboundMax",
+                policy.inbound_per_transfer_limit().0,
+                binding.inbound_max().get(),
+                policy.outbound_per_transfer_limit().0,
+                binding.outbound_max().get()
             )
         } else {
             per_transfer.join(" | ")

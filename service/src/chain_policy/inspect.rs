@@ -222,12 +222,37 @@ fn fragment_policies(doc: &DocumentMut) -> Vec<FragmentPolicy> {
 
 fn read_policy(table: &dyn TableLike, chain: Chain) -> Result<ChainPolicy, String> {
     let fee_bps = integer(table, "fee_bps")?;
-    let per_transfer = integer(table, "per_transfer_limit")?;
+    // The same two forms, and the same refusal to mix them, as the
+    // config parser (`config::resolve_chain_policies`).
+    let legacy = table.get("per_transfer_limit").is_some();
+    let inbound = table.get("inbound_per_transfer_limit").is_some();
+    let outbound = table.get("outbound_per_transfer_limit").is_some();
+    let (inbound, outbound) = match (legacy, inbound, outbound) {
+        (true, false, false) => {
+            let both = integer(table, "per_transfer_limit")?;
+            (both, both)
+        }
+        (false, true, true) => (
+            integer(table, "inbound_per_transfer_limit")?,
+            integer(table, "outbound_per_transfer_limit")?,
+        ),
+        (true, _, _) => {
+            return Err("`per_transfer_limit` (legacy) cannot be combined with \
+                        `inbound_per_transfer_limit` / `outbound_per_transfer_limit`"
+                .to_string())
+        }
+        _ => {
+            return Err("state either `per_transfer_limit` (legacy) or BOTH \
+                        `inbound_per_transfer_limit` and `outbound_per_transfer_limit`"
+                .to_string())
+        }
+    };
     let rolling = integer(table, "rolling_daily_limit")?;
     ChainPolicy::new(
         chain,
         fee_bps,
-        CanonicalAtomic(per_transfer),
+        CanonicalAtomic(inbound),
+        CanonicalAtomic(outbound),
         CanonicalAtomic(rolling),
     )
     .map_err(|e| e.to_string())

@@ -209,9 +209,17 @@ pub fn plan(path: &Path, chain: Chain, after: ChainPolicy) -> Result<ApplyPlan, 
             fee_bps: after.fee_bps(),
         })
     })?);
-    policy_table["per_transfer_limit"] = value(to_toml_integer(
-        after.per_transfer_limit().0,
-        "per_transfer_limit",
+    // The directional pair is always written; the legacy one-figure key
+    // is removed so the file never states both forms (the parser refuses
+    // that).
+    policy_table.remove("per_transfer_limit");
+    policy_table["inbound_per_transfer_limit"] = value(to_toml_integer(
+        after.inbound_per_transfer_limit().0,
+        "inbound_per_transfer_limit",
+    )?);
+    policy_table["outbound_per_transfer_limit"] = value(to_toml_integer(
+        after.outbound_per_transfer_limit().0,
+        "outbound_per_transfer_limit",
     )?);
     policy_table["rolling_daily_limit"] = value(to_toml_integer(
         after.rolling_daily_limit().0,

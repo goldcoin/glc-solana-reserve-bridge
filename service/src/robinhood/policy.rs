@@ -78,6 +78,14 @@ impl LimitDirection {
 
     pub const ALL: [LimitDirection; 2] = [LimitDirection::Inbound, LimitDirection::Outbound];
 
+    /// The policy-side name of the same direction.
+    pub fn policy(self) -> crate::chain_policy::TransferDirection {
+        match self {
+            LimitDirection::Inbound => crate::chain_policy::TransferDirection::Inbound,
+            LimitDirection::Outbound => crate::chain_policy::TransferDirection::Outbound,
+        }
+    }
+
     fn max(self, limits: &BridgeLimits) -> EvmU256 {
         match self {
             LimitDirection::Inbound => limits.inbound_max,
@@ -138,12 +146,13 @@ pub enum RobinhoodPolicyError {
     RollingPolicyNotHalvable { rolling: u64 },
     #[error(
         "the on-chain rolling limit this policy implies ({implied} canonical 8dp — half of the \
-         strict rolling_daily_limit {rolling}) is below per_transfer_limit {per_transfer}. \
+         strict rolling_daily_limit {rolling}) is below {field} {per_transfer}. \
          GlcRobinhoodBridge._validateLimits rejects any Limits struct whose rollingLimit is below \
          its max, so no setLimits call could install this policy: the contract would revert with \
          InvalidLimits"
     )]
     ImpliedRollingBelowPerTransfer {
+        field: &'static str,
         per_transfer: u64,
         rolling: u64,
         implied: u64,
@@ -243,7 +252,10 @@ pub enum PolicyMismatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RobinhoodPolicyBinding {
     policy: ChainPolicy,
-    per_transfer_limit: RobinhoodAtomic,
+    /// `inboundMax`: the source-side deposit ceiling.
+    inbound_max: RobinhoodAtomic,
+    /// `outboundMax`: destination settlement capacity — never a user limit.
+    outbound_max: RobinhoodAtomic,
     /// The strict 24-hour ceiling, in Robinhood atomic units. NOT the
     /// value that belongs on chain.
     rolling_daily_policy: RobinhoodAtomic,
@@ -263,7 +275,8 @@ impl RobinhoodPolicyBinding {
             });
         }
 
-        let per_transfer_canonical = policy.per_transfer_limit();
+        let inbound_canonical = policy.inbound_per_transfer_limit();
+        let outbound_canonical = policy.outbound_per_transfer_limit();
         let rolling_canonical = policy.rolling_daily_limit();
 
         // The halving happens in the CANONICAL unit, before widening, so
@@ -279,22 +292,33 @@ impl RobinhoodPolicyBinding {
         // `_validateLimits` refuses a Limits struct whose rollingLimit is
         // below its max, so a policy implying that is one no governance
         // action could ever install.
-        if implied_canonical.0 < per_transfer_canonical.0 {
-            return Err(RobinhoodPolicyError::ImpliedRollingBelowPerTransfer {
-                per_transfer: per_transfer_canonical.0,
-                rolling: rolling_canonical.0,
-                implied: implied_canonical.0,
-            });
+        // Both directions: the contract validates each rolling limit
+        // against its own max, and this binding installs one bucket for
+        // both, so the bucket must cover the larger of the two.
+        for (field, limit) in [
+            ("inbound_per_transfer_limit", inbound_canonical),
+            ("outbound_per_transfer_limit", outbound_canonical),
+        ] {
+            if implied_canonical.0 < limit.0 {
+                return Err(RobinhoodPolicyError::ImpliedRollingBelowPerTransfer {
+                    field,
+                    per_transfer: limit.0,
+                    rolling: rolling_canonical.0,
+                    implied: implied_canonical.0,
+                });
+            }
         }
 
-        let per_transfer_limit = widen(per_transfer_canonical, "per_transfer_limit")?;
+        let inbound_max = widen(inbound_canonical, "inbound_per_transfer_limit")?;
+        let outbound_max = widen(outbound_canonical, "outbound_per_transfer_limit")?;
         let rolling_daily_policy = widen(rolling_canonical, "rolling_daily_limit")?;
         let expected_onchain_rolling_limit =
             widen(implied_canonical, "implied on-chain rolling limit")?;
 
         Ok(RobinhoodPolicyBinding {
             policy,
-            per_transfer_limit,
+            inbound_max,
+            outbound_max,
             rolling_daily_policy,
             expected_onchain_rolling_limit,
             expected_onchain_rolling_limit_canonical: implied_canonical,
@@ -305,10 +329,24 @@ impl RobinhoodPolicyBinding {
         &self.policy
     }
 
-    /// The largest single transfer, in the token's 18-decimal unit. This
-    /// is the value `inboundMax` and `outboundMax` must both hold.
-    pub fn per_transfer_limit(&self) -> RobinhoodAtomic {
-        self.per_transfer_limit
+    /// The value `inboundMax` must hold (18dp): the source-side deposit
+    /// ceiling on `RhnToGlc`/`RhnToSol`.
+    pub fn inbound_max(&self) -> RobinhoodAtomic {
+        self.inbound_max
+    }
+
+    /// The value `outboundMax` must hold (18dp): destination settlement
+    /// capacity for `GlcToRhn`/`SolToRhn` payouts — never a user limit.
+    pub fn outbound_max(&self) -> RobinhoodAtomic {
+        self.outbound_max
+    }
+
+    /// The per-transfer limit the contract must hold for `direction`.
+    pub fn per_transfer_limit(&self, direction: LimitDirection) -> RobinhoodAtomic {
+        match direction {
+            LimitDirection::Inbound => self.inbound_max,
+            LimitDirection::Outbound => self.outbound_max,
+        }
     }
 
     /// The approved STRICT 24-hour ceiling, 18dp. Never the value to put
@@ -360,12 +398,13 @@ impl RobinhoodPolicyBinding {
             });
             return;
         };
-        let backend = self.per_transfer_limit.get();
+        let backend = self.per_transfer_limit(direction).get();
+        let backend_canonical = self.policy.per_transfer_limit(direction.policy()).0;
         if backend > chain {
             out.push(PolicyMismatch::PerTransferAboveChainMax {
                 direction: direction.as_str(),
                 field,
-                backend_canonical: self.policy.per_transfer_limit().0,
+                backend_canonical,
                 backend_robinhood: backend,
                 chain_robinhood: chain.to_string(),
             });
@@ -373,7 +412,7 @@ impl RobinhoodPolicyBinding {
             out.push(PolicyMismatch::PerTransferBelowChainMax {
                 direction: direction.as_str(),
                 field,
-                backend_canonical: self.policy.per_transfer_limit().0,
+                backend_canonical,
                 backend_robinhood: backend,
                 chain_robinhood: chain.to_string(),
             });

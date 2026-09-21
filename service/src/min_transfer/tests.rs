@@ -318,24 +318,34 @@ mod fold_parking {
 // ------------------------------------------------ the source MAXIMUM --
 
 #[test]
-fn the_source_maximum_is_fifty_thousand_glc_on_every_route_inclusive() {
+fn the_source_maximum_is_by_source_chain_and_inclusive() {
+    use crate::routes::Chain;
     assert_eq!(SOURCE_MAXIMUM_CANONICAL.0, 50_000 * 100_000_000);
+    assert_eq!(SOURCE_MAXIMUM_ROBINHOOD_CANONICAL.0, 20_000 * 100_000_000);
     for route in Route::ALL {
-        assert_eq!(source_maximum(route), SOURCE_MAXIMUM_CANONICAL);
-        assert!(enforce_source_maximum(route, SOURCE_MAXIMUM_CANONICAL).is_ok());
+        let expected = match route.source_chain() {
+            Chain::Robinhood => SOURCE_MAXIMUM_ROBINHOOD_CANONICAL,
+            Chain::Goldcoin | Chain::Solana => SOURCE_MAXIMUM_CANONICAL,
+        };
+        assert_eq!(source_maximum(route), expected, "{}", route.as_str());
+        assert!(enforce_source_maximum(route, expected).is_ok());
         assert!(enforce_source_maximum(route, CanonicalAtomic(1)).is_ok());
-        let err = enforce_source_maximum(route, CanonicalAtomic(SOURCE_MAXIMUM_CANONICAL.0 + 1))
-            .unwrap_err();
+        let err = enforce_source_maximum(route, CanonicalAtomic(expected.0 + 1)).unwrap_err();
         assert_eq!(
             err,
             MaxTransferError::AboveSourceMaximum {
                 route: route.as_str(),
-                gross: SOURCE_MAXIMUM_CANONICAL.0 + 1,
-                maximum: SOURCE_MAXIMUM_CANONICAL.0,
+                gross: expected.0 + 1,
+                maximum: expected.0,
             }
         );
         assert!(err.to_string().contains("amount SENT"));
     }
+    // The two Robinhood-sourced routes are the 20_000 ones, no others.
+    assert_eq!(source_maximum(Route::RhnToGlc).0, 20_000 * 100_000_000);
+    assert_eq!(source_maximum(Route::RhnToSol).0, 20_000 * 100_000_000);
+    assert_eq!(source_maximum(Route::GlcToRhn).0, 50_000 * 100_000_000);
+    assert_eq!(source_maximum(Route::SolToRhn).0, 50_000 * 100_000_000);
     // The explicit-ceiling form is the same comparison.
     assert!(
         enforce_source_maximum_at(Route::GlcToSol, CanonicalAtomic(10), CanonicalAtomic(10))

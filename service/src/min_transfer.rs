@@ -5,9 +5,10 @@
 //!
 //! Two different things, stated in two different places, deliberately:
 //!
-//! - **The source transfer limit** is THIS module: 100 GLC minimum,
-//!   [`SOURCE_MAXIMUM_CANONICAL`] (50 000 GLC) maximum, on what the user
-//!   SENDS. It is the product's economic rule, it is the figure a UI caps
+//! - **The source transfer limit** is THIS module: 100 GLC minimum, and
+//!   a maximum by SOURCE chain — [`SOURCE_MAXIMUM_CANONICAL`] (50 000 GLC
+//!   from Goldcoin L1 or Solana), [`SOURCE_MAXIMUM_ROBINHOOD_CANONICAL`]
+//!   (20 000 GLC from Robinhood Chain) — on what the user SENDS. It is the product's economic rule, it is the figure a UI caps
 //!   its entry at (`RouteView::max_transfer_atomic`), and it does not move
 //!   with any rate.
 //! - **A destination payout cap** is a chain's own per-transfer ceiling
@@ -116,12 +117,23 @@ pub const SOURCE_MINIMUM_CANONICAL: CanonicalAtomic = CanonicalAtomic(100 * CANO
 /// the smaller of the two (`api::published_max_transfer`).
 pub const SOURCE_MAXIMUM_CANONICAL: CanonicalAtomic = CanonicalAtomic(50_000 * CANONICAL_SCALE);
 
-/// The source-side gross maximum for `route`, canonical 8dp. One figure
-/// for every route today, through one function, exactly as
-/// [`source_minimum`].
+/// The source-side maximum for a transfer that STARTS on Robinhood Chain
+/// (`RhnToGlc`, `RhnToSol`): 20 000 GLC (founder decision, 2026-09-21).
+/// The custody contract's `inboundMax` is the on-chain twin of this
+/// figure ([`crate::chain_policy::ChainPolicy::inbound_per_transfer_limit`]);
+/// its `outboundMax` is destination capacity and has nothing to do with
+/// what a user may send.
+pub const SOURCE_MAXIMUM_ROBINHOOD_CANONICAL: CanonicalAtomic =
+    CanonicalAtomic(20_000 * CANONICAL_SCALE);
+
+/// The source-side gross maximum for `route`, canonical 8dp — by the
+/// SOURCE chain: 50 000 GLC from Goldcoin L1 or Solana, 20 000 GLC from
+/// Robinhood Chain. Through one function, exactly as [`source_minimum`].
 pub fn source_maximum(route: Route) -> CanonicalAtomic {
-    let _ = route;
-    SOURCE_MAXIMUM_CANONICAL
+    match route.source_chain() {
+        crate::routes::Chain::Robinhood => SOURCE_MAXIMUM_ROBINHOOD_CANONICAL,
+        crate::routes::Chain::Goldcoin | crate::routes::Chain::Solana => SOURCE_MAXIMUM_CANONICAL,
+    }
 }
 
 /// Why a gross amount exceeds the source transfer limit.

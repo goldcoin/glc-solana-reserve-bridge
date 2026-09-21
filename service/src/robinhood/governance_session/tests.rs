@@ -91,7 +91,7 @@ impl GovernanceQuorumSigner for LocalSigner {
 
 fn binding(per_transfer_glc: u64, rolling_glc: u64) -> RobinhoodPolicyBinding {
     RobinhoodPolicyBinding::new(
-        ChainPolicy::new(
+        ChainPolicy::new_symmetric(
             Chain::Robinhood,
             600,
             CanonicalAtomic(per_transfer_glc * ONE_GLC),
@@ -160,7 +160,7 @@ async fn a_plan_is_derived_from_configured_policy_and_preserves_the_minimums() {
     // Derived from the configured policy...
     assert_eq!(
         plan.after.limits.inbound_max,
-        binding.per_transfer_limit().to_u256()
+        binding.inbound_max().to_u256()
     );
     assert_eq!(
         plan.after.limits.inbound_rolling_limit,

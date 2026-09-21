@@ -749,7 +749,9 @@ pause change, never edits the config file, never restarts the daemon.)
   glc-admin robinhood-governance-set-limits --config PATH --note TEXT
       [--execute] [--inbound-min N] [--outbound-min N] [--protected-min N]
       Reconciles the contract's limit set to whatever [robinhood.policy] in
-      this config says. inboundMax/outboundMax come from per_transfer_limit;
+      this config says. inboundMax comes from inbound_per_transfer_limit
+      (the user's deposit ceiling) and outboundMax from
+      outbound_per_transfer_limit (destination settlement capacity);
       the rolling limits are HALF of rolling_daily_limit, because the
       contract's window is a fixed bucket whose reachable worst case is 2x.
       There are NO figures in this command: change the policy with
@@ -855,8 +857,16 @@ calls. See docs/09-runbook.md 'Chain policy management'.)
       permits an RPC read — the deployed contract's own limits() beside
       them with every disagreement named. --no-onchain skips the read.
   glc-admin chain-policy-validate --config PATH --network <name>
-      (--fee-bps N | --fee-percent X) (--per-transfer-limit N | --per-transfer-glc X)
+      (--fee-bps N | --fee-percent X)
+      (--inbound-per-transfer-limit N | --inbound-per-transfer-glc X)
+      (--outbound-per-transfer-limit N | --outbound-per-transfer-glc X)
       (--rolling-daily-limit N | --rolling-glc X)
+      The two per-transfer limits are SEPARATE (docs/40): inbound is the
+      user's deposit ceiling (inboundMax), outbound is destination
+      settlement capacity (outboundMax) — sized for the elastic payouts a
+      source-side maximum can produce, never a user limit. The legacy
+      (--per-transfer-limit N | --per-transfer-glc X) still means one
+      figure for both and cannot be combined with the directional flags.
       Validates a candidate policy and writes NOTHING, ever. The bps/atomic
       flags take exact machine values; the percent/GLC flags take what an
       operator types (6, 1.5, 20000, 10000000) and convert exactly.
@@ -7686,13 +7696,59 @@ fn requested_policy(
         human::parse_fee_percent,
         |v| v,
     )?;
-    let per_transfer = policy_figure(
-        args,
-        "--per-transfer-limit",
-        "--per-transfer-glc",
-        human::parse_glc,
-        CanonicalAtomic,
-    )?;
+    // Two SEPARATE per-transfer limits (docs/40, "SOURCE TRANSFER LIMIT vs
+    // DESTINATION PAYOUT CAP"): inbound = the user-facing deposit
+    // ceiling (`inboundMax`), outbound = destination settlement capacity
+    // (`outboundMax`). The legacy `--per-transfer-limit/--per-transfer-glc`
+    // still means "the same figure for both" and cannot be mixed with the
+    // directional flags.
+    let legacy_given = ["--per-transfer-limit", "--per-transfer-glc"]
+        .iter()
+        .any(|f| flag(args, f).is_some());
+    let directional_given = [
+        "--inbound-per-transfer-limit",
+        "--inbound-per-transfer-glc",
+        "--outbound-per-transfer-limit",
+        "--outbound-per-transfer-glc",
+    ]
+    .iter()
+    .any(|f| flag(args, f).is_some());
+    let (inbound, outbound) = match (legacy_given, directional_given) {
+        (true, true) => {
+            return Err(
+                "--per-transfer-limit/--per-transfer-glc (one figure for both \
+                        directions) cannot be combined with the --inbound-/--outbound- \
+                        per-transfer flags — pass one form"
+                    .to_string(),
+            )
+        }
+        (true, false) => {
+            let both = policy_figure(
+                args,
+                "--per-transfer-limit",
+                "--per-transfer-glc",
+                human::parse_glc,
+                CanonicalAtomic,
+            )?;
+            (both, both)
+        }
+        (false, _) => (
+            policy_figure(
+                args,
+                "--inbound-per-transfer-limit",
+                "--inbound-per-transfer-glc",
+                human::parse_glc,
+                CanonicalAtomic,
+            )?,
+            policy_figure(
+                args,
+                "--outbound-per-transfer-limit",
+                "--outbound-per-transfer-glc",
+                human::parse_glc,
+                CanonicalAtomic,
+            )?,
+        ),
+    };
     let rolling = policy_figure(
         args,
         "--rolling-daily-limit",
@@ -7701,7 +7757,7 @@ fn requested_policy(
         CanonicalAtomic,
     )?;
 
-    ChainPolicy::new(chain, fee_bps, per_transfer, rolling).map_err(|e| e.to_string())
+    ChainPolicy::new(chain, fee_bps, inbound, outbound, rolling).map_err(|e| e.to_string())
 }
 
 /// Renders one policy as the three lines an operator reads.
@@ -7713,9 +7769,14 @@ fn print_policy(policy: &glc_reserve_bridge_service::chain_policy::ChainPolicy) 
         policy.fee_bps()
     );
     println!(
-        "  Per-transfer limit:  {:<22} ({} canonical 8dp)",
-        human::format_glc(policy.per_transfer_limit().0),
-        policy.per_transfer_limit().0
+        "  Inbound per-transfer:  {:<22} ({} canonical 8dp; inboundMax — the user's deposit ceiling)",
+        human::format_glc(policy.inbound_per_transfer_limit().0),
+        policy.inbound_per_transfer_limit().0
+    );
+    println!(
+        "  Outbound per-transfer: {:<22} ({} canonical 8dp; outboundMax — destination settlement capacity, NOT a user limit)",
+        human::format_glc(policy.outbound_per_transfer_limit().0),
+        policy.outbound_per_transfer_limit().0
     );
     println!(
         "  24h rolling limit:   {:<22} ({} canonical 8dp, STRICT)",
@@ -7753,8 +7814,9 @@ fn print_rolling_bucket_note(
         binding.expected_onchain_rolling_limit().get()
     );
     println!(
-        "      inboundMax           = outboundMax          = {} (18dp)",
-        binding.per_transfer_limit().get()
+        "      inboundMax           = {} (18dp)   outboundMax = {} (18dp)",
+        binding.inbound_max().get(),
+        binding.outbound_max().get()
     );
     println!(
         "  Installing that is a setLimits(...) governance action under a 2-of-3 signer quorum."
@@ -7855,7 +7917,14 @@ fn cmd_chain_policy_show(args: &[String]) -> Result<(), String> {
             Some(policy) => {
                 println!("configured\ttrue");
                 println!("fee_bps\t{}", policy.fee_bps());
-                println!("per_transfer_limit\t{}", policy.per_transfer_limit().0);
+                println!(
+                    "inbound_per_transfer_limit\t{}",
+                    policy.inbound_per_transfer_limit().0
+                );
+                println!(
+                    "outbound_per_transfer_limit\t{}",
+                    policy.outbound_per_transfer_limit().0
+                );
                 println!("rolling_daily_limit\t{}", policy.rolling_daily_limit().0);
             }
             None => println!("configured\tfalse"),
@@ -8054,8 +8123,10 @@ fn print_chain_policy_json(
         root["configured"] = serde_json::json!({
             "fee_bps": policy.fee_bps(),
             "fee_percent": human::format_percent(policy.fee_bps()),
-            "per_transfer_limit": policy.per_transfer_limit().0,
-            "per_transfer_glc": human::format_glc(policy.per_transfer_limit().0),
+            "inbound_per_transfer_limit": policy.inbound_per_transfer_limit().0,
+            "inbound_per_transfer_glc": human::format_glc(policy.inbound_per_transfer_limit().0),
+            "outbound_per_transfer_limit": policy.outbound_per_transfer_limit().0,
+            "outbound_per_transfer_glc": human::format_glc(policy.outbound_per_transfer_limit().0),
             "rolling_daily_limit": policy.rolling_daily_limit().0,
             "rolling_daily_glc": human::format_glc(policy.rolling_daily_limit().0),
         });
@@ -8716,8 +8787,12 @@ fn cmd_chain_policy_check_config(args: &[String]) -> Result<(), String> {
                         Ok(policy) => {
                             println!("fragment_fee_bps\t{}", policy.fee_bps());
                             println!(
-                                "fragment_per_transfer_limit\t{}",
-                                policy.per_transfer_limit().0
+                                "fragment_inbound_per_transfer_limit\t{}",
+                                policy.inbound_per_transfer_limit().0
+                            );
+                            println!(
+                                "fragment_outbound_per_transfer_limit\t{}",
+                                policy.outbound_per_transfer_limit().0
                             );
                             println!(
                                 "fragment_rolling_daily_limit\t{}",
@@ -8765,11 +8840,13 @@ fn cmd_chain_policy_check_config(args: &[String]) -> Result<(), String> {
                     println!("or, without the menus:");
                     println!(
                         "  glc-admin chain-policy-apply --config /etc/glc-bridge/config.toml \\\n    \
-                         --network {} --fee-bps {} --per-transfer-limit {} \\\n    \
-                         --rolling-daily-limit {} --note \"why\" --dry-run",
+                         --network {} --fee-bps {} --inbound-per-transfer-limit {} \\\n    \
+                         --outbound-per-transfer-limit {} --rolling-daily-limit {} \\\n    \
+                         --note \"why\" --dry-run",
                         fragment.chain.as_str(),
                         policy.fee_bps(),
-                        policy.per_transfer_limit().0,
+                        policy.inbound_per_transfer_limit().0,
+                        policy.outbound_per_transfer_limit().0,
                         policy.rolling_daily_limit().0,
                     );
                     println!("(drop --dry-run for --execute once the dry run reads correctly)");
@@ -9202,9 +9279,15 @@ fn cmd_robinhood_governance_set_limits(args: &[String]) -> Result<(), String> {
             policy.fee_bps()
         );
         println!(
-            "  per transfer         {}",
+            "  inbound per transfer {}   (user deposit ceiling)",
             glc_reserve_bridge_service::chain_policy::human::format_glc(
-                policy.per_transfer_limit().0
+                policy.inbound_per_transfer_limit().0
+            )
+        );
+        println!(
+            "  outbound per transfer {}  (destination settlement capacity)",
+            glc_reserve_bridge_service::chain_policy::human::format_glc(
+                policy.outbound_per_transfer_limit().0
             )
         );
         println!(
@@ -9215,9 +9298,15 @@ fn cmd_robinhood_governance_set_limits(args: &[String]) -> Result<(), String> {
         );
         println!("\nOn chain required (derived from that policy, not configured separately):");
         println!(
-            "  max                  {}",
+            "  inboundMax           {}",
             glc_reserve_bridge_service::chain_policy::human::format_glc(
-                policy.per_transfer_limit().0
+                policy.inbound_per_transfer_limit().0
+            )
+        );
+        println!(
+            "  outboundMax          {}",
+            glc_reserve_bridge_service::chain_policy::human::format_glc(
+                policy.outbound_per_transfer_limit().0
             )
         );
         println!(
