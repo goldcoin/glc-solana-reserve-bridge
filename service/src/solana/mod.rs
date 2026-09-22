@@ -12,4 +12,5 @@ pub mod manual_review_settle;
 pub mod program_compat;
 pub mod reconcile_request;
 pub mod refund;
+pub mod resume_destination_bound;
 pub mod rpc;

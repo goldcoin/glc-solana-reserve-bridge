@@ -1102,6 +1102,20 @@ pub enum ResumeDryRunOutcome {
     WouldRefuse { reason: String },
 }
 
+/// The Solana program's live per-transfer bounds and the mint's decimals,
+/// read from `bridge_config` by the caller moments before
+/// [`Ledger::resume_glc_to_sol_destination_bound`] — the ledger never
+/// reads a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSolanaBounds {
+    /// `BridgeConfig.min_transfer_amount`, mint units.
+    pub min_transfer_amount: u64,
+    /// `BridgeConfig.per_transfer_limit`, mint units.
+    pub per_transfer_limit: u64,
+    /// The reserve mint's live `decimals`.
+    pub solana_decimals: u8,
+}
+
 /// The durable state of a Goldcoin-side refund
 /// ([`Ledger::begin_goldcoin_refund`]). Distinct from the REQUEST's
 /// state: the request walks `ManualReview -> RefundPending ->
@@ -4076,6 +4090,318 @@ impl Ledger {
     /// limit — so no signer is ever asked for it.
     pub const MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS: &'static str =
         "destination_payout_out_of_bounds";
+
+    /// The state-log reason prefix every
+    /// [`Self::resume_glc_to_sol_destination_bound`] transition carries —
+    /// the idempotency marker: its presence on a `(ManualReview ->
+    /// SourceFinalized)` row is proof of a prior resume by this path.
+    pub const RESUME_DESTINATION_BOUND_REASON: &'static str = "resume_destination_bound";
+
+    /// Re-admits a `GlcToSol` request parked at settlement for
+    /// [`Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS`] —
+    /// and nothing else — into the normal release pipeline
+    /// (`ManualReview -> SourceFinalized`), once the Solana program's
+    /// LIVE bounds admit its LOCKED payout (docs/40-destination-bound-
+    /// admission.md; `glc-admin resume-destination-bound`).
+    ///
+    /// This is a transition, not a settlement: the existing
+    /// `Orchestrator::tick_release_settlements` then re-runs
+    /// `release_out_of_bounds` against the chain, the 2-of-3 attestation
+    /// re-derives the claim from the stored gross and the locked quote,
+    /// `release_from_reserve` pays, and confirmation settles it. There is
+    /// no second payout implementation and no re-quote: the entitlement
+    /// is recomputed here from the STORED gross + LOCKED quote
+    /// (`BridgeRequest::verify_breakdown`), never from a live rate.
+    ///
+    /// Every check runs inside one write transaction, in this order, and
+    /// the first refusal wins:
+    /// 1. no operator hold and no rapid-burst hold;
+    /// 2. the request is `GlcToSol`;
+    /// 3. it is in `ManualReview` — a request this path already resumed
+    ///    reports [`ResumeManualReviewOutcome::AlreadyResumed`] (a no-op,
+    ///    never a second transition); any other state is refused;
+    /// 4. `manual_review_note` is exactly the destination-bound reason;
+    /// 5. no destination transaction, no release attestation record, no
+    ///    refund lifecycle row, no closure;
+    /// 6. the source deposit is finalized and its binding recorded;
+    /// 7. the bridge quote is locked;
+    /// 8. the recomputed payout, in the mint's live decimals, satisfies
+    ///    `min_transfer_amount <= payout <= per_transfer_limit` against
+    ///    the `live` figures the caller just read from `bridge_config`;
+    /// 9. the row's `net_destination_atomic` equals that payout and the
+    ///    Solana reserve's `reserved_liquidity`/`pending_obligations`
+    ///    still cover it (a Goldcoin-sourced park KEEPS its reservation —
+    ///    [`Self::park_for_destination_bounds`]), and the hard invariant
+    ///    `balance >= protected_minimum + reserved` holds. Nothing new is
+    ///    reserved.
+    ///
+    /// The recipient, amounts and quote columns are never written.
+    pub fn resume_glc_to_sol_destination_bound(
+        &mut self,
+        request_id: i64,
+        live: LiveSolanaBounds,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<ResumeManualReviewOutcome, LedgerError> {
+        let refuse = |detail: String| LedgerError::ManualReviewNotRecoverable {
+            id: request_id,
+            detail,
+        };
+        // The immutable columns (gross, fee, net, quote, recipient) are
+        // read through the typed row; everything that can change under a
+        // concurrent write is re-read inside the transaction below.
+        let request = self
+            .get_request(request_id)?
+            .ok_or(LedgerError::RequestNotFound(request_id))?;
+        let tx = write_tx(&mut self.conn)?;
+        // 1. holds
+        Self::refuse_if_auto_resume_held(&tx, request_id)?;
+        // 2. route
+        if request.direction != Direction::GlcToSol {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "request is {:?}, not GlcToSol — this command recovers only a GlcToSol \
+                 release parked destination_payout_out_of_bounds",
+                request.direction
+            )));
+        }
+        // 3. state, re-read under the write lock
+        let (
+            state,
+            manual_review_note,
+            destination_txid,
+            source_finalized_at,
+            net_destination_atomic,
+        ): (
+            RequestState,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            i64,
+        ) = tx.query_row(
+            "SELECT state, manual_review_note, destination_txid, source_finalized_at,
+                    net_destination_atomic
+               FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        if state != RequestState::ManualReview {
+            let previously_resumed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM bridge_request_state_log
+                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3
+                       AND reason LIKE ?4 LIMIT 1",
+                    rusqlite::params![
+                        request_id,
+                        RequestState::ManualReview,
+                        RequestState::SourceFinalized,
+                        format!("{}%", Self::RESUME_DESTINATION_BOUND_REASON)
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            tx.rollback()?;
+            if previously_resumed {
+                return Ok(ResumeManualReviewOutcome::AlreadyResumed { state });
+            }
+            return Err(refuse(format!("state is {state:?}, not ManualReview")));
+        }
+        // 4. reason — exactly this one, never a list
+        if manual_review_note.as_deref()
+            != Some(Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS)
+        {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "manual_review_note is {manual_review_note:?}, not {:?}",
+                Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS
+            )));
+        }
+        // 5. nothing settled, refunded or closed
+        if destination_txid.is_some() {
+            tx.rollback()?;
+            return Err(refuse(
+                "a destination transaction already exists".to_string(),
+            ));
+        }
+        let release_attested: bool = tx
+            .query_row(
+                "SELECT 1 FROM attestation_records
+                  WHERE request_id = ?1 AND action_type = 'release' LIMIT 1",
+                [request_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if release_attested {
+            tx.rollback()?;
+            return Err(refuse(
+                "a release attestation was already recorded — the payout may have been \
+                 submitted; reconcile against the chain instead"
+                    .to_string(),
+            ));
+        }
+        if Self::refund_lifecycle_exists_in(&tx, request_id)? {
+            tx.rollback()?;
+            return Err(refuse(
+                "a refund lifecycle exists — a refund, once begun, is permanent".to_string(),
+            ));
+        }
+        let closed: bool = tx
+            .query_row(
+                "SELECT 1 FROM request_closures WHERE request_id = ?1",
+                [request_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if closed {
+            tx.rollback()?;
+            return Err(refuse("a closure is recorded for this request".to_string()));
+        }
+        // 6. source final
+        if source_finalized_at.is_none()
+            || request.source_txid.is_none()
+            || request.source_vout.is_none()
+        {
+            tx.rollback()?;
+            return Err(refuse("source deposit is not finalized".to_string()));
+        }
+        // 7. locked quote
+        Self::refuse_unless_quote_locked_in(&tx, request_id, manual_review_note.as_deref())?;
+        if request.quote.as_ref().and_then(|q| q.locked_at).is_none() {
+            tx.rollback()?;
+            return Err(refuse(
+                "the request carries no locked bridge quote".to_string(),
+            ));
+        }
+        // 8. the payout, from the STORED gross and the LOCKED quote only,
+        //    against the LIVE program bounds
+        let breakdown =
+            request
+                .verify_breakdown()
+                .map_err(|e| LedgerError::ManualReviewNotRecoverable {
+                    id: request_id,
+                    detail: format!("stored amounts do not verify against the locked quote: {e}"),
+                })?;
+        let payout = breakdown
+            .net
+            .to_solana(live.solana_decimals)
+            .map_err(|e| LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!("locked net is not representable at the mint's precision: {e}"),
+            })?
+            .0;
+        if payout < live.min_transfer_amount {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "locked payout {payout} mint units is below the program's live min_transfer_amount {}",
+                live.min_transfer_amount
+            )));
+        }
+        if payout > live.per_transfer_limit {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "locked payout {payout} mint units exceeds the program's live per_transfer_limit {} — \
+                 raise the limit (glc-admin set-limit --field per-transfer) before resuming",
+                live.per_transfer_limit
+            )));
+        }
+        // 9. reservation and invariant — nothing is reserved anew
+        if net_destination_atomic < 0 || net_destination_atomic as u64 != payout {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "the row's net_destination_atomic {net_destination_atomic} does not equal the \
+                 recomputed payout {payout}"
+            )));
+        }
+        let (balance, protected_minimum, reserved, pending): (i64, i64, i64, i64) = tx
+            .query_row(
+                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity,
+                        pending_obligations
+                   FROM reserve_ledger WHERE direction = ?1",
+                [ReserveDirection::SolanaReserve],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or(LedgerError::ReserveNotInitialized(
+                ReserveDirection::SolanaReserve,
+            ))?;
+        if reserved < net_destination_atomic || pending < net_destination_atomic {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "the Solana reserve no longer holds this request's reservation (reserved \
+                 {reserved}, pending {pending}, request {net_destination_atomic}) — reconcile \
+                 before resuming"
+            )));
+        }
+        if balance < protected_minimum + reserved {
+            tx.rollback()?;
+            return Err(LedgerError::InvariantViolated {
+                direction: ReserveDirection::SolanaReserve,
+                balance,
+                protected_minimum,
+                reserved_liquidity: reserved,
+            });
+        }
+        // The transition. Only `state` and the note change; the
+        // reservation, recipient, amounts and quote are untouched.
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1, manual_review_note = NULL
+              WHERE id = ?2 AND state = ?3",
+            rusqlite::params![
+                RequestState::SourceFinalized,
+                request_id,
+                RequestState::ManualReview
+            ],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::SourceFinalized,
+            now,
+            Some(&format!(
+                "{}: locked payout {payout} mint units within live bounds [{}, {}]; {note}",
+                Self::RESUME_DESTINATION_BOUND_REASON,
+                live.min_transfer_amount,
+                live.per_transfer_limit
+            )),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(ResumeManualReviewOutcome::Resumed)
+    }
+
+    /// [`Self::resume_glc_to_sol_destination_bound`] trialled and rolled
+    /// back — the SAME function, so what a dry run reports is exactly
+    /// what an execute would do. Takes `&mut self` only for the rollback.
+    pub fn dry_run_resume_glc_to_sol_destination_bound(
+        &mut self,
+        request_id: i64,
+        live: LiveSolanaBounds,
+        now: i64,
+    ) -> Result<ResumeDryRunOutcome, LedgerError> {
+        self.begin_admin_action()?;
+        let attempted = self.resume_glc_to_sol_destination_bound(
+            request_id,
+            live,
+            "dry-run trial",
+            "dry-run",
+            now,
+        );
+        self.rollback_admin_action()?;
+        Ok(match attempted {
+            Ok(ResumeManualReviewOutcome::Resumed) => ResumeDryRunOutcome::WouldResume,
+            Ok(ResumeManualReviewOutcome::AlreadyResumed { state }) => {
+                ResumeDryRunOutcome::AlreadyResumed { state }
+            }
+            Err(e) => ResumeDryRunOutcome::WouldRefuse {
+                reason: e.to_string(),
+            },
+        })
+    }
 
     /// Parks a `SourceFinalized` request whose quoted destination payout
     /// the destination chain would refuse

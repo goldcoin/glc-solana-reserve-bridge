@@ -3127,6 +3127,40 @@ and amount come from the chain. No nonce rewrite. No abandonment — the
 on-chain path that closes an obligation while RETAINING a depositor's
 principal has no representation in this service and gains none here.
 
+## ManualReview -> Solana release recovery: `resume-destination-bound` (added 2026-09-22)
+
+The opposite decision to a refund for a **`GlcToSol`** request the release
+path parked `destination_payout_out_of_bounds` (its LOCKED payout exceeded
+the Solana program's `per_transfer_limit` at the time — the 2026-09-18
+incident, requests 4438/4483; docs/40-destination-bound-admission.md).
+Once the operators have sized the limit (`glc-admin set-limit --field
+per-transfer`), the request is re-admitted into the EXISTING release
+pipeline; there is no second payout implementation and no re-quote.
+
+```
+glc-admin resume-destination-bound --config /etc/glc-bridge/config.toml --request-id N --note TEXT [--execute]
+```
+
+Dry run by default: reads `bridge_config` (live `min_transfer_amount` /
+`per_transfer_limit`) and the mint's decimals, prints the locked payout
+recomputed from the STORED gross + LOCKED quote beside the live bounds and
+the Solana reserve figures, and trials the real ledger check (rolled
+back). `--execute` refuses unless the dry run cleared. Refusals, in order,
+no override: operator hold; rapid-burst hold; not `GlcToSol`; state other
+than `ManualReview` (a prior resume by this command → safe no-op); a note
+other than exactly `destination_payout_out_of_bounds`; an existing
+destination txid, release attestation record, refund lifecycle or closure;
+an unfinalized source deposit; an unlocked quote; locked payout outside
+`[min_transfer_amount, per_transfer_limit]`; a reservation the reserve no
+longer holds; a broken reserve invariant. Execute = `ManualReview ->
+SourceFinalized`, audited (`resume_destination_bound`), nothing reserved
+anew (a Goldcoin-sourced park keeps its reservation), recipient / amounts
+/ quote untouched. The next daemon tick re-checks the bounds live, the
+2-of-3 attestation re-derives the claim at the locked quote,
+`release_from_reserve` pays, confirmation settles. One request at a time;
+watch `GET /transfers/{id}`: `SourceFinalized -> DestinationSubmitted ->
+Settled`, and `reserved_liquidity` drops by the payout on settlement.
+
 ## Robinhood governance (added 2026-09-09)
 
 Changing what the **deployed contract** enforces, as opposed to what this
