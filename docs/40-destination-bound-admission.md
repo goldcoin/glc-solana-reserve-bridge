@@ -263,3 +263,7 @@ claims.
   Solana) pay at any limit ≥ 947 018; pinned in `bridge_rate::tests::
   requests_4438_and_4483_against_candidate_per_transfer_limits` for
   1 000 000 and 2 000 000, settlement and admission verdicts separately.
+  The operator path back into the release pipeline is `glc-admin
+  resume-destination-bound` (docs/09-runbook.md, "ManualReview -> Solana
+  release recovery"); `orchestrator::tests::destination_bound_resume`
+  runs both shapes end to end at their locked quotes.

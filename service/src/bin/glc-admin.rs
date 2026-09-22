@@ -53,6 +53,7 @@ use glc_reserve_bridge_service::solana::instructions::{
 };
 use glc_reserve_bridge_service::solana::manual_review_settle;
 use glc_reserve_bridge_service::solana::refund::{self, RefundExecuteOutcome};
+use glc_reserve_bridge_service::solana::resume_destination_bound;
 use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 
 use solana_sdk::signature::{read_keypair_file, Signer};
@@ -245,6 +246,28 @@ Moves no funds and signs nothing itself: no keypair, no signer. The
 destination Goldcoin address and the amount are columns on the existing
 request row and cannot be supplied or changed by the operator. See
 docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
+  glc-admin resume-destination-bound --config PATH --request-id N --note TEXT [--execute]
+      GlcToSol ONLY: re-admits a request the release path parked
+      `destination_payout_out_of_bounds` (its LOCKED payout exceeded the
+      Solana program's per_transfer_limit at the time) once the program's
+      LIVE bounds admit it (docs/40-destination-bound-admission.md).
+      DRY RUN BY DEFAULT: reads bridge_config + the mint's decimals, prints
+      the locked payout beside the live min/max and the reserve figures,
+      and TRIALS the real ledger check (rolled back). Refuses, no override:
+      any operator or rapid-burst hold; a non-GlcToSol request; a state
+      other than ManualReview (a prior resume by this command is a safe
+      no-op); a manual_review_note other than exactly
+      destination_payout_out_of_bounds; an existing destination txid,
+      release attestation, refund lifecycle or closure; an unfinalized
+      source deposit; an unlocked quote; a locked payout outside
+      [min_transfer_amount, per_transfer_limit]; a reservation the reserve
+      no longer holds; a broken reserve invariant. The payout is recomputed
+      from the STORED gross and the LOCKED quote — never a live rate. With
+      --execute: ManualReview -> SourceFinalized, audited, nothing reserved
+      anew (a Goldcoin-sourced park keeps its reservation); the normal
+      release pipeline (bounds re-check, 2-of-3 attestation,
+      release_from_reserve, confirmation) takes it from there — there is
+      no second payout implementation.
   glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]
       --config points at the same config file glc-bridge-daemon uses (the
       ledger path and Solana RPC come from it; the RPC is needed to
@@ -1080,6 +1103,7 @@ fn main() {
         "refund-manual-review" => cmd_refund_manual_review(&args),
         "refund-list" => cmd_refund_list(&args),
         "manual-review-settle" => cmd_manual_review_settle(&args),
+        "resume-destination-bound" => cmd_resume_destination_bound(&args),
         "manual-review-settle-list" => cmd_manual_review_settle_list(&args),
         "manual-review-hold" => cmd_manual_review_hold(&args),
         "manual-review-release" => cmd_manual_review_hold_release(&args),
@@ -4330,6 +4354,143 @@ fn cmd_manual_review_settle(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+fn cmd_resume_destination_bound(args: &[String]) -> Result<(), String> {
+    let config_path = require(args, "--config");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(config.solana.rpc_url.clone());
+        let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| {
+            format!(
+                "could not open ledger {}: {e}",
+                config.service.db_path.display()
+            )
+        })?;
+        let now = now_unix();
+
+        let report = resume_destination_bound::dry_run(&rpc, &mut ledger, request_id, now).await?;
+        print_destination_bound_report(&report);
+
+        if !execute {
+            println!(
+                "\n--execute not supplied — DRY RUN ONLY: nothing was written, nothing was \
+                 broadcast, and no signer or keypair was involved."
+            );
+            return Ok(());
+        }
+        if !report.would_resume() {
+            return Err(
+                "refusing to execute: the dry run above did not clear. Fix the named cause \
+                 and re-run — there is no override."
+                    .to_string(),
+            );
+        }
+        let outcome = resume_destination_bound::execute(
+            &rpc,
+            &mut ledger,
+            request_id,
+            note,
+            &cli_actor(),
+            now,
+        )
+        .await?;
+        match outcome {
+            ResumeManualReviewOutcome::Resumed => println!(
+                "request {request_id}: re-admitted ManualReview -> SourceFinalized at its LOCKED \
+                 quote, nothing reserved anew. The normal GlcToSol release pipeline will \
+                 re-check the bounds, attest and submit release_from_reserve on the next daemon \
+                 tick; watch GET /transfers/{request_id} for DestinationSubmitted -> Settled \
+                 (note: {note})"
+            ),
+            ResumeManualReviewOutcome::AlreadyResumed { state } => println!(
+                "request {request_id}: already resumed by this command (state={state:?}) — \
+                 nothing to do, no mutation performed"
+            ),
+        }
+        Ok(())
+    })
+}
+
+fn print_destination_bound_report(report: &resume_destination_bound::DestinationBoundDryRunReport) {
+    let r = &report.request;
+    println!("request {}: {:?} {:?}", r.id, r.direction, r.state);
+    println!(
+        "  manual_review_note   = {}",
+        r.manual_review_note.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  gross / fee / net    = {} / {} bps / {} (canonical 8dp)",
+        r.gross_amount_atomic, r.fee_bps, r.net_amount_atomic
+    );
+    match &r.quote {
+        Some(q) => println!(
+            "  locked quote         = src {} e12 / dst {} e12, locked_at {}",
+            q.source_price_e12,
+            q.destination_price_e12,
+            q.locked_at
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "NOT LOCKED".to_string())
+        ),
+        None => println!("  locked quote         = (none)"),
+    }
+    println!(
+        "  recipient            = {}",
+        solana_sdk::pubkey::Pubkey::try_from(r.recipient.as_slice())
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| format!("{} bytes (not a pubkey)", r.recipient.len()))
+    );
+    println!(
+        "  source binding       = txid {} vout {} finalized_at {}",
+        r.source_txid
+            .map(|t| hex::encode(&t))
+            .unwrap_or_else(|| "(none)".to_string()),
+        r.source_vout
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        r.source_finalized_at
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    println!(
+        "  destination txid     = {}",
+        if report.destination_txid_present {
+            "PRESENT"
+        } else {
+            "none"
+        }
+    );
+    match &report.locked_payout_mint_units {
+        Ok(p) => println!(
+            "  locked payout        = {p} mint units (row net_destination_atomic {})",
+            r.net_destination_atomic
+        ),
+        Err(e) => println!("  locked payout        = UNAVAILABLE: {e}"),
+    }
+    println!(
+        "  live program bounds  = min_transfer_amount {} <= payout <= per_transfer_limit {} (mint decimals {})",
+        report.live.min_transfer_amount, report.live.per_transfer_limit, report.live.solana_decimals
+    );
+    let (balance, protected, reserved, pending) = report.reserve;
+    println!(
+        "  Solana reserve       = balance {balance} protected_minimum {protected} reserved {reserved} pending {pending} (mint units; this request's reservation is inside reserved/pending)"
+    );
+    match &report.ledger {
+        glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldResume => {
+            println!("  ledger trial         = WOULD RESUME (ManualReview -> SourceFinalized, nothing reserved anew)")
+        }
+        glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::AlreadyResumed { state } => {
+            println!("  ledger trial         = already resumed by this command (state={state:?}); execute is a no-op")
+        }
+        glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldRefuse { reason } => {
+            println!("  ledger trial         = WOULD REFUSE: {reason}")
+        }
+    }
 }
 
 fn print_settle_report(report: &manual_review_settle::SettleDryRunReport) {

@@ -6442,6 +6442,7 @@ async fn completion_resubmissions_are_capped() {
 }
 
 mod cross_route;
+mod destination_bound_resume;
 
 /// docs/38-elastic-bridge-rate.md, "Minimum / maximum checks": a quoted
 /// release the Solana program would refuse — here, below its
